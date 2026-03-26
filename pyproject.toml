@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "poma-memory"
+version = "0.2.0"
+description = "Structure-preserving memory for AI agents. No cloud. Just markdown."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "POMA Team" }]
+keywords = ["poma", "memory", "rag", "chunking", "agentic", "markdown"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Text Processing :: Markup :: Markdown",
+]
+
+dependencies = [
+    "tiktoken>=0.5.0",
+    "bm25s>=0.2.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+semantic = ["model2vec>=0.3.0"]
+openai = ["openai>=1.0"]
+mcp = ["mcp>=1.2.0"]
+dev = ["pytest>=7.0", "pytest-mock"]
+
+[project.scripts]
+poma-memory = "poma_memory.cli:main"
+poma-memory-mcp = "poma_memory.mcp_server:main"
+
+[tool.setuptools.packages.find]
+include = ["poma_memory*"]

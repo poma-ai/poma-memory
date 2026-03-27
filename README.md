@@ -2,7 +2,7 @@
 
 Free, local, structure-preserving memory for AI agents. No API key. No cloud. Just markdown.
 
-poma-memory is an open-source extraction of [POMA](https://poma.ai)'s heuristic chunking engine, optimized for the kind of well-structured markdown that AI agents produce. It indexes `.agent/` context files into hierarchical chunks and returns complete root-to-leaf context paths — not disconnected snippets.
+poma-memory is an open-source extraction of [POMA](https://poma-ai.com)'s heuristic chunking engine, optimized for the kind of well-structured markdown that AI agents produce. It indexes `.agent/` context files into hierarchical chunks and returns complete root-to-leaf context paths — not disconnected snippets.
 
 **No POMA account or API key required.** This is a standalone tool.
 
@@ -71,7 +71,7 @@ Multiple backends are automatically fused via Reciprocal Rank Fusion when availa
 
 poma-memory extracts the **heuristic chunking and retrieval** logic from POMA's document processing platform. It works well on clean, predictable markdown — exactly what agents produce.
 
-It does **not** include POMA's ML-powered indentation analysis, fine-tuned embedding models, or cloud processing pipeline. For complex document processing (scanned PDFs, inconsistent formatting, enterprise scale), see [poma.ai](https://poma.ai).
+It does **not** include POMA's ML-powered indentation analysis, fine-tuned embedding models, or cloud processing pipeline. For complex document processing (scanned PDFs, inconsistent formatting, enterprise scale), see [poma-ai.com](https://poma-ai.com).
 
 ## Built for
 

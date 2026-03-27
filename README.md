@@ -10,7 +10,7 @@ poma-memory is an open-source extraction of [POMA](https://poma-ai.com)'s heuris
 
 AI coding agents (Claude Code, Cursor, Copilot) write remarkably clean markdown: consistent heading hierarchies, predictable list structures, uniform formatting. This is the sweet spot for heuristic chunking — no ML models needed to parse the structure correctly.
 
-poma-memory exploits this by preserving the full document hierarchy during chunking. When you search for "auth middleware", you get the matching paragraph _plus_ its parent headings and surrounding context, assembled into a coherent cheatsheet with `[...]` gap markers. The result reads like a compressed version of the original document, not a bag of fragments.
+poma-memory exploits this by preserving the full document hierarchy during chunking. E.g. when you search for "auth middleware", you get the matching paragraph _plus_ its parent headings and surrounding context, assembled into a coherent cheatsheet with `[...]` gap markers. The result reads like a compressed version of the original document, not a bag of fragments.
 
 ## Install
 

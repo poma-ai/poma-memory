@@ -7,7 +7,6 @@ Register with: claude mcp add --transport stdio --scope user poma-memory -- poma
 
 from __future__ import annotations
 
-import json
 import sys
 
 from mcp.server.fastmcp import FastMCP

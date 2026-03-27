@@ -59,7 +59,6 @@ def expand_chunk_ids_deep(
 
     sorted_chunks = sorted(chunks, key=lambda c: c["chunk_index"])
     index_to_depth = {c["chunk_index"]: c["depth"] for c in sorted_chunks}
-    all_indices = set(range(len(sorted_chunks)))
 
     candidates = set(hit_chunk_ids)
 

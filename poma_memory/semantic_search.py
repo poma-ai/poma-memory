@@ -100,6 +100,7 @@ class _EmbedderBase:
                 self._embeddings = np.stack(embs)
 
     def search(self, query: str, top_k: int = 10) -> list[dict]:
+        """Perform cosine similarity search on stored chunkset embeddings."""
         if self._embeddings is None or len(self._chunkset_ids) == 0:
             return []
         query_vec = self._embed_query(query)
@@ -180,6 +181,6 @@ def create_search(store: Store) -> _EmbedderBase:
     if client is not None:
         try:
             return OpenAISearch(store, client)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Error creating OpenAI search client: {e}")
     return Model2VecSearch(store)

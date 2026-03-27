@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any
 
 
 _SCHEMA = """
@@ -220,6 +219,7 @@ class Store:
     # --- Embeddings ---
 
     def update_chunk_embedding(self, chunk_id: int, embedding: bytes) -> None:
+        """Persist the embedding blob for a chunk row."""
         self._conn.execute(
             "UPDATE chunks SET embedding = ? WHERE chunk_id = ?",
             (embedding, chunk_id),
@@ -227,6 +227,7 @@ class Store:
         self._conn.commit()
 
     def update_chunkset_embedding(self, chunkset_id: int, embedding: bytes | None) -> None:
+        """Set or clear the embedding blob for a chunkset row."""
         self._conn.execute(
             "UPDATE chunksets SET embedding = ? WHERE chunkset_id = ?",
             (embedding, chunkset_id),
@@ -234,6 +235,7 @@ class Store:
         self._conn.commit()
 
     def get_all_chunkset_embeddings(self) -> list[tuple[int, bytes | None]]:
+        """Return every chunkset id with its embedding (or None if missing), ordered by id."""
         rows = self._conn.execute(
             "SELECT chunkset_id, embedding FROM chunksets ORDER BY chunkset_id"
         ).fetchall()
@@ -242,6 +244,7 @@ class Store:
     # --- Status ---
 
     def status(self) -> dict:
+        """Summarize indexed files, chunk/chunkset counts, and whether any chunk has an embedding."""
         files = self._conn.execute("SELECT file_path FROM files").fetchall()
         chunk_count = self._conn.execute("SELECT COUNT(*) as c FROM chunks").fetchone()["c"]
         chunkset_count = self._conn.execute("SELECT COUNT(*) as c FROM chunksets").fetchone()["c"]

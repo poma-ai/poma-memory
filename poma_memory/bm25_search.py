@@ -6,7 +6,6 @@ import json
 from typing import TYPE_CHECKING
 
 import bm25s
-import numpy as np
 
 if TYPE_CHECKING:
     from poma_memory.store import Store

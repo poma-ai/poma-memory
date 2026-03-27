@@ -130,7 +130,6 @@ def indent_light(text: str, *, extract_title: bool = True) -> str:
 
     last_anchor_depth = 0
     after_placeholder_return_depth: int | None = None
-    last_placeholder_parent_depth: int | None = None
     last_placeholder_depth: int | None = None
     last_was_placeholder = False
 
@@ -212,7 +211,6 @@ def indent_light(text: str, *, extract_title: bool = True) -> str:
 
         if kind == "placeholder":
             parent = last_anchor_depth
-            last_placeholder_parent_depth = parent
             last_placeholder_depth = parent + 1
             emit(last_placeholder_depth, line)
             last_was_placeholder = True
@@ -302,6 +300,7 @@ def indent_light(text: str, *, extract_title: bool = True) -> str:
 
 
 def _scan_events(text: str) -> list[tuple[str, str, int | None]]:
+    """Scan the text for events."""
     lines = text.split("\n")
     events: list[tuple[str, str, int | None]] = []
 
@@ -411,6 +410,7 @@ def _scan_events(text: str) -> list[tuple[str, str, int | None]]:
 def _extract_title(
     events: list[tuple[str, str, int | None]],
 ) -> tuple[str | None, list[tuple[str, str, int | None]]]:
+    """Extract the title from the events."""
     for idx, ev in enumerate(events):
         if ev[0] == "heading":
             return ev[1].strip(), events[:idx] + events[idx + 1:]
@@ -431,6 +431,7 @@ def _extract_title(
 
 
 def _looks_like_pseudo_heading_line(lines: list[str], i: int) -> bool:
+    """Check if a line looks like a pseudo heading."""
     s = lines[i].strip()
     if not s or len(s) > 120:
         return False
@@ -517,6 +518,7 @@ def _simple_token_split(text: str) -> list[tuple[str, int]]:
 
 
 def _split_clauses(text: str) -> list[str]:
+    """Split the text into clauses."""
     s = text
     out: list[str] = []
     pos = 0
@@ -538,6 +540,7 @@ def _split_clauses(text: str) -> list[str]:
 
 
 def _split_placeholder_safe_anchor(text: str) -> list[tuple[str, int]]:
+    """Split the text into placeholder-safe anchor."""
     parts: list[tuple[str, bool]] = []
     last = 0
     for m in _PLACEHOLDER_RE.finditer(text):
@@ -600,6 +603,7 @@ def _split_placeholder_safe_anchor(text: str) -> list[tuple[str, int]]:
 
 
 def _emit_list_item(depth: int, item_text: str, emit) -> None:
+    """Emit a list item."""
     parts = item_text.split(" ", 1)
     if len(parts) == 1:
         for piece, delta in _enforce_limit_anchor(item_text):
@@ -622,12 +626,15 @@ def _emit_list_item(depth: int, item_text: str, emit) -> None:
 
 
 def _expand_indent(s: str) -> int:
+    """Expand the indent."""
     return len(s.replace("\t", "    "))
 
 
 def _list_nesting(indent_spaces: int) -> int:
+    """Get the list nesting."""
     return max(0, indent_spaces // 2)
 
 
 def _toklen(s: str) -> int:
+    """Get the token length."""
     return len(_ENCODING.encode(s))

@@ -7,8 +7,10 @@ Register with: claude mcp add --transport stdio --scope user poma-memory -- poma
 
 from __future__ import annotations
 
-import json
 import sys
+import warnings
+
+warnings.filterwarnings("ignore", message="A NumPy version", category=UserWarning)
 
 from mcp.server.fastmcp import FastMCP
 

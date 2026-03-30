@@ -5,9 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import warnings
+
+warnings.filterwarnings("ignore", message="A NumPy version", category=UserWarning)
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Entry point for poma-memory command."""
     parser = argparse.ArgumentParser(
         prog="poma-memory",
         description="Structure-preserving memory for AI agents.",
@@ -48,6 +52,7 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def _cmd_index(args: argparse.Namespace) -> None:
+    """Index command: index all markdown files in a directory."""
     from poma_memory.api import index
     from poma_memory.store import Store
     from poma_memory.incremental import update_file
@@ -71,6 +76,7 @@ def _cmd_index(args: argparse.Namespace) -> None:
 
 
 def _cmd_search(args: argparse.Namespace) -> None:
+    """Search command: search indexed content."""
     from poma_memory.api import search
 
     results = search(
@@ -95,6 +101,7 @@ def _cmd_search(args: argparse.Namespace) -> None:
 
 
 def _cmd_status(args: argparse.Namespace) -> None:
+    """Status command: show index status."""
     from poma_memory.api import status
 
     info = status(path=args.path, db_path=args.db)

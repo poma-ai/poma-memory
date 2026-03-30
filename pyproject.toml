@@ -19,15 +19,15 @@ classifiers = [
 ]
 
 dependencies = [
-    "tiktoken>=0.5.0",
-    "bm25s>=0.2.0",
-    "numpy>=1.24.0",
+    "tiktoken~=0.11.0",
+    "bm25s~=0.3.0",
+    "numpy~=2.2.0",
 ]
 
 [project.optional-dependencies]
-semantic = ["model2vec>=0.3.0"]
-openai = ["openai>=1.0"]
-mcp = ["mcp>=1.2.0"]
+semantic = ["model2vec~=0.7.0"]
+openai = ["openai~=1.109.0"]
+mcp = ["mcp~=1.26.0"]
 dev = ["pytest>=7.0", "pytest-mock"]
 
 [project.scripts]

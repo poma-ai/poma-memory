@@ -1,16 +1,32 @@
 # poma-memory
 
-Free, local, structure-preserving memory for AI agents. No API key. No cloud. Just markdown.
+**Your AI agent loses context every session. poma-memory gives it back.**
 
-poma-memory is an open-source extraction of [POMA](https://poma-ai.com)'s heuristic chunking engine, optimized for the kind of well-structured markdown that AI agents produce. It indexes `.agent/` context files into hierarchical chunks and returns complete root-to-leaf context paths — not disconnected snippets.
+AI coding agents (Claude Code, Cursor, Copilot) accumulate valuable project knowledge — decisions, architecture notes, task history — in markdown files (`.claude/`, `.cursor/`, `.github/copilot/`). But when context windows fill up or sessions restart, that knowledge becomes invisible. Grep finds strings; it doesn't understand structure.
 
-**No POMA account or API key required.** This is a standalone tool.
+poma-memory indexes those markdown files and returns **complete, readable context** — not disconnected snippets. When you search for "auth middleware", you get the matching paragraph _plus_ its parent headings and surrounding context, assembled into a coherent cheatsheet with `[...]` gap markers. The result reads like a compressed version of the original document.
 
-## Why agent memory specifically?
+**No POMA account or API key required.** Free, local, open-source.
 
-AI coding agents (Claude Code, Cursor, Copilot) write remarkably clean markdown: consistent heading hierarchies, predictable list structures, uniform formatting. This is the sweet spot for heuristic chunking — no ML models needed to parse the structure correctly.
+---
 
-poma-memory exploits this by preserving the full document hierarchy during chunking. When you search for "auth middleware", you get the matching paragraph _plus_ its parent headings and surrounding context, assembled into a coherent cheatsheet with `[...]` gap markers. The result reads like a compressed version of the original document, not a bag of fragments.
+## The Problem
+
+Standard search (grep, embeddings over flat chunks) breaks document structure:
+
+- **Orphaned content** — a paragraph arrives without its heading, so the agent doesn't know what section it belongs to
+- **Lost hierarchy** — a nested list item loses its parent context
+- **Fragment soup** — five hits from the same file come back as five disconnected blocks instead of one readable summary
+
+For agent memory files — which are deeply hierarchical by design — this means the agent retrieves *text* but not *understanding*.
+
+## The Solution
+
+poma-memory preserves the full document hierarchy during chunking. Every retrieval unit is a root-to-leaf path through the heading tree, so results always carry complete context. Multiple hits from the same file are merged into a single cheatsheet.
+
+This is an open-source extraction of [POMA](https://poma-ai.com)'s heuristic chunking engine, optimized for the clean, consistent markdown that AI agents produce.
+
+---
 
 ## Install
 
@@ -25,29 +41,34 @@ pip install poma-memory[semantic,mcp]           # recommended combo
 ## Quick start
 
 ```bash
-poma-memory index .agent/                                    # index your context files
-poma-memory search "authentication middleware" --path .agent/ # search
-poma-memory status --path .agent/                            # check what's indexed
+poma-memory index .claude/                                    # index your context files
+poma-memory search "authentication middleware" --path .claude/ # search
 ```
 
 ## MCP server (Claude Code)
+
+Add poma-memory as an MCP server so Claude Code can search your project memory automatically:
 
 ```bash
 claude mcp add --transport stdio --scope user poma-memory -- poma-memory-mcp
 # Exposes poma_search, poma_index, poma_status tools
 ```
 
+Once added, Claude Code can call `poma_search` during planning and exploration to surface relevant decisions, patterns, and context from prior sessions.
+
 ## Python API
 
 ```python
 from poma_memory import index, search, status
 
-index(path=".agent/")
-results = search("session context", path=".agent/", top_k=5)
+index(path=".claude/")
+results = search("session context", path=".claude/", top_k=5)
 for r in results:
     print(f"{r['file_path']} (score: {r['score']:.4f})")
     print(r['context'])
 ```
+
+---
 
 ## How it works
 
@@ -67,6 +88,8 @@ for r in results:
 
 Multiple backends are automatically fused via Reciprocal Rank Fusion when available.
 
+---
+
 ## What this is (and isn't)
 
 poma-memory extracts the **heuristic chunking and retrieval** logic from POMA's document processing platform. It works well on clean, predictable markdown — exactly what agents produce.
@@ -75,7 +98,7 @@ It does **not** include POMA's ML-powered indentation analysis, fine-tuned embed
 
 ## Built for
 
-- AI coding agents that persist context in markdown (`.agent/`, `.cursor/`, project notes)
+- AI coding agents that persist context in markdown (`.claude/`, `.cursor/`, `.github/copilot/`)
 - [Megavibe](https://github.com/poma-ai/megavibe) multi-agent framework (ships with poma-memory integration)
 - Claude Code hook pipelines (augment Grep results with semantic context)
 

@@ -17,7 +17,7 @@ def parse_indented_text(arrow_text: str) -> list[dict]:
         List of dicts: [{chunk_index, content, depth}]
     """
     chunks = []
-    for i, line in enumerate(arrow_text.split("\n")):
+    for _, line in enumerate(arrow_text.split("\n")):
         if not line.strip():
             continue
         depth = 0

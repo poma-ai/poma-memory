@@ -11,3 +11,6 @@ build/
 *.db-shm
 *.db-wal
 .DS_Store
+.claude/
+CLAUDE.local.md
+events.jsonl

@@ -156,4 +156,5 @@ def _full_reindex(
 
 
 def _hash(text: str) -> str:
+    """Hash a string using SHA-256."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()

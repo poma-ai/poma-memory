@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "poma-memory"
-version = "0.3.1"
+version = "0.3.2"
 description = "Persistent context for AI coding agents. No cloud. Just markdown."
 readme = "README.md"
 license = "MIT"

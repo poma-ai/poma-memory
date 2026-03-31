@@ -1,6 +1,6 @@
 """poma-memory: Persistent context for AI coding agents."""
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 # Re-export chunking primitives from poma-primecut-nano
 from poma_primecut_nano import (

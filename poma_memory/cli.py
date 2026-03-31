@@ -1,4 +1,4 @@
-"""CLI entry point: poma-memory index|search|status."""
+"""CLI entry point: poma-memory index|search|status|mcp."""
 
 from __future__ import annotations
 
@@ -41,6 +41,9 @@ def main(argv: list[str] | None = None) -> None:
     p_status.add_argument("--path", default=".agent/")
     p_status.add_argument("--db", help="Database path")
 
+    # mcp
+    sub.add_parser("mcp", help="Start MCP server (requires: pip install poma-memory[mcp])")
+
     args = parser.parse_args(argv)
 
     if args.command == "index":
@@ -49,6 +52,8 @@ def main(argv: list[str] | None = None) -> None:
         _cmd_search(args)
     elif args.command == "status":
         _cmd_status(args)
+    elif args.command == "mcp":
+        _cmd_mcp()
 
 
 def _cmd_index(args: argparse.Namespace) -> None:
@@ -116,6 +121,20 @@ def _cmd_status(args: argparse.Namespace) -> None:
     print(f"Semantic:  {'yes' if info['has_embeddings'] else 'no'}")
     for f in info["files"]:
         print(f"  - {f}")
+
+
+def _cmd_mcp() -> None:
+    """Start the MCP server (stdio transport)."""
+    try:
+        from poma_memory.mcp_server import main as mcp_main
+    except ImportError:
+        print(
+            "MCP dependencies not installed.\n"
+            "Run: pip install poma-memory[mcp]",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    mcp_main()
 
 
 if __name__ == "__main__":

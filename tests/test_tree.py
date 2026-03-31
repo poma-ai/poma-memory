@@ -1,6 +1,6 @@
 """Tests for tree parsing and depth normalization."""
 
-from poma_memory.tree import parse_indented_text, normalize_depths
+from poma_primecut_nano.tree import parse_indented_text, normalize_depths
 
 
 def test_parse_basic():

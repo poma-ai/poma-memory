@@ -3,9 +3,9 @@
 import os
 import tempfile
 
-from poma_memory.chunker import indent_light
-from poma_memory.tree import parse_indented_text, normalize_depths
-from poma_memory.chunksets import chunks_to_chunksets
+from poma_primecut_nano.chunker import indent_light
+from poma_primecut_nano.tree import parse_indented_text, normalize_depths
+from poma_primecut_nano.chunksets import chunks_to_chunksets
 from poma_memory.store import Store
 from poma_memory.bm25_search import BM25Search
 

@@ -1,6 +1,6 @@
 """Tests for the heuristic markdown chunker."""
 
-from poma_memory.chunker import indent_light
+from poma_primecut_nano.chunker import indent_light
 
 
 def test_basic_heading_hierarchy():

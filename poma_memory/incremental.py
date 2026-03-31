@@ -5,9 +5,9 @@ from __future__ import annotations
 import hashlib
 import os
 
-from poma_memory.chunker import indent_light
-from poma_memory.tree import parse_indented_text, normalize_depths
-from poma_memory.chunksets import chunks_to_chunksets
+from poma_primecut_nano.chunker import indent_light
+from poma_primecut_nano.tree import parse_indented_text, normalize_depths
+from poma_primecut_nano import chunks_to_chunksets
 from poma_memory.store import Store
 
 

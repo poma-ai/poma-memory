@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "poma-memory"
-version = "0.2.0"
-description = "Structure-preserving memory for AI agents. No cloud. Just markdown."
+version = "0.3.0"
+description = "Persistent context for AI coding agents. No cloud. Just markdown."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
-authors = [{ name = "POMA Team" }]
-keywords = ["poma", "memory", "rag", "chunking", "agentic", "markdown"]
+authors = [{ name = "POMA AI GmbH, Berlin", email = "hello@poma-ai.com" }]
+keywords = ["poma", "memory", "rag", "agentic", "markdown", "claude-code", "mcp"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -19,6 +19,7 @@ classifiers = [
 ]
 
 dependencies = [
+    "poma-primecut-nano~=0.1.0",
     "tiktoken~=0.11.0",
     "bm25s~=0.3.0",
     "numpy~=2.2.0",
@@ -33,6 +34,10 @@ dev = ["pytest>=7.0", "pytest-mock"]
 [project.scripts]
 poma-memory = "poma_memory.cli:main"
 poma-memory-mcp = "poma_memory.mcp_server:main"
+
+[project.urls]
+Homepage = "https://github.com/poma-ai/poma-memory"
+Documentation = "https://github.com/poma-ai/poma-memory#readme"
 
 [tool.setuptools.packages.find]
 include = ["poma_memory*"]

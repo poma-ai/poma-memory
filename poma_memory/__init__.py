@@ -1,21 +1,31 @@
-"""poma-memory: Structure-preserving memory for AI agents."""
+"""poma-memory: Persistent context for AI coding agents."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
-from poma_memory.chunker import indent_light
-from poma_memory.chunksets import chunks_to_chunksets, chunks_to_chunksets_optimized
-from poma_memory.retrieval import expand_chunk_ids, expand_chunk_ids_deep, assemble_context
-from poma_memory.normalize import normalize_for_embedding
+# Re-export chunking primitives from poma-primecut-nano
+from poma_primecut_nano import (
+    chunk,
+    chunks_to_chunksets,
+    chunks_to_chunksets_optimized,
+    expand_chunk_ids,
+    expand_chunk_ids_deep,
+    assemble_context,
+    normalize_for_embedding,
+)
+
+# poma-memory's own API
 from poma_memory.api import index, search, status
 
 __all__ = [
-    "indent_light",
+    # From poma-primecut-nano (re-exported for convenience)
+    "chunk",
     "chunks_to_chunksets",
     "chunks_to_chunksets_optimized",
     "expand_chunk_ids",
     "expand_chunk_ids_deep",
     "assemble_context",
     "normalize_for_embedding",
+    # poma-memory API
     "index",
     "search",
     "status",

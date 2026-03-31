@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from poma_memory.bm25_search import BM25Search
-from poma_memory.retrieval import expand_chunk_ids, assemble_context
+from poma_primecut_nano import expand_chunk_ids, assemble_context
 
 if TYPE_CHECKING:
     from poma_memory.store import Store

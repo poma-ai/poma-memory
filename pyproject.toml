@@ -9,7 +9,7 @@ description = "Persistent context for AI coding agents. No cloud. Just markdown.
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
-authors = [{ name = "POMA AI GmbH, Berlin", email = "hello@poma-ai.com" }]
+authors = [{ name = "POMA AI GmbH, Berlin", email = "sdk@poma-ai.com" }]
 keywords = ["poma", "memory", "rag", "agentic", "markdown", "claude-code", "mcp"]
 classifiers = [
     "Development Status :: 3 - Alpha",

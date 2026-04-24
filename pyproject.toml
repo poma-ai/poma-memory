@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "poma-memory"
-version = "0.3.2"
+version = "0.3.3"
 description = "Persistent context for AI coding agents. No cloud. Just markdown."
 readme = "README.md"
 license = "MIT"
@@ -19,16 +19,16 @@ classifiers = [
 ]
 
 dependencies = [
-    "poma-primecut-nano~=0.1.0",
-    "tiktoken~=0.11.0",
-    "bm25s~=0.3.0",
-    "numpy~=2.2.0",
+    "poma-primecut-nano>=0.1.0,<1",
+    "tiktoken>=0.11,<1",
+    "bm25s>=0.3,<1",
+    "numpy>=2.2,<3",
 ]
 
 [project.optional-dependencies]
-semantic = ["model2vec~=0.7.0"]
-openai = ["openai~=1.109.0"]
-mcp = ["mcp~=1.26.0"]
+semantic = ["model2vec>=0.7,<1"]
+openai = ["openai>=1.109,<2"]
+mcp = ["mcp>=1.26,<2"]
 dev = ["pytest>=7.0", "pytest-mock"]
 
 [project.scripts]

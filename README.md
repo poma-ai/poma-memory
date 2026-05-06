@@ -32,10 +32,10 @@ This is an open-source extraction of [POMA](https://poma-ai.com)'s heuristic chu
 
 ```bash
 pip install poma-memory                         # BM25 keyword search (always works)
-pip install poma-memory[semantic]               # + model2vec local embeddings (30MB, no API key)
-pip install poma-memory[openai]                 # + OpenAI text-embedding-3-large
-pip install poma-memory[mcp]                    # + MCP server for Claude Code
-pip install poma-memory[semantic,mcp]           # recommended combo
+pip install 'poma-memory[semantic]'               # + model2vec local embeddings (30MB, no API key)
+pip install 'poma-memory[openai]'                 # + OpenAI text-embedding-3-large
+pip install 'poma-memory[mcp]'                    # + MCP server for Claude Code
+pip install 'poma-memory[semantic,mcp]'           # recommended combo
 ```
 
 ## Quick start

@@ -3,6 +3,8 @@
 import os
 import tempfile
 
+import pytest
+
 from poma_memory.store import Store
 from poma_memory.incremental import update_file
 from poma_memory.search import HybridSearch
@@ -205,5 +207,35 @@ def test_empty_search():
         for r in results:
             assert "file_path" in r
             assert "context" in r
+
+        store.close()
+
+
+def test_status_has_embeddings_after_semantic_search():
+    """status() must report has_embeddings=True once chunkset embeddings exist.
+
+    Regression: status() previously queried `chunks.embedding`, but the current
+    semantic pipeline only writes embeddings on chunksets, so has_embeddings
+    was always False even when semantic search was active.
+    """
+    pytest.importorskip("model2vec")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        md_path = os.path.join(tmpdir, "notes.md")
+        db_path = os.path.join(tmpdir, "test.db")
+
+        with open(md_path, "w") as f:
+            f.write(SAMPLE_MD)
+
+        store = Store(db_path)
+        update_file(store, md_path)
+
+        assert store.status()["has_embeddings"] is False
+
+        # First semantic-enabled search triggers embedding generation + persistence.
+        hybrid = HybridSearch(store, enable_semantic=True)
+        hybrid.search("authentication", top_k=1)
+
+        assert store.status()["has_embeddings"] is True
 
         store.close()

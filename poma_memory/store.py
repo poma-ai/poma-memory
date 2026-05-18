@@ -244,12 +244,17 @@ class Store:
     # --- Status ---
 
     def status(self) -> dict:
-        """Summarize indexed files, chunk/chunkset counts, and whether any chunk has an embedding."""
+        """Summarize indexed files, chunk/chunkset counts, and whether any embedding exists.
+
+        Embeddings live on the ``chunksets`` table (one vector per chunkset), not on
+        ``chunks``. Checking only ``chunks.embedding`` reports ``has_embeddings=False``
+        even when every chunkset is fully embedded.
+        """
         files = self._conn.execute("SELECT file_path FROM files").fetchall()
         chunk_count = self._conn.execute("SELECT COUNT(*) as c FROM chunks").fetchone()["c"]
         chunkset_count = self._conn.execute("SELECT COUNT(*) as c FROM chunksets").fetchone()["c"]
         has_emb = self._conn.execute(
-            "SELECT COUNT(*) as c FROM chunks WHERE embedding IS NOT NULL"
+            "SELECT COUNT(*) as c FROM chunksets WHERE embedding IS NOT NULL"
         ).fetchone()["c"] > 0
 
         return {

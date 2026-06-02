@@ -29,8 +29,16 @@ class HybridSearch:
         if enable_semantic and HAS_SEMANTIC:
             try:
                 self._semantic = _create_semantic(store)
-            except Exception:
-                pass  # model not available, fall back to BM25 only
+            except Exception as e:
+                # Fall back to BM25 only, but surface WHY on stderr — a silent
+                # `pass` here hid a perpetual "Semantic: no" for a long time.
+                # (Callers that must stay quiet, e.g. hooks, redirect stderr.)
+                import sys
+                print(
+                    f"poma-memory: semantic search unavailable, using BM25 only "
+                    f"({type(e).__name__}: {e})",
+                    file=sys.stderr,
+                )
 
     def search(
         self,

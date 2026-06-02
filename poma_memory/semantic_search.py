@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -176,11 +177,29 @@ SemanticSearch = Model2VecSearch
 
 
 def create_search(store: Store) -> _EmbedderBase:
-    """Auto-select: OpenAI if OPENAI_API_KEY set, else model2vec."""
-    client = _get_openai_client()
-    if client is not None:
-        try:
-            return OpenAISearch(store, client)
-        except Exception as e:
-            print(f"Error creating OpenAI search client: {e}")
+    """Select an embedder. Local model2vec is the default — private, free, no
+    network, and deterministic across processes (avoids embedding-dimension
+    thrash when one caller has OPENAI_API_KEY and another does not).
+
+    Opt into OpenAI embeddings explicitly with POMA_EMBEDDER=openai. NOTE: that
+    sends the indexed content to OpenAI's API — do not enable it for private or
+    proprietary corpora unless that data egress is acceptable.
+    """
+    if os.environ.get("POMA_EMBEDDER", "").strip().lower() == "openai":
+        client = _get_openai_client()
+        if client is not None:
+            try:
+                return OpenAISearch(store, client)
+            except Exception as e:
+                print(
+                    f"poma-memory: OpenAI embedder init failed ({e}); "
+                    "falling back to local model2vec",
+                    file=sys.stderr,
+                )
+        else:
+            print(
+                "poma-memory: POMA_EMBEDDER=openai set but no OPENAI_API_KEY / "
+                "openai SDK available; using local model2vec",
+                file=sys.stderr,
+            )
     return Model2VecSearch(store)

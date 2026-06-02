@@ -55,6 +55,7 @@ def search(
     path: str | Path = ".agent/",
     db_path: str | Path | None = None,
     top_k: int = 5,
+    min_score: float = 0.0,
 ) -> list[dict]:
     """Search indexed content.
 
@@ -63,6 +64,7 @@ def search(
         path: Directory that was indexed (for default db_path)
         db_path: SQLite database path
         top_k: Number of results to return
+        min_score: Drop results below this fused score (0.0 = no floor)
 
     Returns:
         List of dicts with keys: file_path, score, context, chunk_ids
@@ -73,7 +75,7 @@ def search(
 
     store = Store(db_path)
     hybrid = HybridSearch(store)
-    results = hybrid.search(query, top_k=top_k)
+    results = hybrid.search(query, top_k=top_k, min_score=min_score)
     store.close()
     return results
 

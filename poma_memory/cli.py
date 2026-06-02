@@ -33,6 +33,8 @@ def main(argv: list[str] | None = None) -> None:
                           help="Directory that was indexed")
     p_search.add_argument("--db", help="Database path")
     p_search.add_argument("--top", "--top-k", type=int, default=5, help="Number of results")
+    p_search.add_argument("--min-score", type=float, default=0.0, dest="min_score",
+                          help="Drop results below this fused score (0.0 = no floor)")
     p_search.add_argument("--json", action="store_true", dest="as_json",
                           help="Output as JSON")
 
@@ -89,6 +91,7 @@ def _cmd_search(args: argparse.Namespace) -> None:
         path=args.path,
         db_path=args.db,
         top_k=args.top,
+        min_score=args.min_score,
     )
 
     if args.as_json:

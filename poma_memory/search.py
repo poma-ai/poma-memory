@@ -45,6 +45,7 @@ class HybridSearch:
         query: str,
         top_k: int = 5,
         max_per_file: int = 3,
+        min_score: float = 0.0,
     ) -> list[dict]:
         """Search with hybrid BM25 + semantic fusion.
 
@@ -118,6 +119,12 @@ class HybridSearch:
                 "chunk_ids": expanded_ids,
             })
 
+        # Relevance floor: drop weak hits. RRF scores cluster ~0.027+ when both
+        # BM25 and semantic corroborate a result, vs ~0.016 for single-signal
+        # noise — a floor in that gap keeps corroborated context and injects
+        # nothing when nothing is genuinely relevant.
+        if min_score > 0.0:
+            results = [r for r in results if r["score"] >= min_score]
         return results
 
 

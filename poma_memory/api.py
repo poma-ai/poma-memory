@@ -2,11 +2,26 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 from poma_memory.store import Store
 from poma_memory.incremental import update_file
 from poma_memory.search import HybridSearch
+
+
+def format_updated(upserted_at: float | None) -> str | None:
+    """Render a chunkset's upsert time as a YYYY-MM-DD date for result output.
+
+    Returns None for 0/missing (legacy rows indexed before age tracking) so
+    callers can omit the line rather than print a misleading epoch-0 date.
+    """
+    if not upserted_at:
+        return None
+    try:
+        return datetime.fromtimestamp(upserted_at).strftime("%Y-%m-%d")
+    except (ValueError, OSError, OverflowError):
+        return None
 
 
 def index(

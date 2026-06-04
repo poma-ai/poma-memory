@@ -102,9 +102,13 @@ def _cmd_search(args: argparse.Namespace) -> None:
         print("No results found.")
         return
 
+    from poma_memory.api import format_updated
     for i, r in enumerate(results, 1):
         print(f"\n--- Result {i} (score: {r['score']:.4f}) ---")
         print(f"File: {r['file_path']}")
+        updated = format_updated(r.get("upserted_at"))
+        if updated:
+            print(f"Updated: {updated}")
         print(r["context"])
 
 

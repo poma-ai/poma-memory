@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from pathlib import Path
 
 
@@ -34,6 +35,7 @@ CREATE TABLE IF NOT EXISTS chunksets (
     contents     TEXT NOT NULL,
     to_embed     TEXT NOT NULL DEFAULT '',
     embedding    BLOB,
+    upserted_at  REAL NOT NULL DEFAULT 0,
     UNIQUE(file_path, local_index)
 );
 
@@ -93,6 +95,18 @@ class Store:
         try:
             self._conn.execute(
                 "ALTER TABLE chunksets ADD COLUMN to_embed TEXT NOT NULL DEFAULT ''"
+            )
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+        # v0.3.8: added upserted_at to chunksets (per-chunkset age signal). Existing
+        # rows default to 0 = "unknown age"; true timestamps accrue as content is
+        # (re)indexed. The append fast path preserves old rows, so chunks appended
+        # over time keep their original insert time — real age for append-only logs.
+        try:
+            self._conn.execute(
+                "ALTER TABLE chunksets ADD COLUMN upserted_at REAL NOT NULL DEFAULT 0"
             )
             self._conn.commit()
         except sqlite3.OperationalError:
@@ -172,15 +186,34 @@ class Store:
     # --- Chunksets ---
 
     def insert_chunksets(self, file_path: str, chunksets: list[dict]) -> None:
+        # Stamp insert time so search can surface content age. Appends insert only
+        # NEW chunksets (old ones are untouched), so each chunkset's timestamp
+        # reflects when its content first entered the index.
+        now = time.time()
         for cs in chunksets:
             self._conn.execute(
-                """INSERT INTO chunksets (file_path, local_index, chunk_ids, contents, to_embed)
-                   VALUES (?, ?, ?, ?, ?)""",
+                """INSERT INTO chunksets (file_path, local_index, chunk_ids, contents, to_embed, upserted_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
                 (file_path, cs["chunkset_index"],
                  json.dumps(cs["chunk_ids"]), cs["contents"],
-                 cs.get("to_embed", "")),
+                 cs.get("to_embed", ""), now),
             )
         self._conn.commit()
+
+    def max_chunkset_upserted(self, chunkset_ids: list[int]) -> float:
+        """Newest upsert time among the given chunksets (0.0 if none/unknown).
+
+        Used to surface the age of a search result: the freshest matched chunkset
+        in a file answers "how recent is this context?".
+        """
+        if not chunkset_ids:
+            return 0.0
+        placeholders = ",".join("?" for _ in chunkset_ids)
+        row = self._conn.execute(
+            f"SELECT MAX(upserted_at) AS m FROM chunksets WHERE chunkset_id IN ({placeholders})",
+            list(chunkset_ids),
+        ).fetchone()
+        return float(row["m"]) if row and row["m"] is not None else 0.0
 
     def get_all_chunksets(self) -> list[dict]:
         rows = self._conn.execute(

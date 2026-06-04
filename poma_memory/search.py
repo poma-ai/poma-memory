@@ -112,11 +112,15 @@ class HybridSearch:
                 expanded_ids = unique_ids
                 context = "\n".join(h["contents"] for h in fhits)
 
+            # Age of this result = newest matched chunkset in the file (0.0 = unknown,
+            # e.g. legacy rows indexed before upserted_at existed).
+            cs_ids = [h["chunkset_id"] for h in fhits if "chunkset_id" in h]
             results.append({
                 "file_path": file_path,
                 "score": file_scores[file_path],
                 "context": context,
                 "chunk_ids": expanded_ids,
+                "upserted_at": self._store.max_chunkset_upserted(cs_ids),
             })
 
         # Relevance floor: drop weak hits. RRF scores cluster ~0.027+ when both

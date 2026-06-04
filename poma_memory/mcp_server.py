@@ -38,11 +38,15 @@ def poma_search(query: str, path: str = ".agent/", top_k: int = 5, min_score: fl
     if not results:
         return "No results found."
 
+    from poma_memory.api import format_updated
     output = []
     for i, r in enumerate(results, 1):
+        updated = format_updated(r.get("upserted_at"))
+        updated_line = f"Updated: {updated}\n" if updated else ""
         output.append(
             f"--- Result {i} (score: {r['score']:.4f}) ---\n"
             f"File: {r['file_path']}\n"
+            f"{updated_line}"
             f"{r['context']}"
         )
 

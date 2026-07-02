@@ -207,3 +207,89 @@ def test_empty_search():
             assert "context" in r
 
         store.close()
+
+
+class _StubSemantic:
+    """Fake embedder: fixed hit list + calibrated gate, no model download."""
+
+    empty_gate = 0.35
+
+    def __init__(self, hits):
+        self._hits = hits
+
+    def search(self, query, top_k=10):
+        return self._hits[:top_k]
+
+
+def _indexed_store(tmpdir):
+    md_path = os.path.join(tmpdir, "notes.md")
+    with open(md_path, "w") as f:
+        f.write(SAMPLE_MD)
+    store = Store(os.path.join(tmpdir, "test.db"))
+    update_file(store, md_path)
+    return store, md_path
+
+
+def _stub_hit(store, md_path, cosine):
+    """A semantic hit shaped like semantic_search output, score = cosine."""
+    cs = store.get_all_chunksets()[0]
+    return {
+        "chunkset_id": cs["chunkset_id"],
+        "file_path": md_path,
+        "chunk_ids": cs["chunk_ids"] if isinstance(cs["chunk_ids"], list) else [0],
+        "contents": cs["contents"],
+        "score": cosine,
+    }
+
+
+def test_empty_gate_suppresses_weak_corpus():
+    """Best semantic cosine below the gate -> NO results, even with BM25 hits."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store, md_path = _indexed_store(tmpdir)
+        hybrid = HybridSearch(store, enable_semantic=False)
+        hybrid._semantic = _StubSemantic([_stub_hit(store, md_path, 0.20)])
+
+        assert hybrid.search("JWT tokens", top_k=3) == []
+        store.close()
+
+
+def test_empty_gate_passes_strong_corpus():
+    """Best semantic cosine above the gate -> results flow through fusion."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store, md_path = _indexed_store(tmpdir)
+        hybrid = HybridSearch(store, enable_semantic=False)
+        hybrid._semantic = _StubSemantic([_stub_hit(store, md_path, 0.60)])
+
+        results = hybrid.search("JWT tokens", top_k=3)
+        assert results
+        store.close()
+
+
+def test_empty_gate_param_and_env_override():
+    """Precedence: explicit param > env var > embedder default; 0 disables."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store, md_path = _indexed_store(tmpdir)
+        hybrid = HybridSearch(store, enable_semantic=False)
+        hybrid._semantic = _StubSemantic([_stub_hit(store, md_path, 0.20)])
+
+        # Param 0.0 disables the gate despite the weak cosine
+        assert hybrid.search("JWT tokens", top_k=3, empty_gate=0.0)
+
+        # Env override below the cosine also lets results through
+        os.environ["POMA_MEMORY_EMPTY_GATE"] = "0.1"
+        try:
+            assert hybrid.search("JWT tokens", top_k=3)
+            # Explicit param beats env
+            assert hybrid.search("JWT tokens", top_k=3, empty_gate=0.5) == []
+        finally:
+            del os.environ["POMA_MEMORY_EMPTY_GATE"]
+        store.close()
+
+
+def test_bm25_only_mode_has_no_gate():
+    """Without a semantic engine there is no cosine to gate on — unchanged."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store, _ = _indexed_store(tmpdir)
+        hybrid = HybridSearch(store, enable_semantic=False)
+        assert hybrid.search("JWT tokens", top_k=3)
+        store.close()

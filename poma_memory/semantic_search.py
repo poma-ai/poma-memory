@@ -20,10 +20,23 @@ if TYPE_CHECKING:
 _M2V_MODEL = "minishlab/potion-retrieval-32M"
 _M2V_CUTOFF = 0.10
 _M2V_DIMS = 512
+# Empty gate: if even the BEST hit's cosine is below this, the corpus has no
+# answer for the query and the whole result set should be suppressed (RRF
+# fused scores are rank-based and saturate, so they cannot express "nothing
+# here is relevant" — only an absolute similarity can). Calibrated 2026-07-02
+# on a real .agent/ corpus (poma-core, 12 answerable + 10 irrelevant queries):
+# irrelevant top-1 cosines 0.14–0.25, answerable 0.44–0.71 — 0.35 sits mid-gap,
+# rejecting 10/10 irrelevant while keeping 12/12 answerable.
+_M2V_EMPTY_GATE = 0.35
 
 _OAI_MODEL = "text-embedding-3-large"
 _OAI_CUTOFF = 0.25
 _OAI_DIMS = 3072
+# Not yet calibrated for text-embedding-3-large (different cosine scale —
+# runs cooler than model2vec). Conservatively equal to the per-hit cutoff:
+# gate fires only when NO hit clears the cutoff, i.e. behavior is unchanged
+# until someone calibrates a real corpus and raises it.
+_OAI_EMPTY_GATE = 0.25
 
 
 def _get_openai_client():
@@ -41,6 +54,7 @@ class _EmbedderBase:
     """Common logic for cosine search over stored embeddings."""
 
     min_score: float = 0.0
+    empty_gate: float = 0.0
     expected_dims: int = 0
 
     def __init__(self, store: Store):
@@ -135,6 +149,7 @@ class Model2VecSearch(_EmbedderBase):
     """Local vector search using model2vec (30MB, no API key)."""
 
     min_score = _M2V_CUTOFF
+    empty_gate = _M2V_EMPTY_GATE
     expected_dims = _M2V_DIMS
 
     def __init__(self, store: Store):
@@ -153,6 +168,7 @@ class OpenAISearch(_EmbedderBase):
     """Vector search using OpenAI text-embedding-3-large."""
 
     min_score = _OAI_CUTOFF
+    empty_gate = _OAI_EMPTY_GATE
     expected_dims = _OAI_DIMS
 
     def __init__(self, store: Store, client):

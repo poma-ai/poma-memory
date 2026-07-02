@@ -18,7 +18,13 @@ mcp = FastMCP("poma-memory")
 
 
 @mcp.tool()
-def poma_search(query: str, path: str = ".agent/", top_k: int = 5, min_score: float = 0.0) -> str:
+def poma_search(
+    query: str,
+    path: str = ".agent/",
+    top_k: int = 5,
+    min_score: float = 0.0,
+    empty_gate: float | None = None,
+) -> str:
     """Search indexed .agent/ content with structure-preserving hierarchical context.
 
     Returns ranked results with ancestor headings and [...] gap markers
@@ -30,10 +36,14 @@ def poma_search(query: str, path: str = ".agent/", top_k: int = 5, min_score: fl
         path: Directory that was indexed (default: .agent/)
         top_k: Number of results to return (default: 5)
         min_score: Drop results below this fused score (0.0 = no floor)
+        empty_gate: Suppress ALL results when the best semantic hit's cosine
+            is below this (default: embedder-calibrated; 0 disables)
     """
     from poma_memory.api import search
 
-    results = search(query=query, path=path, top_k=top_k, min_score=min_score)
+    results = search(
+        query=query, path=path, top_k=top_k, min_score=min_score, empty_gate=empty_gate
+    )
 
     if not results:
         return "No results found."

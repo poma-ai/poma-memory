@@ -75,8 +75,9 @@ for r in results:
 1. **Hierarchical chunking.** Markdown is parsed into depth-annotated chunks that preserve heading hierarchy, lists, code blocks, and tables.
 2. **Chunkset assembly.** Leaf chunks are paired with their ancestors into self-contained retrieval units (root-to-leaf paths), so every result carries full context.
 3. **Hybrid search.** BM25 keyword matching (always available) + optional semantic vectors, merged via Reciprocal Rank Fusion.
-4. **Cheatsheet merging.** Multiple hits from the same file are merged into one block with `[...]` gap markers — reads like a summary, not a list of excerpts.
-5. **Incremental indexing.** Append-only files (like agent context logs) only process new content on re-index.
+4. **Empty gate.** RRF scores are rank-based — something always tops the list, so a fused-score floor can't express "the corpus has no answer." The gate can: when even the *best* semantic hit's cosine similarity is below a per-embedder calibrated threshold (model2vec: 0.35 — calibrated on a real corpus where irrelevant queries topped out at 0.25 and answerable ones started at 0.44), *all* results are suppressed instead of returning the best of a bad lot. Override per call (`--empty-gate`, `empty_gate=`), via `POMA_MEMORY_EMPTY_GATE`, or disable with `0`. BM25-only mode has no cosine and is ungated.
+5. **Cheatsheet merging.** Multiple hits from the same file are merged into one block with `[...]` gap markers — reads like a summary, not a list of excerpts.
+6. **Incremental indexing.** Append-only files (like agent context logs) only process new content on re-index.
 
 ### Search backends
 

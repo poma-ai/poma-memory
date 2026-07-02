@@ -35,6 +35,9 @@ def main(argv: list[str] | None = None) -> None:
     p_search.add_argument("--top", "--top-k", type=int, default=5, help="Number of results")
     p_search.add_argument("--min-score", type=float, default=0.0, dest="min_score",
                           help="Drop results below this fused score (0.0 = no floor)")
+    p_search.add_argument("--empty-gate", type=float, default=None, dest="empty_gate",
+                          help="Suppress ALL results when the best semantic hit's cosine "
+                               "is below this (default: embedder-calibrated; 0 disables)")
     p_search.add_argument("--json", action="store_true", dest="as_json",
                           help="Output as JSON")
 
@@ -92,6 +95,7 @@ def _cmd_search(args: argparse.Namespace) -> None:
         db_path=args.db,
         top_k=args.top,
         min_score=args.min_score,
+        empty_gate=args.empty_gate,
     )
 
     if args.as_json:

@@ -71,6 +71,7 @@ def search(
     db_path: str | Path | None = None,
     top_k: int = 5,
     min_score: float = 0.0,
+    empty_gate: float | None = None,
 ) -> list[dict]:
     """Search indexed content.
 
@@ -80,6 +81,9 @@ def search(
         db_path: SQLite database path
         top_k: Number of results to return
         min_score: Drop results below this fused score (0.0 = no floor)
+        empty_gate: Suppress ALL results when the best semantic hit's cosine
+            is below this (None = embedder's calibrated default, 0.0 =
+            disable; env override POMA_MEMORY_EMPTY_GATE)
 
     Returns:
         List of dicts with keys: file_path, score, context, chunk_ids
@@ -90,7 +94,9 @@ def search(
 
     store = Store(db_path)
     hybrid = HybridSearch(store)
-    results = hybrid.search(query, top_k=top_k, min_score=min_score)
+    results = hybrid.search(
+        query, top_k=top_k, min_score=min_score, empty_gate=empty_gate
+    )
     store.close()
     return results
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 from poma_memory.bm25_search import BM25Search
@@ -46,6 +47,7 @@ class HybridSearch:
         top_k: int = 5,
         max_per_file: int = 3,
         min_score: float = 0.0,
+        empty_gate: float | None = None,
     ) -> list[dict]:
         """Search with hybrid BM25 + semantic fusion.
 
@@ -53,6 +55,10 @@ class HybridSearch:
             query: Search query
             top_k: Number of results to return
             max_per_file: Max hits from a single file (prevents domination)
+            min_score: Drop results below this RRF-fused score (0.0 = no floor)
+            empty_gate: Suppress ALL results when the best semantic hit's
+                cosine is below this. None = the embedder's calibrated
+                default; 0.0 disables. Env override: POMA_MEMORY_EMPTY_GATE.
 
         Returns:
             List of dicts: [{file_path, score, context, chunk_ids}]
@@ -62,6 +68,17 @@ class HybridSearch:
 
         if self._semantic:
             vec_hits = self._semantic.search(query, top_k=top_k * 3)
+            # Empty gate on ABSOLUTE similarity of the single best semantic
+            # hit. RRF fused scores are rank-based: something always tops the
+            # list, and a top-of-both-lists hit scores ~0.033 whether it is a
+            # genuine answer or merely the best of a bad lot — so no fused-
+            # score floor can express "the corpus has no answer". The top-1
+            # cosine can: below the (per-embedder calibrated) gate, inject
+            # nothing at all. BM25-only mode has no cosine, hence no gate.
+            gate = self._resolve_empty_gate(empty_gate)
+            top1 = vec_hits[0]["score"] if vec_hits else 0.0
+            if top1 < gate:
+                return []
             merged = _reciprocal_rank_fusion(bm25_hits, vec_hits, k=top_k * 3)
         else:
             merged = bm25_hits
@@ -130,6 +147,19 @@ class HybridSearch:
         if min_score > 0.0:
             results = [r for r in results if r["score"] >= min_score]
         return results
+
+    def _resolve_empty_gate(self, empty_gate: float | None) -> float:
+        """Precedence: explicit param > POMA_MEMORY_EMPTY_GATE env >
+        embedder's calibrated default. 0.0 (any layer) disables."""
+        if empty_gate is not None:
+            return empty_gate
+        env = os.environ.get("POMA_MEMORY_EMPTY_GATE")
+        if env is not None:
+            try:
+                return float(env)
+            except ValueError:
+                pass
+        return getattr(self._semantic, "empty_gate", 0.0)
 
 
 def _reciprocal_rank_fusion(

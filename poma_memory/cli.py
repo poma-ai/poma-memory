@@ -16,7 +16,7 @@ def main(argv: list[str] | None = None) -> None:
         prog="poma-memory",
         description="Structure-preserving memory for AI agents.",
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
 
     # index
     p_index = sub.add_parser("index", help="Index markdown files")
@@ -38,6 +38,9 @@ def main(argv: list[str] | None = None) -> None:
     p_search.add_argument("--empty-gate", type=float, default=None, dest="empty_gate",
                           help="Suppress ALL results when the best semantic hit's cosine "
                                "is below this (default: embedder-calibrated; 0 disables)")
+    p_search.add_argument("--socket", default="auto",
+                          help="Daemon socket: 'auto' (default), a path, or "
+                               "'off' to force in-process search")
     p_search.add_argument("--json", action="store_true", dest="as_json",
                           help="Output as JSON")
 
@@ -49,7 +52,23 @@ def main(argv: list[str] | None = None) -> None:
     # mcp
     sub.add_parser("mcp", help="Start MCP server (requires: pip install poma-memory[mcp])")
 
+    # serve
+    p_serve = sub.add_parser(
+        "serve", help="Run a resident search daemon on a unix socket")
+    p_serve.add_argument("--socket", help="Socket path (default: per-user)")
+    p_serve.add_argument("--idle-timeout", type=float, default=1800.0,
+                         help="Exit after this many idle seconds (0 = never)")
+    p_serve.add_argument("--quiet", action="store_true")
+
+    parser.add_argument("--version", action="store_true",
+                        help="Print the installed version and exit")
+
     args = parser.parse_args(argv)
+
+    if getattr(args, "version", False):
+        from poma_memory import __version__
+        print(__version__)
+        return
 
     if args.command == "index":
         _cmd_index(args)
@@ -59,6 +78,8 @@ def main(argv: list[str] | None = None) -> None:
         _cmd_status(args)
     elif args.command == "mcp":
         _cmd_mcp()
+    elif args.command == "serve":
+        _cmd_serve(args)
 
 
 def _cmd_index(args: argparse.Namespace) -> None:
@@ -87,16 +108,66 @@ def _cmd_index(args: argparse.Namespace) -> None:
 
 def _cmd_search(args: argparse.Namespace) -> None:
     """Search command: search indexed content."""
-    from poma_memory.api import search
+    import os
 
-    results = search(
-        query=args.query,
-        path=args.path,
-        db_path=args.db,
-        top_k=args.top,
-        min_score=args.min_score,
-        empty_gate=args.empty_gate,
-    )
+    # The env overrides documented on `search` (POMA_MEMORY_EMPTY_GATE selects the
+    # relevance gate, POMA_EMBEDDER selects the embedder) are read inside the
+    # process that runs the search. Under the daemon that is a long-lived tmux
+    # process whose environment was frozen days ago — so the same command would
+    # silently mean something different depending on whether a daemon happened to
+    # be up. Resolve the gate here and send it explicitly; refuse the daemon
+    # entirely when the embedder is overridden, since that changes which vectors
+    # a query is compared against and cannot be passed in a request.
+    empty_gate = args.empty_gate
+    if empty_gate is None:
+        env_gate = os.environ.get("POMA_MEMORY_EMPTY_GATE", "").strip()
+        if env_gate:
+            try:
+                empty_gate = float(env_gate)
+            except ValueError:
+                empty_gate = None
+
+    embedder_override = bool(os.environ.get("POMA_EMBEDDER", "").strip())
+
+    results = None
+    if getattr(args, "socket", None) != "off" and not embedder_override:
+        # Try the resident daemon first: it holds the model and the embedding
+        # matrix, which is ~0.37s of the ~0.52s a cold search costs. Any failure
+        # (no daemon, stale socket, daemon mid-restart) falls through to the
+        # in-process path, so behaviour never depends on the daemon being up.
+        try:
+            from poma_memory.server import request
+
+            sock = None if args.socket in (None, "auto") else args.socket
+            # Resolve here, not in the daemon: its cwd is not ours.
+            from pathlib import Path as _P
+            _path = str(_P(args.path).expanduser().resolve()) if args.path else None
+            _db = str(_P(args.db).expanduser().resolve()) if args.db else None
+            resp = request({
+                "op": "search",
+                "query": args.query,
+                "path": _path,
+                "db_path": _db,
+                "top_k": args.top,
+                "min_score": args.min_score,
+                "empty_gate": empty_gate,
+            }, sock)
+            if resp.get("ok"):
+                results = resp.get("results", [])
+        except Exception:
+            results = None
+
+    if results is None:
+        from poma_memory.api import search
+
+        results = search(
+            query=args.query,
+            path=args.path,
+            db_path=args.db,
+            top_k=args.top,
+            min_score=args.min_score,
+            empty_gate=empty_gate,
+        )
 
     if args.as_json:
         print(json.dumps(results, indent=2))
@@ -132,6 +203,20 @@ def _cmd_status(args: argparse.Namespace) -> None:
     print(f"Semantic:  {'yes' if info['has_embeddings'] else 'no'}")
     for f in info["files"]:
         print(f"  - {f}")
+
+
+def _cmd_serve(args: argparse.Namespace) -> None:
+    """Serve command: run the resident search daemon."""
+    import sys
+
+    from poma_memory.server import serve
+
+    sock = args.socket
+    if sock:
+        from pathlib import Path as _P
+        sock = str(_P(sock).expanduser().resolve())
+    sys.exit(serve(socket_path=sock, idle_timeout=args.idle_timeout,
+                   quiet=args.quiet))
 
 
 def _cmd_mcp() -> None:

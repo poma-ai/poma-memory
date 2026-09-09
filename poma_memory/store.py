@@ -78,10 +78,21 @@ END;
 class Store:
     """SQLite + FTS5 storage for poma-memory."""
 
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, check_same_thread: bool = True):
+        """Open the store.
+
+        `check_same_thread=False` is for the search daemon only, which hands one
+        cached connection to whichever worker thread serves the next request and
+        serialises every use of it behind a single lock. SQLite's thread check
+        guards against unsynchronised sharing; the daemon provides that
+        synchronisation itself. Do NOT pass False without an equivalent lock —
+        and note that the thread check passes by luck in short-lived threads,
+        because Python reuses thread identifiers once a thread exits.
+        """
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path))
+        self._conn = sqlite3.connect(str(self.db_path),
+                                     check_same_thread=check_same_thread)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")

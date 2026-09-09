@@ -145,6 +145,30 @@ class _EmbedderBase:
         return hits
 
 
+def _load_static_model(name: str):
+    """Load the model2vec model without re-resolving it against the hub.
+
+    `StaticModel.from_pretrained` defaults to `force_download=True`, so every
+    call re-fetches a model that is already on disk. Measured: 7.85s with the
+    default against 0.11s with `force_download=False` on a warm cache — and a
+    search hook runs this on every Grep.
+
+    An earlier version of this fix set HF_HUB_OFFLINE around the call instead.
+    That worked, but it mutates process-global state in a library other people
+    embed, and it is unsafe once two loads can overlap on different threads (the
+    search daemon). model2vec's own argument needs neither.
+
+    Falls back to the default behaviour if this model2vec build predates the
+    argument, so an older install degrades to slow rather than broken.
+    """
+    from model2vec import StaticModel
+
+    try:
+        return StaticModel.from_pretrained(name, force_download=False)
+    except TypeError:
+        return StaticModel.from_pretrained(name)
+
+
 class Model2VecSearch(_EmbedderBase):
     """Local vector search using model2vec (30MB, no API key)."""
 
@@ -153,8 +177,7 @@ class Model2VecSearch(_EmbedderBase):
     expected_dims = _M2V_DIMS
 
     def __init__(self, store: Store):
-        from model2vec import StaticModel
-        self._model = StaticModel.from_pretrained(_M2V_MODEL)
+        self._model = _load_static_model(_M2V_MODEL)
         super().__init__(store)
 
     def _embed_texts(self, texts: list[str]) -> np.ndarray:

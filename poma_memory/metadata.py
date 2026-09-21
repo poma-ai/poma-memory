@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from pathlib import Path, PurePosixPath
 
 RULES_FILENAME = ".poma-metadata.json"
@@ -90,14 +91,19 @@ def load_rules(root: str | Path) -> tuple[list[dict], str]:
         # `Path.glob` raises NotImplementedError on an absolute pattern, which
         # names nothing; and '..' would attach metadata to files outside the
         # directory being indexed.
-        # `\` and `:` are how the posix-only checks below get bypassed:
-        # PurePosixPath does not split on a backslash and does not see a drive
-        # letter as absolute, so `..\..\etc\*.md` reads as one harmless
-        # component here and escapes the root on Windows.
-        if "\\" in rule["glob"] or ":" in rule["glob"]:
+        # A backslash and a drive letter are how the posix-only checks below
+        # get bypassed: PurePosixPath does not split on a backslash and does
+        # not see `C:` as absolute, so `..\..\etc\*.md` reads as one harmless
+        # component here and escapes the root on Windows. A bare `:` elsewhere
+        # is a legal POSIX filename character and is left alone — a directory
+        # really can be called `notes:2026`.
+        if "\\" in rule["glob"]:
             raise MetadataRulesError(
-                f"{p}: rule {i} glob {rule['glob']!r} must use '/' separators "
-                "and no drive letter")
+                f"{p}: rule {i} glob {rule['glob']!r} must use '/' separators")
+        if re.match(r"^[A-Za-z]:", rule["glob"]):
+            raise MetadataRulesError(
+                f"{p}: rule {i} glob {rule['glob']!r} must be relative to the "
+                "indexed directory (no drive letter)")
         if PurePosixPath(rule["glob"]).is_absolute() or rule["glob"].startswith("/"):
             raise MetadataRulesError(
                 f"{p}: rule {i} glob {rule['glob']!r} must be relative to the "

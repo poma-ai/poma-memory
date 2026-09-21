@@ -37,6 +37,12 @@ FENCE = "---"
 # metadata backfill does on files it does not otherwise need to open.
 MAX_BYTES = 8192
 
+# A fence that has not closed within this much text is not front-matter. Both
+# the parser and the bounded head read in `incremental` use it, so the two
+# cannot disagree about whether a block parsed, and a large file that merely
+# opens with `---` is never read whole to find that out.
+MAX_BLOCK_BYTES = 65536
+
 _REJECT_VALUE_PREFIXES = ("|", ">", "&", "*", "!", "{")
 
 
@@ -56,7 +62,7 @@ def extract_block(text: str) -> str | None:
     after = text[len(FENCE):]
     if after[:1] not in ("\n", "\r"):
         return None  # "---foo", a horizontal rule, something else entirely
-    lines = text.splitlines()
+    lines = text[:MAX_BLOCK_BYTES].splitlines()
     for i, line in enumerate(lines[1:], start=1):
         if line.rstrip() == FENCE:
             return "\n".join(lines[1:i])
@@ -67,7 +73,7 @@ def is_terminated(text: str) -> bool:
     text = text.lstrip("\ufeff")
     if not text.startswith(FENCE):
         return False
-    lines = text.splitlines()
+    lines = text[:MAX_BLOCK_BYTES].splitlines()
     return any(line.rstrip() == FENCE for line in lines[1:])
 
 
@@ -106,7 +112,10 @@ def _parse_block(block: str) -> tuple[dict, bool]:
         if ":" not in raw:
             return {}, False
 
-        key, _, rest = raw.partition(":")
+        split = _split_key(raw)
+        if split is None:
+            return {}, False
+        key, rest = split
         key = _unquote_key(key.strip())
         if key is None:
             return {}, False
@@ -115,8 +124,6 @@ def _parse_block(block: str) -> tuple[dict, bool]:
         value = strip_comment(rest.strip())
         if not key or key in out:
             return {}, False  # empty or duplicate key
-        if key[:1].isspace() or ":" in key:
-            return {}, False
 
         if value:
             parsed = _scalar_or_inline_list(value)
@@ -146,7 +153,7 @@ def _parse_block(block: str) -> tuple[dict, bool]:
             if ":" not in b or b.startswith("- "):
                 return {}, False
             sub, _, subval = b.partition(":")
-            sub = sub.strip()
+            sub = _unquote_key(sub.strip())
             subval = _scalar(subval.strip())
             if not sub or subval is None:
                 return {}, False
@@ -183,6 +190,25 @@ def _take_indented(lines: list[str], start: int) -> tuple[list[str] | None, int]
         body.append(raw.strip())
         i += 1
     return body, i
+
+
+def _split_key(raw: str) -> tuple[str, str] | None:
+    """Split a mapping line at the first colon OUTSIDE quotes.
+
+    `raw.partition(":")` cuts `"my:key": value` in the middle of the key and
+    the line is then rejected — visible rather than silent, but still a valid
+    quoted key refused for no reason but a naive split.
+    """
+    quote = None
+    for i, ch in enumerate(raw):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"') and not raw[:i].strip():
+            quote = ch
+        elif ch == ":":
+            return raw[:i], raw[i + 1:]
+    return None
 
 
 def _unquote_key(key: str) -> str | None:
@@ -265,7 +291,15 @@ def _scalar(value: str) -> str | None:
     if value[:1] in _REJECT_VALUE_PREFIXES:
         return None
     if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-        return value[1:-1]
+        inner = value[1:-1]
+        if value[0] == '"' and "\\" in inner:
+            # YAML unescapes these; this parser does not. Returning the
+            # backslashes literally is a wrong value, and `\"` also closes the
+            # quote early in strip_comment and silently truncates the rest.
+            return None
+        if value[0] == "'" and "''" in inner:
+            return None  # single-quoted YAML escapes a quote by doubling it
+        return inner
     if value[:1] in ("'", '"'):
         return None  # opened a quote and never closed it
     return value

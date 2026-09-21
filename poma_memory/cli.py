@@ -183,7 +183,7 @@ def _cmd_search(args: argparse.Namespace) -> None:
             }, sock)
             if resp.get("ok"):
                 results = resp.get("results", [])
-            elif resp.get("code") in ("metadata_not_indexed", "bad_where"):
+            elif resp.get("code") == "metadata_not_indexed":
                 # A real answer, not a daemon problem. Falling through to the
                 # in-process path would reach the same refusal ~0.5s and one
                 # model load later.

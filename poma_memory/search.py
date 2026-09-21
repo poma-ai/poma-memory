@@ -28,6 +28,13 @@ class HybridSearch:
         self._bm25 = BM25Search(store)
         self._semantic = None
 
+        # A SNAPSHOT, taken once. `api.search()` builds a fresh HybridSearch
+        # per call and the daemon rebuilds on `PRAGMA data_version`, so both
+        # public paths are current — but anything that holds this object
+        # across an external reindex keeps answering from the old corpus, and
+        # for metadata that degrades from refusing to answering. Re-create it
+        # rather than keeping one around.
+        #
         # Metadata lives here, not on the Store, so that it is rebuilt with the
         # rest of this object. The search daemon caches one HybridSearch per
         # database and discards it when PRAGMA data_version moves; a map hung

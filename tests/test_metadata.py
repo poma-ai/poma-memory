@@ -519,13 +519,27 @@ def test_a_trailing_comma_in_an_inline_list_is_not_a_phantom_item():
 # --- the rules guards are not posix-only ---
 
 @pytest.mark.parametrize("glob", ["..\\\\..\\\\etc\\\\*.md", "C:\\\\Users\\\\x\\\\*.md",
-                                  "sub:/*.md"])
+                                  "D:/data/*.md"])
 def test_windows_style_globs_are_rejected_rather_than_bypassing_the_guards(glob):
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         _write_rules(root, [{"glob": glob, "metadata": {"kind": "x"}}])
         with pytest.raises(MetadataRulesError):
             load_rules(root)
+
+
+def test_a_colon_inside_a_path_component_is_legal_on_posix():
+    """A directory really can be called `notes:2026`; refusing it was collateral
+    damage from the Windows guard."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "notes:2026").mkdir()
+        (root / "notes:2026" / "a.md").write_text("# A\n\ntext\n")
+        _write_rules(root, [{"glob": "notes:2026/**/*.md",
+                             "metadata": {"kind": "dated"}}])
+        rules, _ = load_rules(root)
+        resolved = resolve_paths(root, rules)
+        assert [v for v in resolved.values()] == [{"kind": "dated"}]
 
 
 # --- the bounded head read must agree with the full read ---
@@ -543,3 +557,162 @@ def test_a_frontmatter_block_straddling_the_head_read_boundary_agrees():
             full_path = _resolve_metadata(str(f), None, f.read_text())
             assert head_path == full_path, f"disagreement at pad={pad}"
             assert json.loads(head_path[0])["kind"] == "event"
+
+
+# --- an unreadable file must not be recorded as scanned ---
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
+                    reason="root ignores file permissions")
+def test_an_unreadable_file_keeps_its_metadata_rather_than_losing_frontmatter():
+    """The file itself is unreadable but its directory is traversable, so
+    `os.stat` succeeds and the mtime short-circuit is taken. Swallowing the
+    read error there stamped the row with path-rule metadata alone, flagged it
+    parsed, and counted it complete -- permanently and silently wrong."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "a.md").write_text("---\nkind: decision\n---\n# A\n\ntext\n")
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        api.index(path=root)
+
+        store = Store(root / ".poma-memory.db")
+        before = store.get_file_metadata_map()
+        store.close()
+        assert list(before.values()) == [{"kind": "decision"}]
+
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "note2"}}])
+        (root / "a.md").chmod(0o000)
+        try:
+            result = api.index(path=root)
+        finally:
+            (root / "a.md").chmod(0o644)
+
+        store = Store(root / ".poma-memory.db")
+        # Unchanged, not overwritten with the path rule alone.
+        assert store.get_file_metadata_map() == before
+        store.close()
+        assert [Path(p_).name for p_ in result["unreadable"]] == ["a.md"]
+
+        # And the next run that can read it resolves it properly.
+        api.index(path=root)
+        store = Store(root / ".poma-memory.db")
+        assert list(store.get_file_metadata_map().values()) == [{"kind": "decision"}]
+        store.close()
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
+                    reason="root ignores file permissions")
+def test_one_unreadable_file_does_not_abort_the_whole_index_run():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "good.md").write_text("# Good\n\ntext\n")
+        (root / "bad.md").write_text("# Bad\n\ntext\n")
+        (root / "bad.md").chmod(0o000)
+        try:
+            result = api.index(path=root)   # must not raise
+        finally:
+            (root / "bad.md").chmod(0o644)
+        assert [Path(p_).name for p_ in result["unreadable"]] == ["bad.md"]
+        assert result["files_indexed"] == 1
+
+
+def test_a_dangling_symlink_does_not_abort_the_run():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "good.md").write_text("# Good\n\ntext\n")
+        (root / "dangling.md").symlink_to(root / "nowhere.md")
+        result = api.index(path=root)       # must not raise
+        assert result["files_indexed"] == 1
+
+
+# --- rows an index run could not reach are reported, not hidden ---
+
+def test_rows_left_on_an_earlier_rule_set_are_named():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _corpus(root)
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        api.index(path=root)
+
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "changed"}}])
+        result = api.index(path=root, glob="events/*.md")
+
+        assert [Path(p_).name for p_ in result["stale_rules"]] == ["DECISIONS.md"]
+        # Per-file hashes mean the next full run heals it, unlike the global flag.
+        assert api.index(path=root)["stale_rules"] == []
+
+
+def test_a_dot_prefixed_file_is_still_refreshable_through_index_file():
+    """`index()` skips it forever, so the per-file hash is what keeps it
+    healable at all -- a global flag left it permanently stale."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "a.md").write_text("# A\n\ntext\n")
+        (root / ".hidden.md").write_text("# H\n\ntext\n")
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        api.index(path=root)
+        api.index_file(root / ".hidden.md", path=root)
+
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "changed"}}])
+        api.index(path=root)
+        # The visible file heals and the run does not re-resolve forever.
+        assert api.index(path=root)["metadata_refreshed"] is False
+
+        api.index_file(root / ".hidden.md", path=root)
+        store = Store(root / ".poma-memory.db")
+        kinds = {Path(p_).name: m["kind"]
+                 for p_, m in store.get_file_metadata_map().items()}
+        assert kinds == {"a.md": "changed", ".hidden.md": "changed"}
+        store.close()
+
+
+# --- parser: the two remaining silent mis-parses ---
+
+def test_a_nested_sub_key_is_unquoted_like_a_top_level_one():
+    meta, ok = parse('---\nmeta:\n  "sub": v\n---\n')
+    assert ok and meta == {"meta.sub": "v"}
+
+
+@pytest.mark.parametrize("block", [
+    '---\ntitle: "say \\\\"hi\\\\""\n---\n',
+    '---\ntitle: "a \\\\" # b"\n---\n',
+    "---\ntitle: 'it''s'\n---\n",
+])
+def test_escaped_quotes_are_refused_rather_than_half_processed(block):
+    """Returning the backslashes literally is a wrong value, and `\\"` also
+    closes the quote early and truncates the rest with no flag."""
+    assert parse(block) == ({}, False)
+
+
+# --- the COALESCE ordering, which a green suite did not defend ---
+
+def test_metadata_survives_a_content_change_and_reindex():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "a.md").write_text("# A\n\nfirst.\n")
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        api.index(path=root)
+
+        (root / "a.md").write_text("# A\n\nfirst. second, rewritten.\n")
+        api.index(path=root)
+
+        store = Store(root / ".poma-memory.db")
+        rows = store._conn.execute(
+            "SELECT metadata, fm_unparsed FROM files").fetchall()
+        assert [dict(r) for r in rows] == [
+            {"metadata": '{"kind": "note"}', "fm_unparsed": 0}]
+        assert store.get_file_metadata_map() != {}
+        assert store.count_files_without_metadata() == 0
+        store.close()
+        assert api.search("rewritten", path=root, where={"kind": "note"}) != []
+
+
+def test_a_quoted_key_containing_a_colon_is_split_at_the_right_colon():
+    """`partition(":")` cut inside the key and the whole block was refused."""
+    meta, ok = parse('---\n"a:b": v\nplain: w\n---\n')
+    assert ok and meta == {"a:b": "v", "plain": "w"}
+
+
+def test_a_key_that_opens_a_quote_and_never_closes_it_is_unparsed():
+    from poma_memory.frontmatter import _unquote_key
+    assert parse('---\n"abc: v\n---\n') == ({}, False)
+    assert _unquote_key('"abc') is None

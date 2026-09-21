@@ -15,15 +15,8 @@ CREATE TABLE IF NOT EXISTS files (
     content_hash TEXT NOT NULL DEFAULT '',
     mtime        REAL NOT NULL DEFAULT 0,
     metadata     TEXT NOT NULL DEFAULT '',
-    fm_unparsed  INTEGER NOT NULL DEFAULT 0
-);
-
--- Index-wide state that is not about any one file. Created with IF NOT EXISTS
--- rather than added by ALTER, so it appears on databases written by older
--- versions without a migration step.
-CREATE TABLE IF NOT EXISTS index_meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
+    fm_unparsed  INTEGER NOT NULL DEFAULT 0,
+    rules_hash   TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -141,28 +134,13 @@ class Store:
         for column, ddl in (
             ("metadata", "ALTER TABLE files ADD COLUMN metadata TEXT NOT NULL DEFAULT ''"),
             ("fm_unparsed", "ALTER TABLE files ADD COLUMN fm_unparsed INTEGER NOT NULL DEFAULT 0"),
+            ("rules_hash", "ALTER TABLE files ADD COLUMN rules_hash TEXT NOT NULL DEFAULT ''"),
         ):
             try:
                 self._conn.execute(ddl)
                 self._conn.commit()
             except sqlite3.OperationalError:
                 pass  # column already exists
-
-    # --- Index-wide state ---
-
-    def get_index_meta(self, key: str) -> str | None:
-        row = self._conn.execute(
-            "SELECT value FROM index_meta WHERE key = ?", (key,)
-        ).fetchone()
-        return row["value"] if row else None
-
-    def set_index_meta(self, key: str, value: str) -> None:
-        self._conn.execute(
-            """INSERT INTO index_meta (key, value) VALUES (?, ?)
-               ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
-            (key, value),
-        )
-        self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()
@@ -178,6 +156,7 @@ class Store:
     def upsert_file_record(
         self, file_path: str, byte_offset: int, content_hash: str, mtime: float,
         metadata: str | None = None, fm_unparsed: bool | None = None,
+        rules_hash: str | None = None,
     ) -> None:
         """Write a file row. `metadata=None` leaves any existing value alone.
 
@@ -188,21 +167,24 @@ class Store:
         flag = None if fm_unparsed is None else int(fm_unparsed)
         self._conn.execute(
             """INSERT INTO files (file_path, byte_offset, content_hash, mtime,
-                                  metadata, fm_unparsed)
-               VALUES (?, ?, ?, ?, COALESCE(?, ''), COALESCE(?, 0))
+                                  metadata, fm_unparsed, rules_hash)
+               VALUES (?, ?, ?, ?, COALESCE(?, ''), COALESCE(?, 0),
+                       COALESCE(?, ''))
                ON CONFLICT(file_path) DO UPDATE SET
                    byte_offset=excluded.byte_offset,
                    content_hash=excluded.content_hash,
                    mtime=excluded.mtime,
                    metadata=COALESCE(?, files.metadata),
-                   fm_unparsed=COALESCE(?, files.fm_unparsed)""",
+                   fm_unparsed=COALESCE(?, files.fm_unparsed),
+                   rules_hash=COALESCE(?, files.rules_hash)""",
             (file_path, byte_offset, content_hash, mtime, metadata, flag,
-             metadata, flag),
+             rules_hash, metadata, flag, rules_hash),
         )
         self._conn.commit()
 
     def set_file_metadata(self, file_path: str, metadata: str,
-                          fm_unparsed: bool = False) -> None:
+                          fm_unparsed: bool = False,
+                          rules_hash: str = "") -> None:
         """Update metadata in place, without re-chunking or re-embedding.
 
         This is the whole backfill mechanism. `_full_reindex` would delete,
@@ -210,8 +192,9 @@ class Store:
         money for a column that can be filled from the file head.
         """
         self._conn.execute(
-            "UPDATE files SET metadata = ?, fm_unparsed = ? WHERE file_path = ?",
-            (metadata, int(fm_unparsed), file_path),
+            "UPDATE files SET metadata = ?, fm_unparsed = ?, rules_hash = ? "
+            "WHERE file_path = ?",
+            (metadata, int(fm_unparsed), rules_hash, file_path),
         )
         self._conn.commit()
 
@@ -234,6 +217,17 @@ class Store:
         rows = self._conn.execute(
             "SELECT file_path FROM files WHERE metadata = '' "
             "ORDER BY file_path LIMIT ?", (limit,),
+        ).fetchall()
+        return [r["file_path"] for r in rows]
+
+    def files_with_other_rules(self, rules_hash: str) -> list[str]:
+        """Rows resolved against a different rule set than the current one.
+
+        Scanned, so they never raise; just answering from superseded rules.
+        """
+        rows = self._conn.execute(
+            "SELECT file_path FROM files WHERE metadata != '' AND rules_hash != ? "
+            "ORDER BY file_path", (rules_hash,),
         ).fetchall()
         return [r["file_path"] for r in rows]
 

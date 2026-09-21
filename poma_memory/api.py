@@ -12,10 +12,6 @@ from poma_memory.incremental import update_file
 from poma_memory.metadata import load_rules, resolve_paths, rules_hash
 from poma_memory.search import HybridSearch
 
-# Identity of the path-rule set the current rows were resolved against.
-RULES_HASH_KEY = "metadata_rules_hash"
-
-
 def _disk_state(path: str) -> str:
     """"gone" | "present" | "unknown".
 
@@ -76,27 +72,42 @@ def index(
     store = Store(db_path)
     rules, raw = load_rules(path)
     new_hash = rules_hash(raw)
-    # Editing the rule file touches no document, and update_file short-circuits
-    # on mtime equality — so without this, every row would keep metadata
-    # resolved against rules that no longer exist, and nothing would say so.
-    refresh = store.get_index_meta(RULES_HASH_KEY) != new_hash
     path_meta = resolve_paths(path, rules)
 
     total_chunks = 0
     total_chunksets = 0
     files_indexed = 0
+    refreshed = False
     seen: set[str] = set()
+    unreadable: list[str] = []
 
     for md_file in sorted(path.glob(glob)):
         if md_file.name.startswith("."):
             continue
         key = os.path.realpath(md_file)
         seen.add(key)
-        result = update_file(
-            store, str(md_file),
-            path_metadata=path_meta.get(key),
-            refresh_metadata=refresh,
-        )
+        try:
+            result = update_file(
+                store, str(md_file),
+                path_metadata=path_meta.get(key),
+                rules_hash=new_hash,
+            )
+        except OSError as e:
+            # A dangling symlink or an unreadable file used to abort the whole
+            # run with an uncaught exception, skipping store.close(). One bad
+            # file should cost that file, not the index.
+            unreadable.append(key)
+            seen.discard(key)
+            print(f"poma-memory: {md_file}: {e.strerror or e}; skipped",
+                  file=sys.stderr)
+            continue
+        if result["status"] == "unreadable":
+            unreadable.append(key)
+            seen.discard(key)
+            print(f"poma-memory: {md_file}: could not be read; metadata left "
+                  "unresolved", file=sys.stderr)
+            continue
+        refreshed = refreshed or result.get("metadata_refreshed", False)
         if result["status"] in ("updated", "reindexed"):
             files_indexed += 1
             total_chunks += result.get("new_chunks", 0)
@@ -122,22 +133,25 @@ def index(
         print(f"poma-memory: {fp} is indexed but no longer on disk; recorded "
               "as having no metadata", file=sys.stderr)
 
-    # Only claim the rule set has been applied when this run actually reached
-    # every row that still exists. A narrower `glob` — or a file that was
-    # briefly unreadable — otherwise leaves those rows resolved against
-    # superseded rules while `refresh` goes False for good: they are not '',
-    # so the legacy heal never touches them either, and `status` says
-    # complete. That is the same indistinguishable-wrong-answer this feature
-    # exists to remove, and the first fix for the orphan bug re-opened it.
-    unvisited = [fp for fp, st in states.items() if st != "gone"]
-    if not unvisited:
-        store.set_index_meta(RULES_HASH_KEY, new_hash)
+    # Rows this run did not reach — a narrower glob, a name `index()` skips, a
+    # file it could not read. Their metadata is whatever an earlier rule set
+    # produced. Per-file hashes mean the next run that reaches them fixes it,
+    # but nothing would otherwise say the rule set is only partly applied.
+    stale = store.files_with_other_rules(new_hash)
+    if stale:
+        shown = ", ".join(stale[:3]) + (", ..." if len(stale) > 3 else "")
+        print(f"poma-memory: {len(stale)} file(s) still hold metadata from an "
+              f"earlier rule set and were not reached by this run ({shown}). "
+              "Re-run with a glob that matches them.", file=sys.stderr)
+
     store.close()
     return {
         "files_indexed": files_indexed,
         "chunks_created": total_chunks,
         "chunksets_created": total_chunksets,
-        "metadata_refreshed": refresh,
+        "metadata_refreshed": refreshed,
+        "unreadable": unreadable,
+        "stale_rules": stale,
     }
 
 
@@ -160,12 +174,18 @@ def index_file(
         db_path = path / ".poma-memory.db"
 
     store = Store(db_path)
-    rules, _ = load_rules(path)
+    rules, raw = load_rules(path)
     path_meta = resolve_paths(path, rules)
+    if Path(file).name.startswith("."):
+        # `index()` skips dot-prefixed names, so this row can only ever be
+        # refreshed by another index_file call on the same path.
+        print(f"poma-memory: {file} starts with '.', so `poma-memory index` "
+              "will not revisit it; re-run this command after changing "
+              "metadata rules", file=sys.stderr)
     result = update_file(
         store, str(file),
         path_metadata=path_meta.get(os.path.realpath(file)),
-        refresh_metadata=True,
+        rules_hash=rules_hash(raw),
     )
     store.close()
     return result

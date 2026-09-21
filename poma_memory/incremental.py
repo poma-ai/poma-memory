@@ -15,12 +15,18 @@ from poma_memory.store import Store
 
 def _resolve_metadata(
     file_path: str, path_metadata: dict | None, text: str | None = None,
-) -> tuple[str, bool]:
+) -> tuple[str, bool] | None:
     """Combine path-rule metadata with the file's own front-matter.
 
     `text` is the already-read document when there is one. Without it only the
     head of the file is read: metadata backfill must not cost a full read of
     every document, and front-matter cannot legally live past the head anyway.
+
+    Returns None when the file could not be read. That is NOT the same as "it
+    has no front-matter": swallowing the error and parsing "" stamps a live
+    document with path-rule metadata alone, flags it parsed, and counts it
+    scanned — permanently and silently wrong, and indistinguishable afterwards
+    from a document that really carries nothing.
     """
     if text is None:
         try:
@@ -36,9 +42,12 @@ def _resolve_metadata(
                 # cost one bounded read.
                 if (len(text) == frontmatter.MAX_BYTES
                         and text.lstrip("\ufeff").startswith(frontmatter.FENCE)):
-                    text += f.read()
+                    # Bounded by the same limit the parser applies to a block,
+                    # so the two paths still agree and a huge file that merely
+                    # opens with `---` cannot be pulled into memory whole.
+                    text += f.read(frontmatter.MAX_BLOCK_BYTES)
         except OSError:
-            text = ""
+            return None
     fm, ok = frontmatter.parse(text)
     return json.dumps(meta_mod.merge(path_metadata, fm), sort_keys=True), not ok
 
@@ -47,7 +56,7 @@ def update_file(
     store: Store,
     file_path: str,
     path_metadata: dict | None = None,
-    refresh_metadata: bool = False,
+    rules_hash: str = "",
 ) -> dict:
     """Incrementally update index for a single file.
 
@@ -55,10 +64,11 @@ def update_file(
     known byte offset. Falls back to full reindex if the existing
     prefix was modified.
 
-    `path_metadata` is what the caller's path rules say about this file;
-    `refresh_metadata` forces metadata to be re-resolved even when the content
-    is untouched, which is how a rule-file edit reaches rows whose mtime has
-    not moved.
+    `path_metadata` is what the caller's path rules say about this file, and
+    `rules_hash` identifies the rule set it came from. The hash is recorded on
+    the row, so a file re-resolves exactly when the rules that produced it have
+    changed — a rule edit moves no mtime, and a global "rules changed" flag
+    cannot express "this row was covered but that one was not".
 
     Returns:
         dict with status ("unchanged", "updated", "reindexed") and counts.
@@ -74,15 +84,26 @@ def update_file(
         # had any, and a rule edit changes what this file resolves to without
         # touching the file. Both are an in-place UPDATE — no re-chunk, no
         # re-embed.
-        if refresh_metadata or not record.get("metadata"):
-            meta_json, fm_unparsed = _resolve_metadata(file_path, path_metadata)
-            store.set_file_metadata(file_path, meta_json, fm_unparsed)
-        return {"status": "unchanged"}
+        stale = (not record.get("metadata")
+                 or record.get("rules_hash") != rules_hash)
+        resolved = _resolve_metadata(file_path, path_metadata) if stale else None
+        if stale and resolved is not None:
+            meta_json, fm_unparsed = resolved
+            store.set_file_metadata(file_path, meta_json, fm_unparsed, rules_hash)
+        elif stale:
+            # Unreadable right now. Leave the row exactly as it was so the
+            # next run that can read it resolves it properly.
+            return {"status": "unreadable", "metadata_refreshed": False}
+        return {"status": "unchanged", "metadata_refreshed": stale}
 
     with open(file_path, "r", encoding="utf-8") as f:
         full_text = f.read()
 
-    meta_json, fm_unparsed = _resolve_metadata(file_path, path_metadata, full_text)
+    resolved = _resolve_metadata(file_path, path_metadata, full_text)
+    # The content was read above, so this cannot be a read failure; the guard
+    # is here so a future change to _resolve_metadata cannot silently reach
+    # the upserts below with nothing.
+    meta_json, fm_unparsed = resolved if resolved is not None else ("", False)
 
     # Try incremental (append-only fast path)
     if record and record["byte_offset"] > 0:
@@ -96,18 +117,18 @@ def update_file(
                 store.upsert_file_record(
                     file_path, len(full_text),
                     prefix_hash, stat.st_mtime,
-                    meta_json, fm_unparsed,
+                    meta_json, fm_unparsed, rules_hash,
                 )
                 return {"status": "unchanged"}
 
             return _incremental_update(
                 store, file_path, full_text, new_text, stat.st_mtime,
-                meta_json, fm_unparsed,
+                meta_json, fm_unparsed, rules_hash,
             )
 
     # Full reindex (first time or prefix was modified)
     return _full_reindex(store, file_path, full_text, stat.st_mtime,
-                         meta_json, fm_unparsed)
+                         meta_json, fm_unparsed, rules_hash)
 
 
 def _incremental_update(
@@ -118,6 +139,7 @@ def _incremental_update(
     mtime: float,
     meta_json: str = "{}",
     fm_unparsed: bool = False,
+    rules_hash: str = "",
 ) -> dict:
     """Process only the appended portion of a file."""
     # Get heading context from existing chunks for proper depth assignment
@@ -144,7 +166,7 @@ def _incremental_update(
     if not new_chunks:
         store.upsert_file_record(
             file_path, len(full_text),
-            _hash(full_text), mtime, meta_json, fm_unparsed,
+            _hash(full_text), mtime, meta_json, fm_unparsed, rules_hash,
         )
         return {"status": "updated", "new_chunks": 0, "new_chunksets": 0}
 
@@ -169,7 +191,7 @@ def _incremental_update(
 
     store.upsert_file_record(
         file_path, len(full_text),
-        _hash(full_text), mtime, meta_json, fm_unparsed,
+        _hash(full_text), mtime, meta_json, fm_unparsed, rules_hash,
     )
 
     return {
@@ -181,7 +203,7 @@ def _incremental_update(
 
 def _full_reindex(
     store: Store, file_path: str, full_text: str, mtime: float,
-    meta_json: str = "{}", fm_unparsed: bool = False,
+    meta_json: str = "{}", fm_unparsed: bool = False, rules_hash: str = "",
 ) -> dict:
     """Full reindex: delete existing data and re-chunk entire file."""
     store.delete_file_data(file_path)
@@ -193,7 +215,7 @@ def _full_reindex(
     if not chunks:
         store.upsert_file_record(file_path, len(full_text),
                                   _hash(full_text), mtime,
-                                  meta_json, fm_unparsed)
+                                  meta_json, fm_unparsed, rules_hash)
         return {"status": "reindexed", "new_chunks": 0, "new_chunksets": 0}
 
     store.insert_chunks(file_path, chunks)
@@ -203,7 +225,7 @@ def _full_reindex(
 
     store.upsert_file_record(
         file_path, len(full_text),
-        _hash(full_text), mtime, meta_json, fm_unparsed,
+        _hash(full_text), mtime, meta_json, fm_unparsed, rules_hash,
     )
 
     return {

@@ -125,6 +125,13 @@ def poma_status(path: str = ".agent/") -> str:
         f"Chunksets: {info['total_chunksets']}",
         f"Semantic:  {'yes' if info['has_embeddings'] else 'no'}",
     ]
+    # An agent told "N files have no metadata" by poma_search needs a surface
+    # that confirms and quantifies it; without these it has none.
+    missing = info.get("files_without_metadata", 0)
+    lines.append(f"Metadata:  {missing} file(s) unscanned - run poma_index"
+                 if missing else "Metadata:  complete")
+    for f in info.get("unparsed_frontmatter", []):
+        lines.append(f"  ! unparsed front-matter: {f}")
     for f in info["files"]:
         lines.append(f"  - {f}")
 

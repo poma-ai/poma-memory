@@ -18,7 +18,8 @@ Grammar, between a ``---`` fence at byte 0 and the next ``---`` line:
     key:                        one level of nesting, flattened to "key.sub"
       sub: value
 
-Values stay strings. ``true``/``yes``/``1`` are NOT coerced: the search
+A trailing ``# comment`` outside quotes is dropped, as YAML does. Values stay
+strings otherwise. ``true``/``yes``/``1`` are NOT coerced: the search
 predicate is case-sensitive string equality, so any coercion opens a silent gap
 between what an author wrote and what they can filter on. Matching outer quotes
 are stripped, which is spelling rather than meaning.
@@ -46,6 +47,10 @@ def extract_block(text: str) -> str | None:
     file has no front-matter" (fine), while an unterminated fence returns the
     remainder so that `parse` can report it as unparsed rather than as absent.
     """
+    # A BOM before the fence would otherwise make this look like a file with
+    # no front-matter at all: no metadata, not flagged unparsed, invisible in
+    # `status()`. Editors write one without being asked.
+    text = text.lstrip("\ufeff")
     if not text.startswith(FENCE):
         return None
     after = text[len(FENCE):]
@@ -59,6 +64,7 @@ def extract_block(text: str) -> str | None:
 
 
 def is_terminated(text: str) -> bool:
+    text = text.lstrip("\ufeff")
     if not text.startswith(FENCE):
         return False
     lines = text.splitlines()
@@ -73,6 +79,7 @@ def parse(text: str) -> tuple[dict, bool]:
     the path. A document with no fence is ``({}, True)``: nothing to parse is not
     a failure.
     """
+    text = text.lstrip("\ufeff")
     block = extract_block(text)
     if block is None:
         return {}, True
@@ -101,7 +108,9 @@ def _parse_block(block: str) -> tuple[dict, bool]:
 
         key, _, rest = raw.partition(":")
         key = key.strip()
-        value = rest.strip()
+        # Strip before testing emptiness: `key:  # note` is an empty value with
+        # a comment, not a value of "# note".
+        value = strip_comment(rest.strip())
         if not key or key in out:
             return {}, False  # empty or duplicate key
 
@@ -172,12 +181,62 @@ def _take_indented(lines: list[str], start: int) -> tuple[list[str] | None, int]
     return body, i
 
 
+def strip_comment(value: str) -> str:
+    """Drop a YAML trailing comment. A '#' inside quotes is literal.
+
+    Without this, `kind: event  # primary` stores "event  # primary" and the
+    author cannot filter on the value they wrote — a silent wrong parse, which
+    is the one failure this parser is built to avoid.
+    """
+    quote = None
+    for i, ch in enumerate(value):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "#" and (i == 0 or value[i - 1].isspace()):
+            return value[:i].rstrip()
+    return value
+
+
+def _split_inline(inner: str) -> list[str] | None:
+    """Split an inline list on commas that are not inside quotes.
+
+    `inner.split(",")` cuts `[api, "auth, login"]` into three garbage items and
+    reports success. None means an unterminated quote: unparsed, not guessed.
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    quote = None
+    for ch in inner:
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+        elif ch == ",":
+            parts.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+    if quote is not None:
+        return None
+    parts.append("".join(buf).strip())
+    return parts
+
+
 def _scalar(value: str) -> str | None:
     """A single scalar, kept as a string. None means out of grammar."""
+    value = strip_comment(value)
     if value[:1] in _REJECT_VALUE_PREFIXES:
         return None
     if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
         return value[1:-1]
+    if value[:1] in ("'", '"'):
+        return None  # opened a quote and never closed it
     return value
 
 
@@ -186,9 +245,12 @@ def _scalar_or_inline_list(value: str) -> str | list[str] | None:
         inner = value[1:-1].strip()
         if not inner:
             return []
+        parts = _split_inline(inner)
+        if parts is None:
+            return None
         items = []
-        for part in inner.split(","):
-            item = _scalar(part.strip())
+        for part in parts:
+            item = _scalar(part)
             if item is None:
                 return None
             items.append(item)

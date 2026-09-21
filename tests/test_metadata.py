@@ -271,6 +271,9 @@ def test_a_row_whose_file_vanished_is_recorded_rather_than_left_unscanned():
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         _corpus(root)
+        _write_rules(root, [
+            {"glob": "events/**/*.md", "metadata": {"kind": "event"}},
+        ])
         api.index(path=root)
 
         db = root / ".poma-memory.db"
@@ -285,6 +288,13 @@ def test_a_row_whose_file_vanished_is_recorded_rather_than_left_unscanned():
         # Left at '', every filtered search would refuse forever over a file
         # nobody can fix.
         assert store.count_files_without_metadata() == 0
+        # The surviving file must have been resolved properly, not swept into
+        # the same "{}" as the deleted one -- which is what made the earlier
+        # version of this test pass against a bug.
+        by_name = {Path(p_).name: m
+                   for p_, m in store.get_file_metadata_map().items()}
+        assert by_name["e1.md"] == {"kind": "event"}
+        assert by_name["DECISIONS.md"] == {}
         store.close()
 
 
@@ -296,4 +306,101 @@ def test_single_file_indexing_still_applies_path_rules():
         api.index_file(root / "events" / "e1.md", path=root)
         store = Store(root / ".poma-memory.db")
         assert list(store.get_file_metadata_map().values()) == [{"kind": "event"}]
+        store.close()
+
+
+# --- silent wrong parse: the failure this parser exists to avoid ---
+
+def test_a_trailing_comment_is_not_part_of_the_value():
+    meta, ok = parse("---\nkind: event   # written by agent-log.sh\n---\n")
+    assert ok and meta == {"kind": "event"}
+
+
+def test_a_hash_inside_quotes_is_literal():
+    meta, ok = parse('---\ntitle: "issue #42"\n---\n')
+    assert ok and meta == {"title": "issue #42"}
+
+
+def test_a_comment_only_value_is_empty_not_the_comment_text():
+    meta, ok = parse("---\nkind:  # to be decided\n---\n")
+    assert ok and meta == {"kind": ""}
+
+
+def test_an_inline_list_does_not_split_inside_quotes():
+    meta, ok = parse('---\ntags: [api, "auth, login"]\n---\n')
+    assert ok and meta == {"tags": ["api", "auth, login"]}
+
+
+def test_an_unterminated_quote_is_unparsed_rather_than_guessed():
+    assert parse('---\nk: "open\n---\n') == ({}, False)
+    assert parse('---\ntags: [a, "open]\n---\n') == ({}, False)
+
+
+def test_a_utf8_bom_does_not_silently_disable_frontmatter():
+    """A BOM would otherwise read as 'no front-matter': no metadata, not
+    flagged unparsed, invisible in status()."""
+    meta, ok = parse("﻿---\nkind: note\n---\nbody\n")
+    assert ok and meta == {"kind": "note"}
+
+
+# --- hostile rules ---
+
+@pytest.mark.parametrize("glob", ["/etc/**/*.md", "../**/*.md", "a/../../b/*.md"])
+def test_absolute_or_escaping_globs_are_a_named_rules_error(glob):
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _write_rules(root, [{"glob": glob, "metadata": {"kind": "x"}}])
+        with pytest.raises(MetadataRulesError) as e:
+            load_rules(root)
+        assert ".poma-metadata.json" in str(e.value)
+
+
+# --- the documented status() shape ---
+
+def test_status_shape_is_the_same_with_no_database():
+    with tempfile.TemporaryDirectory() as td:
+        info = api.status(path=Path(td))
+        assert info["files_without_metadata"] == 0
+        assert info["unparsed_frontmatter"] == []
+
+
+# --- a narrower glob must not claim files it did not look at ---
+
+def test_a_narrower_glob_leaves_untouched_files_unscanned_rather_than_empty():
+    """`fp not in seen` means 'outside this run's glob', not 'gone from disk'.
+
+    Recording those as scanned-and-empty is a lie that no later run corrects,
+    because '{}' looks done -- and a filtered search then returns [] that
+    cannot be told apart from 'nothing matches'.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _corpus(root)
+        api.index(path=root)
+        db = root / ".poma-memory.db"
+
+        store = Store(db)
+        store._conn.execute("UPDATE files SET metadata = ''")
+        store._conn.commit()
+        store.close()
+
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        api.index(path=root, glob="events/*.md")
+
+        store = Store(db)
+        rows = dict(store._conn.execute(
+            "SELECT file_path, metadata FROM files").fetchall())
+        by_name = {Path(p).name: m for p, m in rows.items()}
+        assert by_name["e1.md"] != ""           # covered by the narrow glob
+        assert by_name["DECISIONS.md"] == ""    # exists on disk, not looked at
+        assert store.count_files_without_metadata() == 1
+        store.close()
+
+        # And the command the error message tells you to run must heal it.
+        api.index(path=root)
+        store = Store(db)
+        assert store.count_files_without_metadata() == 0
+        kinds = {Path(p).name: m["kind"]
+                 for p, m in store.get_file_metadata_map().items()}
+        assert kinds["DECISIONS.md"] == "note"
         store.close()

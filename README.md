@@ -100,6 +100,16 @@ session: laptop-2
 ---
 ```
 
+Front-matter is read by a **restricted** parser, not a full YAML one: `key:
+value`, `key: [a, b]`, a block list, and one level of nesting flattened to
+`parent.child`. Values stay strings, so `true` and `1` are the strings `"true"`
+and `"1"`. A trailing `# comment` outside quotes is dropped.
+
+Anything else — block scalars (`|`, `>`), anchors, flow mappings, duplicate
+keys, an unterminated fence — makes the whole block **unparsed**: the file gets
+no front-matter metadata, and `poma-memory status` names it. If a filter misses
+a file you expected, check `status` first.
+
 Then filter:
 
 ```bash

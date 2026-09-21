@@ -20,7 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 RULES_FILENAME = ".poma-metadata.json"
 
@@ -34,15 +34,24 @@ class MetadataNotIndexed(RuntimeError):
     the search path.
     """
 
-    def __init__(self, count: int, db_path: str | os.PathLike | None = None):
+    def __init__(self, count: int, db_path: str | os.PathLike | None = None,
+                 examples: list[str] | None = None):
         self.count = count
         self.db_path = str(db_path) if db_path is not None else None
+        self.examples = list(examples or [])
         where = f" in {self.db_path}" if self.db_path else ""
+        # Name a few of them: the usual way to get stuck here is a file that no
+        # `index` run's glob covers, and a bare count does not tell you which.
+        shown = ", ".join(self.examples[:3])
+        if shown and count > len(self.examples[:3]):
+            shown += ", ..."
+        detail = f" (e.g. {shown})" if shown else ""
         super().__init__(
-            f"{count} indexed file(s){where} have no metadata recorded, so a "
-            "metadata filter cannot be answered honestly. Run `poma-memory "
+            f"{count} indexed file(s){where} have no metadata recorded{detail}, "
+            "so a metadata filter cannot be answered honestly. Run `poma-memory "
             "index` to backfill (it re-reads metadata only; no re-chunking or "
-            "re-embedding)."
+            "re-embedding); if a file is not covered by the default glob, pass "
+            "the glob that matches it."
         )
 
 
@@ -78,6 +87,17 @@ def load_rules(root: str | Path) -> tuple[list[dict], str]:
             raise MetadataRulesError(f"{p}: rule {i} is not an object")
         if not isinstance(rule.get("glob"), str) or not rule["glob"]:
             raise MetadataRulesError(f"{p}: rule {i} needs a non-empty 'glob' string")
+        # `Path.glob` raises NotImplementedError on an absolute pattern, which
+        # names nothing; and '..' would attach metadata to files outside the
+        # directory being indexed.
+        if PurePosixPath(rule["glob"]).is_absolute() or rule["glob"].startswith("/"):
+            raise MetadataRulesError(
+                f"{p}: rule {i} glob {rule['glob']!r} must be relative to the "
+                "indexed directory")
+        if ".." in PurePosixPath(rule["glob"]).parts:
+            raise MetadataRulesError(
+                f"{p}: rule {i} glob {rule['glob']!r} escapes the indexed "
+                "directory")
         meta = rule.get("metadata")
         if not isinstance(meta, dict) or not meta:
             raise MetadataRulesError(f"{p}: rule {i} needs a non-empty 'metadata' object")
@@ -151,6 +171,12 @@ def normalize_where(where: dict | None) -> dict | None:
     """Validate a predicate and reject shapes the grammar does not cover."""
     if not where:
         return None
+    if not isinstance(where, dict):
+        # Not reachable from `--where`, which always builds a dict, but very
+        # reachable from the Python API and from any other socket client.
+        # Left as AttributeError it escapes the daemon's `code:` contract and
+        # the CLI's except clause, and the user gets a traceback.
+        raise ValueError(f"where: expected a dict, got {type(where).__name__}")
     out = {}
     for key, want in where.items():
         if not isinstance(key, str) or not key:

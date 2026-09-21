@@ -88,13 +88,21 @@ def index(
     # Rows whose file is gone from disk. Their indexed content demonstrably has
     # no metadata to find, and leaving them at '' would make the index
     # permanently incomplete — every filtered search would refuse forever.
+    #
+    # `fp not in seen` is NOT enough to call a row orphaned: this run may have
+    # been given a narrower `glob` than the one that indexed it, and a file that
+    # still exists has simply not been scanned yet. Recording it as scanned-and-
+    # empty would be a lie that no later run corrects, because '{}' looks done.
+    # Leaving it at '' is honest — a filtered search refuses until a run whose
+    # glob covers it fills it in.
+    scanned = store.get_file_metadata_map()
     orphaned = [
         fp for fp in store.all_file_paths()
-        if fp not in seen and fp not in store.get_file_metadata_map()
+        if fp not in seen and fp not in scanned and not os.path.exists(fp)
     ]
     for fp in orphaned:
         store.set_file_metadata(fp, "{}")
-        print(f"poma-memory: {fp} is indexed but missing from disk; recorded "
+        print(f"poma-memory: {fp} is indexed but no longer on disk; recorded "
               "as having no metadata", file=sys.stderr)
 
     store.set_index_meta(RULES_HASH_KEY, new_hash)
@@ -197,7 +205,9 @@ def status(
         db_path = path / ".poma-memory.db"
 
     if not Path(db_path).exists():
-        return {"files": [], "total_chunks": 0, "total_chunksets": 0, "has_embeddings": False}
+        return {"files": [], "total_chunks": 0, "total_chunksets": 0,
+                "has_embeddings": False, "files_without_metadata": 0,
+                "unparsed_frontmatter": []}
 
     store = Store(db_path)
     info = store.status()

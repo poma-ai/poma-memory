@@ -57,6 +57,12 @@ class BM25Search:
                 dtype=np.float32, count=len(self._chunksets),
             )
 
+        # Caveat if the retriever is ever constructed with a different method:
+        # bm25s applies `scores *= weight_mask` BEFORE adding its
+        # `nonoccurrence_array`, so under "bm25l"/"bm25+" a masked document
+        # would come back with a non-zero score. `bm25s.BM25()` defaults to
+        # lucene, where that array is None. The membership drop below does not
+        # depend on the score, so it holds either way.
         query_tokens = bm25s.tokenize([query], stopwords="en", show_progress=False)
         results, scores = self._retriever.retrieve(
             query_tokens, k=min(top_k, len(self._chunksets)),

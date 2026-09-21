@@ -341,7 +341,11 @@ def test_an_in_scope_document_scoring_zero_is_kept():
         hybrid = HybridSearch(store, enable_semantic=False)
         allowed = hybrid._allowed_ids({"kind": "in"})
         hits = hybrid._bm25.search("sqlite storage", top_k=10, allowed_ids=allowed)
+        # `all()` over an empty list is True, which would pass for the exact
+        # regression this test is named for.
+        assert hits
         assert all(Path(h["file_path"]).name == "a.md" for h in hits)
+        assert hits[0]["score"] == 0.0
         store.close()
 
 
@@ -355,3 +359,100 @@ def test_cli_where_encoding():
         "kind": ["a", "b"], "status": "x"}
     with pytest.raises(SystemExit):
         _parse_where(["novalue"])
+
+
+# --- the masks themselves, at api level, on the real embedder ---
+#
+# The four crux tests above drive `_StubEmbedder`, which reimplements the
+# masking it is meant to be checking — so both real mechanisms could be deleted
+# with the whole suite green. These two exist to kill exactly that: each fails
+# if its mask is removed, even though the id-membership drop after it stays.
+
+_CROWD_QUERY = "cosine similarity ranking embedded chunksets vector index"
+_CROWD_OUT = "Cosine similarity ranking of embedded chunksets in the vector index."
+_CROWD_IN = "Cosine similarity of embedded chunksets, ranked for the vector index lookup."
+
+
+def _crowded_corpus(root: Path, n_out: int = 30) -> None:
+    """One in-scope document, ranked last by both signals.
+
+    Measured on this corpus: the in-scope document is rank 30 of 31 for the
+    embedder (cosine 0.91, well above the 0.35 gate) and rank 30 of 31 for
+    BM25. Ranking first and filtering after therefore never sees it — the
+    candidate window is `top_k * 3` deep.
+    """
+    (root / "out").mkdir()
+    (root / "in").mkdir()
+    for i in range(n_out):
+        (root / "out" / f"o{i}.md").write_text(f"# Out {i}\n\n{_CROWD_OUT}\n")
+    (root / "in" / "keep.md").write_text(f"# Keep\n\n{_CROWD_IN}\n")
+    _kind_rules(root)
+    api.index(path=root)
+
+
+def test_semantic_mask_recovers_a_crowded_out_document():
+    """Fails if the -inf mask in `_EmbedderBase.search` is removed."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _crowded_corpus(root)
+        results = api.search(_CROWD_QUERY, path=root, top_k=1, where={"kind": "in"})
+        assert [Path(r["file_path"]).name for r in results] == ["keep.md"]
+
+
+def test_bm25_weight_mask_recovers_a_crowded_out_document():
+    """Fails if the `weight_mask` in `BM25Search.search` is removed.
+
+    BM25-only, because with the embedder running the semantic mask alone is
+    enough to surface the document and the BM25 mask's absence is invisible.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _crowded_corpus(root)
+        store = Store(root / ".poma-memory.db")
+        hybrid = HybridSearch(store, enable_semantic=False)
+        results = hybrid.search(_CROWD_QUERY, top_k=1, where={"kind": "in"})
+        assert [Path(r["file_path"]).name for r in results] == ["keep.md"]
+        store.close()
+
+
+# --- predicate validation ---
+
+@pytest.mark.parametrize("bad", [["kind"], "kind=in", 7])
+def test_a_non_dict_predicate_is_a_value_error_not_an_attribute_error(bad):
+    """It has to reach the daemon's `code:` contract and the CLI's except."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        store = _build(root, {"in/a.md": "# A\n\nSQLite storage notes.\n"})
+        store.close()
+        with pytest.raises(ValueError):
+            api.search("storage", path=root, where=bad)
+
+
+def test_the_daemon_reports_a_non_dict_predicate_as_bad_where(mixed_dir):
+    resp = _handle({"op": "search", "query": "cosine", "path": str(mixed_dir),
+                    "where": ["kind"]}, _IndexCache())
+    assert resp["ok"] is False and resp["code"] == "bad_where"
+
+
+# --- CLI exit status ---
+
+def test_cli_exits_2_on_an_unscanned_index_rather_than_printing_no_results():
+    """'No results found.' and exit 0 would be the empty answer this refuses."""
+    import subprocess
+    import sys
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        store = _build(root, {"in/a.md": "# A\n\nSQLite storage notes.\n"})
+        store._conn.execute("UPDATE files SET metadata = ''")
+        store._conn.commit()
+        store.close()
+
+        proc = subprocess.run(
+            [sys.executable, "-m", "poma_memory.cli", "search", "storage",
+             "--path", str(root), "--socket", "off", "--where", "kind=in"],
+            capture_output=True, text=True,
+        )
+        assert proc.returncode == 2
+        assert "no metadata recorded" in proc.stderr
+        assert "No results found." not in proc.stdout

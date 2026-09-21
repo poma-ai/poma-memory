@@ -9,7 +9,9 @@ from pathlib import Path
 
 from poma_memory.store import Store
 from poma_memory.incremental import update_file
-from poma_memory.metadata import load_rules, resolve_paths, rules_hash
+from poma_memory.metadata import (
+    current_rules_hash, load_rules, resolve_paths, rules_hash,
+)
 from poma_memory.search import HybridSearch
 
 def _disk_state(path: str) -> str:
@@ -81,10 +83,20 @@ def index(
     seen: set[str] = set()
     unreadable: list[str] = []
 
+    # Taken before the loop, so the dot-prefix rule below asks whether a row
+    # already existed rather than whether this run just made one.
+    tracked_set = set(store.all_file_paths())
+
     for md_file in sorted(path.glob(glob)):
-        if md_file.name.startswith("."):
-            continue
         key = os.path.realpath(md_file)
+        if md_file.name.startswith(".") and key not in tracked_set:
+            # Dot-prefixed names are not indexed by this command. But once a row
+            # exists -- `index --file` puts one there -- refusing to revisit it
+            # leaves metadata that NO glob can ever backfill, so a filtered
+            # search refuses permanently and the remediation it prints cannot
+            # work. Skipping only unindexed ones keeps the default behaviour and
+            # removes the trap.
+            continue
         seen.add(key)
         try:
             result = update_file(
@@ -92,13 +104,18 @@ def index(
                 path_metadata=path_meta.get(key),
                 rules_hash=new_hash,
             )
-        except OSError as e:
+        except (OSError, UnicodeDecodeError) as e:
             # A dangling symlink or an unreadable file used to abort the whole
             # run with an uncaught exception, skipping store.close(). One bad
             # file should cost that file, not the index.
+            #
+            # UnicodeDecodeError is a ValueError, not an OSError, so catching
+            # OSError alone still let one Latin-1 byte in one document kill the
+            # run and lose every file already indexed. It also has no `strerror`.
             unreadable.append(key)
             seen.discard(key)
-            print(f"poma-memory: {md_file}: {e.strerror or e}; skipped",
+            print(f"poma-memory: {md_file}: "
+                  f"{getattr(e, 'strerror', None) or e}; skipped",
                   file=sys.stderr)
             continue
         if result["status"] == "unreadable":
@@ -124,12 +141,13 @@ def index(
     # Leaving it at '' is honest — a filtered search refuses until a run whose
     # glob covers it fills it in.
     scanned = store.get_file_metadata_map()
-    tracked = store.all_file_paths()
-    states = {fp: _disk_state(fp) for fp in tracked if fp not in seen}
+    # Re-read: the loop above may have added rows.
+    states = {fp: _disk_state(fp) for fp in store.all_file_paths()
+              if fp not in seen}
     orphaned = [fp for fp, st in states.items()
                 if st == "gone" and fp not in scanned]
     for fp in orphaned:
-        store.set_file_metadata(fp, "{}")
+        store.set_file_metadata(fp, "{}", False, new_hash)
         print(f"poma-memory: {fp} is indexed but no longer on disk; recorded "
               "as having no metadata", file=sys.stderr)
 
@@ -177,11 +195,12 @@ def index_file(
     rules, raw = load_rules(path)
     path_meta = resolve_paths(path, rules)
     if Path(file).name.startswith("."):
-        # `index()` skips dot-prefixed names, so this row can only ever be
-        # refreshed by another index_file call on the same path.
-        print(f"poma-memory: {file} starts with '.', so `poma-memory index` "
-              "will not revisit it; re-run this command after changing "
-              "metadata rules", file=sys.stderr)
+        # `index()` does not pick dot-prefixed names up on its own, so this
+        # command is what puts the row there. Once it exists `index` does
+        # revisit it, which is what keeps a rule edit from stranding it.
+        print(f"poma-memory: {file} starts with '.'; `poma-memory index` "
+              "will not discover it on its own, but will keep this row "
+              "up to date now that it exists", file=sys.stderr)
     result = update_file(
         store, str(file),
         path_metadata=path_meta.get(os.path.realpath(file)),
@@ -220,6 +239,9 @@ def search(
     Raises:
         MetadataNotIndexed: `where` was given against an index that has files
             with no metadata recorded. Run `index()` to backfill.
+        MetadataStale: `where` was given against an index whose rows were
+            resolved against a rule set that is no longer current. Run
+            `index()` with a glob that covers them.
     """
     path = Path(path)
     if db_path is None:
@@ -231,6 +253,10 @@ def search(
         results = hybrid.search(
             query, top_k=top_k, min_score=min_score, empty_gate=empty_gate,
             where=where,
+            # Only when there is a predicate: locating the rules file costs a
+            # read and can raise on a malformed one, and an unfiltered search
+            # neither uses metadata nor should start failing because of it.
+            rules_hash=current_rules_hash(path, db_path) if where else None,
         )
     finally:
         store.close()

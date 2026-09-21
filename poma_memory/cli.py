@@ -129,7 +129,7 @@ def _cmd_search(args: argparse.Namespace) -> None:
     """Search command: search indexed content."""
     import os
 
-    from poma_memory.metadata import MetadataNotIndexed, normalize_where
+    from poma_memory.metadata import MetadataIncomplete, normalize_where
 
     where = _parse_where(getattr(args, "where", None))
     try:
@@ -183,7 +183,7 @@ def _cmd_search(args: argparse.Namespace) -> None:
             }, sock)
             if resp.get("ok"):
                 results = resp.get("results", [])
-            elif resp.get("code") == "metadata_not_indexed":
+            elif str(resp.get("code", "")).startswith("metadata_"):
                 # A real answer, not a daemon problem. Falling through to the
                 # in-process path would reach the same refusal ~0.5s and one
                 # model load later.
@@ -207,7 +207,7 @@ def _cmd_search(args: argparse.Namespace) -> None:
                 empty_gate=empty_gate,
                 where=where,
             )
-        except MetadataNotIndexed as e:
+        except MetadataIncomplete as e:
             # Only this one. A bare `ValueError` here would swallow, say, a
             # corrupt chunk_ids blob and report it as a metadata problem.
             print(f"poma-memory: {e}", file=sys.stderr)

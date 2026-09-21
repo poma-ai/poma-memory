@@ -133,8 +133,15 @@ documents you filtered out would answer for a corpus you did not ask about.
 Run `poma-memory index` after adding metadata or editing the rules file — it
 re-reads metadata in place, with no re-chunking and no re-embedding. Until
 then, a filtered search **refuses** rather than returning an empty list you
-could not tell apart from "nothing matches". `poma-memory status` shows
-whether the index is complete.
+could not tell apart from "nothing matches". That covers both ways the index
+can be behind: a file never scanned for metadata, and a file still carrying
+what an earlier version of the rules file said about it. `poma-memory status`
+shows the first; the second is reported by `index` itself, naming the files a
+run could not reach.
+
+A run given a narrower `--glob` reaches only part of the corpus, so it leaves
+the rest on the old rules and says so. Re-run with a glob that covers every
+indexed file to clear it.
 
 ---
 

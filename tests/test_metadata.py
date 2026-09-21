@@ -12,6 +12,7 @@ import pytest
 from poma_memory import api
 from poma_memory.frontmatter import parse
 from poma_memory.metadata import (
+    MetadataNotIndexed, MetadataStale,
     MetadataRulesError, load_rules, merge, matches, normalize_where,
     resolve_paths, rules_hash,
 )
@@ -716,3 +717,247 @@ def test_a_key_that_opens_a_quote_and_never_closes_it_is_unparsed():
     from poma_memory.frontmatter import _unquote_key
     assert parse('---\n"abc: v\n---\n') == ({}, False)
     assert _unquote_key('"abc') is None
+
+
+# --- Stale rules: a rule edit changes what a file means, without touching it ---
+#
+# Every test here fails against a build that refuses only on `metadata = ''`.
+# That was the shape of the bug through four rounds: the row is scanned, so
+# nothing on the search path notices, and the filter answers from rules that no
+# longer exist -- in both directions, since the predicate that used to match
+# still does and the one that should now match does not.
+
+_V1 = [{"glob": "DECISIONS.md", "metadata": {"kind": "decision"}},
+       {"glob": "events/*.md", "metadata": {"kind": "event"}}]
+_V2 = [{"glob": "DECISIONS.md", "metadata": {"kind": "architecture"}},
+       {"glob": "events/*.md", "metadata": {"kind": "event"}}]
+
+
+def _two_kinds(root: Path) -> None:
+    (root / "events").mkdir()
+    (root / "DECISIONS.md").write_text("# Decisions\n\nWe chose sqlite here.\n")
+    (root / "events" / "e1.md").write_text("# Event\n\nDeployed sqlite today.\n")
+
+
+def test_a_narrow_glob_after_a_rules_edit_refuses_instead_of_answering():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _two_kinds(root)
+        _write_rules(root, _V1)
+        api.index(root)
+        _write_rules(root, _V2)
+        api.index(root, glob="events/*.md")
+
+        # Both directions of the wrong answer the old build gave: DECISIONS.md
+        # answering to its deleted kind, and not answering to its current one.
+        for where in ({"kind": "decision"}, {"kind": "architecture"}):
+            with pytest.raises(MetadataStale) as e:
+                api.search("sqlite", path=root, where=where)
+            assert e.value.from_rules_file
+        # And the refusal clears once the rules are actually applied.
+        api.index(root)
+        hits = api.search("sqlite", path=root, where={"kind": "architecture"})
+        assert [Path(h["file_path"]).name for h in hits] == ["DECISIONS.md"]
+
+
+def test_adding_a_rules_file_without_reindexing_refuses():
+    """No `index` run happens after the edit, so nothing can mark rows stale.
+
+    Only comparing the rows against the rules file on disk catches this; a fix
+    that invalidates rows during `index()` cannot, because `index()` never runs.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _two_kinds(root)
+        api.index(root)
+        _write_rules(root, _V1)
+        with pytest.raises(MetadataStale):
+            api.search("sqlite", path=root, where={"kind": "decision"})
+
+
+def test_index_file_after_a_rules_edit_refuses():
+    """The quietest variant: `index_file` prints nothing at all."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _two_kinds(root)
+        _write_rules(root, _V1)
+        api.index(root)
+        _write_rules(root, _V2)
+        api.index_file(root / "events" / "e1.md", path=root)
+        with pytest.raises(MetadataStale):
+            api.search("sqlite", path=root, where={"kind": "decision"})
+
+
+def test_rows_that_disagree_refuse_even_with_the_rules_file_out_of_reach():
+    """An explicit database elsewhere: `path` may not own it, so the file is
+    not consulted. Rows carrying two different hashes still prove a partial
+    re-index, and the message must not claim to know which side is current."""
+    with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as td2:
+        root, db = Path(td), Path(td2) / "x.sqlite"
+        _two_kinds(root)
+        _write_rules(root, _V1)
+        api.index(root, db_path=db)
+        _write_rules(root, _V2)
+        api.index(root, db_path=db, glob="events/*.md")
+        with pytest.raises(MetadataStale) as e:
+            api.search("sqlite", path=root, db_path=db, where={"kind": "decision"})
+        assert not e.value.from_rules_file
+        assert "more than" in str(e.value)
+
+
+@pytest.mark.parametrize("scenario", ["no_rules_ever", "db_elsewhere", "deleted_file"])
+def test_consistent_indexes_are_not_refused(scenario):
+    """The staleness check must not cost a correct index its answers.
+
+    `deleted_file` is the one that bit: an orphaned row was stamped with the
+    default empty `rules_hash`, which differs from every real hash forever, so
+    a check like this one would refuse that index permanently.
+    """
+    with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as td2:
+        root = Path(td)
+        _two_kinds(root)
+        db = None
+        if scenario != "no_rules_ever":
+            _write_rules(root, _V1)
+        if scenario == "db_elsewhere":
+            db = Path(td2) / "x.sqlite"
+        api.index(root, db_path=db)
+        if scenario == "deleted_file":
+            os.remove(root / "events" / "e1.md")
+            api.index(root, db_path=db)
+            assert api.index(root, db_path=db)["stale_rules"] == []
+        # No exception, and an unfiltered search is unaffected either way.
+        api.search("sqlite", path=root, db_path=db, where={"kind": "decision"})
+        assert api.search("sqlite", path=root, db_path=db)
+
+
+def test_a_dot_prefixed_row_can_be_healed_by_index():
+    """`index` skips dot-names, so a row one put there was unreachable by any
+    glob: every filtered search refused forever and the remediation printed
+    could not work."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _two_kinds(root)
+        _write_rules(root, _V1)
+        (root / ".hidden.md").write_text("# Hidden\n\nsqlite notes.\n")
+        api.index_file(root / ".hidden.md", path=root)
+        # A row written before metadata existed at all (0.5.0), which is how
+        # one of these gets stranded in practice.
+        store = Store(root / ".poma-memory.db")
+        store.set_file_metadata(os.path.realpath(root / ".hidden.md"), "")
+        store.close()
+        assert api.status(root)["files_without_metadata"] == 1
+        api.index(root)
+        assert api.status(root)["files_without_metadata"] == 0
+        api.search("sqlite", path=root, where={"kind": "decision"})
+
+
+def test_the_refusal_names_the_file_route_for_a_dot_prefixed_file():
+    e = MetadataNotIndexed(1, "/db", ["/x/.hidden.md"])
+    assert "index --file /x/.hidden.md" in str(e)
+    assert "pass the glob" not in str(e)
+
+
+def test_index_survives_a_file_that_is_not_utf8():
+    """UnicodeDecodeError is a ValueError, not an OSError. Catching OSError
+    alone let one byte abort the run and lose every file already indexed."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "a_good.md").write_text("# A\n\nreadable sqlite content.\n")
+        (root / "z_bad.md").write_bytes(b"# Bad\n\n\xff\xfe not utf8\n")
+        result = api.index(root)
+        assert [Path(p).name for p in result["unreadable"]] == ["z_bad.md"]
+        assert result["files_indexed"] == 1
+        assert [Path(f).name for f in api.status(root)["files"]] == ["a_good.md"]
+
+
+def test_a_vanished_unscanned_row_is_recorded_against_the_current_rules():
+    """The orphan branch fires only for a row that was never scanned AND whose
+    file is gone. Stamping it without the current rules hash left it differing
+    from every real hash forever, so every filtered search refused permanently
+    and no glob could clear it -- the file is deleted."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _two_kinds(root)
+        _write_rules(root, _V1)
+        api.index(root)
+
+        # A row that predates metadata indexing (0.5.0), whose file then goes.
+        gone = os.path.realpath(root / "events" / "e1.md")
+        store = Store(root / ".poma-memory.db")
+        store.set_file_metadata(gone, "")
+        store.close()
+        os.remove(root / "events" / "e1.md")
+
+        api.index(root)
+        store = Store(root / ".poma-memory.db")
+        record = store.get_file_record(gone)
+        store.close()
+        assert record["metadata"] == "{}"
+        assert record["rules_hash"] == rules_hash(json.dumps({"rules": _V1}))
+
+        assert api.index(root)["stale_rules"] == []
+        api.search("sqlite", path=root, where={"kind": "decision"})
+
+
+@pytest.mark.parametrize("falsy", [[], "", 0, ()])
+def test_a_falsy_non_dict_predicate_is_rejected_not_read_as_no_predicate(falsy):
+    """Testing falsiness before type made `[]`, `""` and `0` mean "unfiltered",
+    so the caller got the ENTIRE corpus back as a successful filtered answer --
+    indistinguishable from a correct one. `[1, 2]` raised; `[]` did not."""
+    with pytest.raises(ValueError, match="expected a dict"):
+        normalize_where(falsy)
+
+
+def test_an_empty_dict_is_a_predicate_that_constrains_nothing():
+    assert normalize_where({}) is None
+    assert normalize_where(None) is None
+
+
+def test_a_falsy_non_dict_predicate_does_not_return_the_corpus_over_the_daemon():
+    from poma_memory.server import _IndexCache, _handle
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _two_kinds(root)
+        _write_rules(root, _V1)
+        api.index(root)
+        resp = _handle({"op": "search", "query": "sqlite", "path": str(root),
+                        "db_path": None, "where": []}, _IndexCache())
+        assert resp["ok"] is False and resp["code"] == "bad_where"
+        assert "results" not in resp
+
+
+@pytest.mark.parametrize("closing", ["--- ", "---\t", "---  \t"])
+def test_trailing_whitespace_on_the_closing_fence_still_closes_a_block(closing):
+    """The symmetry the opening-fence fix is justified by. Untested, it could
+    be tightened to `line == FENCE` and take the opening tolerance's reason
+    away without anything failing."""
+    meta, ok = parse(f"---\nkind: decision\n{closing}\nbody\n")
+    assert ok and meta == {"kind": "decision"}
+
+
+@pytest.mark.parametrize("opening", ["--- ", "---\t", "---  \t"])
+def test_trailing_whitespace_on_the_opening_fence_still_opens_a_block(opening):
+    """The closing fence has always been `line.rstrip() == FENCE`; the opening
+    one was not, so an invisible trailing space made the entire block vanish
+    with ok=True -- no metadata, not flagged unparsed, invisible in status().
+    PyYAML accepts it, so the document plainly has front-matter."""
+    meta, ok = parse(f"{opening}\nkind: decision\n---\nbody\n")
+    assert ok and meta == {"kind": "decision"}
+
+
+def test_a_horizontal_rule_is_still_not_front_matter():
+    """The tolerance must not swallow ordinary markdown."""
+    assert parse("---foo\nkind: decision\n---\nbody\n") == ({}, True)
+    assert parse("---") == ({}, True)
+
+
+def test_a_file_whose_fence_has_trailing_space_is_filterable_end_to_end():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "a.md").write_text("--- \nkind: decision\n---\n\nsqlite notes.\n")
+        (root / "b.md").write_text("# B\n\nother sqlite notes.\n")
+        api.index(root)
+        assert api.status(root)["unparsed_frontmatter"] == []
+        hits = api.search("sqlite", path=root, where={"kind": "decision"})
+        assert [Path(h["file_path"]).name for h in hits] == ["a.md"]

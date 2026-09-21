@@ -60,7 +60,17 @@ def extract_block(text: str) -> str | None:
     if not text.startswith(FENCE):
         return None
     after = text[len(FENCE):]
-    if after[:1] not in ("\n", "\r"):
+    # Trailing whitespace on the OPENING fence is tolerated, because it already
+    # is on the closing one (`line.rstrip() == FENCE` below). Without this the
+    # two disagreed, and `"--- \n"` -- an invisible trailing space, which YAML
+    # itself accepts and PyYAML parses -- made the whole block vanish: no
+    # metadata, `ok=True` so not flagged unparsed, invisible in `status()`, and
+    # a filtered search silently omitting the document. A silent wrong result is
+    # exactly what this grammar refuses to produce.
+    #
+    # A bare `---` with no line terminator is still not front-matter: stripping
+    # leaves "", which fails the check, so a one-line horizontal rule is safe.
+    if after.lstrip(" \t")[:1] not in ("\n", "\r"):
         return None  # "---foo", a horizontal rule, something else entirely
     lines = text[:MAX_BLOCK_BYTES].splitlines()
     for i, line in enumerate(lines[1:], start=1):

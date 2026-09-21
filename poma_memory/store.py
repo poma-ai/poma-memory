@@ -231,6 +231,20 @@ class Store:
         ).fetchall()
         return [r["file_path"] for r in rows]
 
+    def majority_rules_hash(self) -> str | None:
+        """The rule set most scanned rows were resolved against, or None.
+
+        Used only when the rules file itself cannot be located: rows that
+        disagree with each other prove a rule edit was applied to part of the
+        corpus, without saying which part is current. Naming the minority is the
+        useful half of that answer, and the count is honest either way.
+        """
+        row = self._conn.execute(
+            "SELECT rules_hash FROM files WHERE metadata != '' "
+            "GROUP BY rules_hash ORDER BY COUNT(*) DESC, rules_hash LIMIT 1"
+        ).fetchone()
+        return row["rules_hash"] if row else None
+
     def get_file_metadata_map(self) -> dict[str, dict]:
         """file_path -> parsed metadata, skipping rows that have none recorded."""
         rows = self._conn.execute(

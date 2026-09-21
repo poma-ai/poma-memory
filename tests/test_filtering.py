@@ -568,3 +568,36 @@ def test_the_cli_daemon_client_does_not_retry_the_search_in_process():
     finally:
         server_mod.request = real_request
         api_mod.search = real_search
+
+
+def test_daemon_sees_a_rules_edit_although_its_cached_index_is_not_rebuilt():
+    """The warm HybridSearch is keyed on `PRAGMA data_version`, and editing the
+    rules file writes nothing to the database — so the cache is deliberately
+    NOT rebuilt here. A rules hash captured when that object was built would
+    keep reporting the superseded rules as current forever, which is why the
+    hash is resolved per request instead."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "events").mkdir()
+        (root / "DECISIONS.md").write_text("# Decisions\n\nWe chose sqlite.\n")
+        (root / "events" / "e1.md").write_text("# Event\n\nDeployed sqlite.\n")
+        _write_rules(root, [{"glob": "DECISIONS.md", "metadata": {"kind": "decision"}},
+                            {"glob": "events/*.md", "metadata": {"kind": "event"}}])
+        api.index(root)
+
+        cache = _IndexCache()
+        req = {"op": "search", "query": "sqlite", "path": str(root),
+               "db_path": None, "where": {"kind": "decision"}}
+        assert _handle(req, cache)["ok"] is True
+        builds = cache.builds
+
+        # Rules edited on disk only. Nothing touches the database.
+        _write_rules(root, [{"glob": "DECISIONS.md", "metadata": {"kind": "architecture"}},
+                            {"glob": "events/*.md", "metadata": {"kind": "event"}}])
+        resp = _handle(req, cache)
+        assert resp["ok"] is False and resp["code"] == "metadata_stale"
+        assert cache.builds == builds, "the cached index must not have been rebuilt"
+
+        # And it recovers once the rules are applied.
+        api.index(root)
+        assert _handle({**req, "where": {"kind": "architecture"}}, cache)["ok"] is True

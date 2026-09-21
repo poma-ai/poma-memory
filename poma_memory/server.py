@@ -53,7 +53,10 @@ import threading
 import time
 from pathlib import Path
 
-from poma_memory.metadata import MetadataNotIndexed, normalize_where
+from poma_memory.metadata import (
+    MetadataIncomplete, MetadataNotIndexed, MetadataRulesError, MetadataStale,
+    current_rules_hash, normalize_where,
+)
 from poma_memory.search import HybridSearch
 from poma_memory.store import Store
 
@@ -271,6 +274,17 @@ def _handle(req: dict, cache: _IndexCache) -> dict:
         where = normalize_where(req.get("where"))
     except ValueError as e:
         return {"ok": False, "code": "bad_where", "error": str(e)}
+    # Per request, never cached with the index: editing the rules file writes
+    # nothing to the database, so `PRAGMA data_version` does not move and the
+    # warm HybridSearch below is NOT rebuilt. A hash captured when that object
+    # was built would keep saying the superseded rules are current, which is
+    # the exact failure this check exists to catch.
+    rules_hash = None
+    if where and req.get('path'):
+        try:
+            rules_hash = current_rules_hash(req['path'], db)
+        except (MetadataRulesError, OSError, UnicodeDecodeError) as e:
+            return {'ok': False, 'code': 'bad_rules', 'error': str(e)}
     search = cache.get(db)
     try:
         results = search.search(
@@ -279,15 +293,22 @@ def _handle(req: dict, cache: _IndexCache) -> dict:
             min_score=0.0 if min_score is None else float(min_score),
             empty_gate=req.get("empty_gate"),
             where=where,
+            rules_hash=rules_hash,
         )
-    except MetadataNotIndexed as e:
+    except MetadataIncomplete as e:
         # A machine-readable code, not just prose. The client has to tell this
         # apart from every other failure: falling back to the in-process path
         # would raise the same thing half a second and one model load later,
         # and matching on the message text is not something a client should be
         # asked to do. Additive — every other failure keeps the old shape.
-        return {"ok": False, "code": "metadata_not_indexed", "error": str(e),
-                "files_without_metadata": e.count}
+        code = ("metadata_not_indexed" if isinstance(e, MetadataNotIndexed)
+                else "metadata_stale" if isinstance(e, MetadataStale)
+                else "metadata_incomplete")
+        resp = {"ok": False, "code": code, "error": str(e)}
+        if isinstance(e, MetadataNotIndexed):
+            # Kept for clients written against the original shape.
+            resp["files_without_metadata"] = e.count
+        return resp
     return {"ok": True, "results": results, "db": str(db), "indexed": True}
 
 

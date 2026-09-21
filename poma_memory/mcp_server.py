@@ -45,14 +45,14 @@ def poma_search(
             built with metadata (see `.poma-metadata.json`).
     """
     from poma_memory.api import search
-    from poma_memory.metadata import MetadataNotIndexed
+    from poma_memory.metadata import MetadataIncomplete
 
     try:
         results = search(
             query=query, path=path, top_k=top_k, min_score=min_score,
             empty_gate=empty_gate, where=where,
         )
-    except (MetadataNotIndexed, ValueError) as e:
+    except (MetadataIncomplete, ValueError) as e:
         return f"Search failed: {e}"
 
     if not results:

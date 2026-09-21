@@ -6,7 +6,9 @@ import os
 from typing import TYPE_CHECKING
 
 from poma_memory.bm25_search import BM25Search
-from poma_memory.metadata import MetadataNotIndexed, matches, normalize_where
+from poma_memory.metadata import (
+    MetadataNotIndexed, MetadataStale, matches, normalize_where,
+)
 from poma_primecut_nano import expand_chunk_ids, assemble_context
 
 if TYPE_CHECKING:
@@ -66,6 +68,7 @@ class HybridSearch:
         min_score: float = 0.0,
         empty_gate: float | None = None,
         where: dict | None = None,
+        rules_hash: str | None = None,
     ) -> list[dict]:
         """Search with hybrid BM25 + semantic fusion.
 
@@ -80,6 +83,14 @@ class HybridSearch:
             where: Metadata predicate, e.g. {"kind": ["decision", "lesson"]}.
                 AND across keys, OR within a list. The corpus is narrowed
                 before anything is ranked — see `_allowed_ids`.
+            rules_hash: the rule set the caller has established is in effect,
+                from `metadata.current_rules_hash`. Per CALL, not per object:
+                editing the rules file writes nothing to the database, so
+                `PRAGMA data_version` does not move and the daemon's cached
+                HybridSearch is never rebuilt — a hash captured in __init__
+                would go stale and stay stale. None means the caller could not
+                locate the rules file, and the check falls back to comparing
+                the rows against each other.
 
         Returns:
             List of dicts: [{file_path, score, context, chunk_ids}]
@@ -87,8 +98,11 @@ class HybridSearch:
         Raises:
             MetadataNotIndexed: `where` was given but this index has files with
                 no metadata recorded, so the answer could not be honest.
+            MetadataStale: `where` was given but some rows were resolved
+                against a rule set other than the current one. Both are
+                `MetadataIncomplete`; catch that to cover either.
         """
-        allowed_ids = self._allowed_ids(where)
+        allowed_ids = self._allowed_ids(where, rules_hash)
         if allowed_ids is not None and not allowed_ids:
             # Nothing matches the predicate. Returning early also avoids handing
             # the searchers an all-zero mask, which is not a meaningful ranking.
@@ -181,7 +195,8 @@ class HybridSearch:
             results = [r for r in results if r["score"] >= min_score]
         return results
 
-    def _allowed_ids(self, where: dict | None) -> set[int] | None:
+    def _allowed_ids(self, where: dict | None,
+                     rules_hash: str | None = None) -> set[int] | None:
         """Chunkset ids the predicate admits, or None when there is no predicate.
 
         Resolved before ranking, which is the entire point: the empty gate is
@@ -198,6 +213,10 @@ class HybridSearch:
             raise MetadataNotIndexed(self._files_without_metadata,
                                      self._store.db_path,
                                      self._store.files_without_metadata())
+        stale, from_rules_file = self._stale_rows(rules_hash)
+        if stale:
+            raise MetadataStale(len(stale), self._store.db_path, stale[:3],
+                                from_rules_file=from_rules_file)
         keep_files = {
             path for path, meta in self._file_meta.items()
             if matches(meta, where)
@@ -206,6 +225,24 @@ class HybridSearch:
             cs_id for cs_id, file_path in self._chunkset_files
             if file_path in keep_files
         }
+
+    def _stale_rows(self, rules_hash: str | None) -> tuple[list[str], bool]:
+        """(rows resolved against other rules, whether the rules file said so).
+
+        Two checks, because neither covers the other. Against the rules file we
+        catch the case every row is stale together -- rules edited, `index` not
+        re-run at all -- which no amount of comparing rows to each other can
+        see. Without the file we can still catch a corpus that was only partly
+        re-indexed, because the reached rows carry the new hash and the rest do
+        not. Both end in the same refusal, but only the first knows which side
+        is current, and the flag keeps the message from claiming otherwise.
+        """
+        if rules_hash is not None:
+            return self._store.files_with_other_rules(rules_hash), True
+        majority = self._store.majority_rules_hash()
+        if majority is None:
+            return [], False
+        return self._store.files_with_other_rules(majority), False
 
     def _resolve_empty_gate(self, empty_gate: float | None) -> float:
         """Precedence: explicit param > POMA_MEMORY_EMPTY_GATE env >

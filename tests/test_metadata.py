@@ -404,3 +404,142 @@ def test_a_narrower_glob_leaves_untouched_files_unscanned_rather_than_empty():
                  for p, m in store.get_file_metadata_map().items()}
         assert kinds["DECISIONS.md"] == "note"
         store.close()
+
+
+# --- the rules hash may only advance on a run that covered everything ---
+
+def test_a_partial_run_does_not_claim_the_new_rules_were_applied():
+    """Otherwise the rest of the corpus keeps superseded metadata forever.
+
+    Those rows are not '', so the legacy heal never touches them, and the
+    hash says the rules are current, so the refresh path never does either.
+    `status` reports complete and the filter answers from stale rules.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _corpus(root)
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        api.index(path=root)
+
+        _write_rules(root, [
+            {"glob": "events/**/*.md", "metadata": {"kind": "event"}},
+            {"glob": "**/*.md", "metadata": {"kind": "decision"}},
+        ])
+        api.index(path=root, glob="events/*.md")
+
+        # The narrow run must not have banked the new hash...
+        assert api.index(path=root)["metadata_refreshed"] is True
+
+        store = Store(root / ".poma-memory.db")
+        kinds = {Path(p_).name: m["kind"]
+                 for p_, m in store.get_file_metadata_map().items()}
+        assert kinds == {"e1.md": "event", "DECISIONS.md": "decision"}
+        store.close()
+
+        # ...and once it has, an unchanged rule set stops re-resolving.
+        assert api.index(path=root)["metadata_refreshed"] is False
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
+                    reason="root ignores directory permissions")
+def test_an_unreadable_file_is_left_unscanned_rather_than_called_deleted():
+    """`os.path.exists` is False for a permission error too, not just deletion."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "sub").mkdir()
+        (root / "sub" / "a.md").write_text("# A\n\nSQLite notes.\n")
+        (root / "b.md").write_text("# B\n\nMore notes.\n")
+        db = Path(td + "-db") / "index.db"
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        api.index(path=root, db_path=db)
+
+        store = Store(db)
+        store._conn.execute("UPDATE files SET metadata = ''")
+        store._conn.commit()
+        store.close()
+
+        (root / "sub").chmod(0o000)
+        try:
+            api.index(path=root, db_path=db)
+        finally:
+            (root / "sub").chmod(0o755)
+
+        store = Store(db)
+        rows = {Path(p_).name: m for p_, m in store._conn.execute(
+            "SELECT file_path, metadata FROM files").fetchall()}
+        # Unreachable, not gone: recording '{}' here is permanent and silent.
+        assert rows["a.md"] == ""
+        store.close()
+
+        api.index(path=root, db_path=db)
+        store = Store(db)
+        assert store.count_files_without_metadata() == 0
+        store.close()
+
+
+# --- an apostrophe is not an opening quote ---
+
+def test_an_apostrophe_does_not_swallow_the_rest_of_the_line():
+    meta, ok = parse("---\ntitle: Don't ship  # decided 2026-09-21\n---\n")
+    assert ok and meta == {"title": "Don't ship"}
+
+
+def test_an_apostrophe_does_not_merge_inline_list_items():
+    meta, ok = parse("---\ntags: [don't, can't]\n---\n")
+    assert ok and meta == {"tags": ["don't", "can't"]}
+
+
+def test_a_quote_still_opens_at_the_start_of_a_value():
+    meta, ok = parse('---\nk: "a # b"\n---\n')
+    assert ok and meta == {"k": "a # b"}
+
+
+# --- more shapes the grammar cannot represent ---
+
+def test_a_quoted_key_is_unwrapped_not_kept_with_its_quotes():
+    meta, ok = parse('---\n"kind": event\n---\n')
+    assert ok and meta == {"kind": "event"}
+
+
+@pytest.mark.parametrize("block", [
+    "---\nk: [a, [b, c]]\n---\n",   # nested flow sequence
+    "---\nk: [a, b\n---\n",         # unterminated bracket
+    "---\nk: [a, , b]\n---\n",      # empty item
+    "---\n<<: base\n---\n",         # merge key
+])
+def test_flow_shapes_outside_the_grammar_are_unparsed(block):
+    assert parse(block) == ({}, False)
+
+
+def test_a_trailing_comma_in_an_inline_list_is_not_a_phantom_item():
+    meta, ok = parse("---\ntags: [a, ]\n---\n")
+    assert ok and meta == {"tags": ["a"]}
+
+
+# --- the rules guards are not posix-only ---
+
+@pytest.mark.parametrize("glob", ["..\\\\..\\\\etc\\\\*.md", "C:\\\\Users\\\\x\\\\*.md",
+                                  "sub:/*.md"])
+def test_windows_style_globs_are_rejected_rather_than_bypassing_the_guards(glob):
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _write_rules(root, [{"glob": glob, "metadata": {"kind": "x"}}])
+        with pytest.raises(MetadataRulesError):
+            load_rules(root)
+
+
+# --- the bounded head read must agree with the full read ---
+
+def test_a_frontmatter_block_straddling_the_head_read_boundary_agrees():
+    """Both directions: cut-short-looks-unparsed and cut-short-looks-closed."""
+    from poma_memory.frontmatter import MAX_BYTES, parse as fm_parse
+    from poma_memory.incremental import _resolve_metadata
+
+    for pad in (MAX_BYTES - 40, MAX_BYTES + 40):
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "big.md"
+            f.write_text(f"---\nkind: event\np: {'x' * pad}\n---\n# Body\n\ntext\n")
+            head_path = _resolve_metadata(str(f), None)          # bounded read
+            full_path = _resolve_metadata(str(f), None, f.read_text())
+            assert head_path == full_path, f"disagreement at pad={pad}"
+            assert json.loads(head_path[0])["kind"] == "event"

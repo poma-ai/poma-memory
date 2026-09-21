@@ -129,9 +129,14 @@ def _cmd_search(args: argparse.Namespace) -> None:
     """Search command: search indexed content."""
     import os
 
-    from poma_memory.metadata import MetadataNotIndexed
+    from poma_memory.metadata import MetadataNotIndexed, normalize_where
 
     where = _parse_where(getattr(args, "where", None))
+    try:
+        normalize_where(where)
+    except ValueError as e:
+        print(f"poma-memory: {e}", file=sys.stderr)
+        raise SystemExit(2)
 
     # The env overrides documented on `search` (POMA_MEMORY_EMPTY_GATE selects the
     # relevance gate, POMA_EMBEDDER selects the embedder) are read inside the
@@ -202,7 +207,9 @@ def _cmd_search(args: argparse.Namespace) -> None:
                 empty_gate=empty_gate,
                 where=where,
             )
-        except (MetadataNotIndexed, ValueError) as e:
+        except MetadataNotIndexed as e:
+            # Only this one. A bare `ValueError` here would swallow, say, a
+            # corrupt chunk_ids blob and report it as a metadata problem.
             print(f"poma-memory: {e}", file=sys.stderr)
             raise SystemExit(2)
 

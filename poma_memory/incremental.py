@@ -22,25 +22,24 @@ def _resolve_metadata(
     head of the file is read: metadata backfill must not cost a full read of
     every document, and front-matter cannot legally live past the head anyway.
     """
-    truncated = False
     if text is None:
         try:
             with open(file_path, "r", encoding="utf-8", errors="replace") as f:
                 text = f.read(frontmatter.MAX_BYTES)
-                truncated = len(text) == frontmatter.MAX_BYTES
+                # A cut-short head disagrees with the full read in BOTH
+                # directions: an unterminated block looks unparsed, and a
+                # `---` line straddling the boundary looks terminated when it
+                # is not. Whether a file's metadata parsed must not depend on
+                # which code path last touched it, so once a truncated head
+                # turns out to carry a fence at all, pay for the rest. Files
+                # with no front-matter — the overwhelming majority — still
+                # cost one bounded read.
+                if (len(text) == frontmatter.MAX_BYTES
+                        and text.lstrip("\ufeff").startswith(frontmatter.FENCE)):
+                    text += f.read()
         except OSError:
             text = ""
     fm, ok = frontmatter.parse(text)
-    if not ok and truncated:
-        # The head read stopped mid-block, so "unparsed" here may only mean
-        # "cut short". Whether a file's metadata parsed must not depend on
-        # which code path last touched it, so pay for the full read rather
-        # than record a state the content path would disagree with.
-        try:
-            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                fm, ok = frontmatter.parse(f.read())
-        except OSError:
-            pass
     return json.dumps(meta_mod.merge(path_metadata, fm), sort_keys=True), not ok
 
 

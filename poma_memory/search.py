@@ -189,7 +189,8 @@ class HybridSearch:
             # An empty result here would be indistinguishable from an honest
             # "nothing matches", so refuse instead of guessing.
             raise MetadataNotIndexed(self._files_without_metadata,
-                                     self._store.db_path)
+                                     self._store.db_path,
+                                     self._store.files_without_metadata())
         keep_files = {
             path for path, meta in self._file_meta.items()
             if matches(meta, where)

@@ -107,12 +107,16 @@ def _parse_block(block: str) -> tuple[dict, bool]:
             return {}, False
 
         key, _, rest = raw.partition(":")
-        key = key.strip()
+        key = _unquote_key(key.strip())
+        if key is None:
+            return {}, False
         # Strip before testing emptiness: `key:  # note` is an empty value with
         # a comment, not a value of "# note".
         value = strip_comment(rest.strip())
         if not key or key in out:
             return {}, False  # empty or duplicate key
+        if key[:1].isspace() or ":" in key:
+            return {}, False
 
         if value:
             parsed = _scalar_or_inline_list(value)
@@ -181,6 +185,22 @@ def _take_indented(lines: list[str], start: int) -> tuple[list[str] | None, int]
     return body, i
 
 
+def _unquote_key(key: str) -> str | None:
+    """Strip matching outer quotes from a key. None means out of grammar.
+
+    A quoted key is ordinary YAML, and keeping the quotes produces a key no
+    predicate can ever match. `<<` is YAML's merge key and means something this
+    parser does not implement, so it is refused rather than taken literally.
+    """
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in ("'", '"'):
+        key = key[1:-1]
+    if key.startswith("<<"):
+        return None
+    if key[:1] in ("'", '"'):
+        return None
+    return key
+
+
 def strip_comment(value: str) -> str:
     """Drop a YAML trailing comment. A '#' inside quotes is literal.
 
@@ -193,7 +213,10 @@ def strip_comment(value: str) -> str:
         if quote:
             if ch == quote:
                 quote = None
-        elif ch in ("'", '"'):
+        elif ch in ("'", '"') and i == 0:
+            # YAML quotes a scalar only from its start. Treating an apostrophe
+            # anywhere as an opener swallows the rest of the line, so
+            # `title: Don't ship  # decided` kept the comment in the value.
             quote = ch
         elif ch == "#" and (i == 0 or value[i - 1].isspace()):
             return value[:i].rstrip()
@@ -214,9 +237,13 @@ def _split_inline(inner: str) -> list[str] | None:
             buf.append(ch)
             if ch == quote:
                 quote = None
-        elif ch in ("'", '"'):
+        elif ch in ("'", '"') and not "".join(buf).strip():
+            # Only at the start of an item, for the same reason as
+            # `strip_comment`: `[don't, can't]` is two items, not one.
             quote = ch
             buf.append(ch)
+        elif ch in "[]{}":
+            return None  # nested flow collections are outside this grammar
         elif ch == ",":
             parts.append("".join(buf).strip())
             buf = []
@@ -225,6 +252,10 @@ def _split_inline(inner: str) -> list[str] | None:
     if quote is not None:
         return None
     parts.append("".join(buf).strip())
+    if parts and parts[-1] == "":
+        parts.pop()  # `[a, ]` is ['a'] in YAML, not ['a', '']
+    if any(part == "" for part in parts):
+        return None
     return parts
 
 
@@ -241,6 +272,8 @@ def _scalar(value: str) -> str | None:
 
 
 def _scalar_or_inline_list(value: str) -> str | list[str] | None:
+    if value.startswith("[") and not value.endswith("]"):
+        return None  # an unterminated bracket is not a scalar
     if value.startswith("[") and value.endswith("]"):
         inner = value[1:-1].strip()
         if not inner:

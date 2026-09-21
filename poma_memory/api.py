@@ -16,6 +16,23 @@ from poma_memory.search import HybridSearch
 RULES_HASH_KEY = "metadata_rules_hash"
 
 
+def _disk_state(path: str) -> str:
+    """"gone" | "present" | "unknown".
+
+    `os.path.exists` collapses the last two: it returns False for a permission
+    error on a parent directory, an unmounted volume and a dead network mount,
+    none of which mean the file was deleted. Treating those as deletions
+    records a live document as scanned-and-empty, permanently and silently.
+    """
+    try:
+        os.lstat(path)
+        return "present"
+    except FileNotFoundError:
+        return "gone"
+    except OSError:
+        return "unknown"
+
+
 def format_updated(upserted_at: float | None) -> str | None:
     """Render a chunkset's upsert time as a YYYY-MM-DD date for result output.
 
@@ -96,16 +113,25 @@ def index(
     # Leaving it at '' is honest — a filtered search refuses until a run whose
     # glob covers it fills it in.
     scanned = store.get_file_metadata_map()
-    orphaned = [
-        fp for fp in store.all_file_paths()
-        if fp not in seen and fp not in scanned and not os.path.exists(fp)
-    ]
+    tracked = store.all_file_paths()
+    states = {fp: _disk_state(fp) for fp in tracked if fp not in seen}
+    orphaned = [fp for fp, st in states.items()
+                if st == "gone" and fp not in scanned]
     for fp in orphaned:
         store.set_file_metadata(fp, "{}")
         print(f"poma-memory: {fp} is indexed but no longer on disk; recorded "
               "as having no metadata", file=sys.stderr)
 
-    store.set_index_meta(RULES_HASH_KEY, new_hash)
+    # Only claim the rule set has been applied when this run actually reached
+    # every row that still exists. A narrower `glob` — or a file that was
+    # briefly unreadable — otherwise leaves those rows resolved against
+    # superseded rules while `refresh` goes False for good: they are not '',
+    # so the legacy heal never touches them either, and `status` says
+    # complete. That is the same indistinguishable-wrong-answer this feature
+    # exists to remove, and the first fix for the orphan bug re-opened it.
+    unvisited = [fp for fp, st in states.items() if st != "gone"]
+    if not unvisited:
+        store.set_index_meta(RULES_HASH_KEY, new_hash)
     store.close()
     return {
         "files_indexed": files_indexed,

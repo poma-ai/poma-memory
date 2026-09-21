@@ -9,6 +9,7 @@ every test here is written to fail in that case.
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -456,3 +457,114 @@ def test_cli_exits_2_on_an_unscanned_index_rather_than_printing_no_results():
         assert proc.returncode == 2
         assert "no metadata recorded" in proc.stderr
         assert "No results found." not in proc.stdout
+
+
+# --- surfaces a green suite was not defending ---
+
+def test_mcp_status_surfaces_metadata_completeness():
+    """An agent told "N files have no metadata" by poma_search needs an MCP
+    surface that confirms it; the CLI prints this and the tool did not."""
+    pytest.importorskip("mcp", reason="pip install poma-memory[mcp]")
+    from poma_memory.mcp_server import poma_status
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        store = _build(root, {"in/a.md": "# A\n\nSQLite storage notes.\n"})
+        store.close()
+        assert "Metadata:  complete" in poma_status(path=str(root))
+
+        store = Store(root / ".poma-memory.db")
+        store._conn.execute("UPDATE files SET metadata = ''")
+        store._conn.commit()
+        store.close()
+        assert "1 file(s) unscanned" in poma_status(path=str(root))
+
+
+def test_the_cli_does_not_fall_through_to_in_process_on_a_daemon_refusal():
+    """Falling through raises the same refusal a model load later."""
+    import subprocess
+    import sys
+    import time
+
+    sock = Path(f"/tmp/pm-test-{os.getpid()}.sock")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        store = _build(root, {"in/a.md": "# A\n\nSQLite storage notes.\n"})
+        store._conn.execute("UPDATE files SET metadata = ''")
+        store._conn.commit()
+        store.close()
+
+        daemon = subprocess.Popen(
+            [sys.executable, "-m", "poma_memory.cli", "serve",
+             "--socket", str(sock), "--idle-timeout", "30", "--quiet"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            for _ in range(100):
+                if sock.exists():
+                    break
+                time.sleep(0.1)
+            assert sock.exists(), "daemon never bound its socket"
+
+            proc = subprocess.run(
+                [sys.executable, "-m", "poma_memory.cli", "search", "storage",
+                 "--path", str(root), "--socket", str(sock), "--where", "kind=in"],
+                capture_output=True, text=True, timeout=60)
+            assert proc.returncode == 2
+            assert "no metadata recorded" in proc.stderr
+            assert "No results found." not in proc.stdout
+        finally:
+            daemon.terminate()
+            daemon.wait(timeout=10)
+            sock.unlink(missing_ok=True)
+
+
+def test_the_refusal_names_files_rather_than_only_counting_them():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        store = _build(root, {"in/a.md": "# A\n\nSQLite storage notes.\n"})
+        store._conn.execute("UPDATE files SET metadata = ''")
+        store._conn.commit()
+        store.close()
+        with pytest.raises(MetadataNotIndexed) as e:
+            api.search("storage", path=root, where={"kind": "in"})
+        assert "a.md" in str(e.value)
+
+
+def test_the_cli_daemon_client_does_not_retry_the_search_in_process():
+    """The observable end state is the same either way -- the same refusal,
+    the same exit 2 -- so only the absence of the second search distinguishes
+    them. Falling through costs a model load to reach an answer already given.
+    """
+    import argparse
+
+    import poma_memory.api as api_mod
+    import poma_memory.server as server_mod
+
+    called = []
+    real_request = server_mod.request
+    real_search = api_mod.search
+
+    def fake_request(payload, sock=None, timeout=10.0):
+        return {"ok": False, "code": "metadata_not_indexed",
+                "error": "1 indexed file(s) have no metadata recorded",
+                "files_without_metadata": 1}
+
+    def tripwire_search(*a, **kw):
+        called.append(kw)
+        return []
+
+    server_mod.request = fake_request
+    api_mod.search = tripwire_search
+    try:
+        from poma_memory.cli import _cmd_search
+        args = argparse.Namespace(
+            query="storage", path=".", db=None, top=5, min_score=0.0,
+            empty_gate=None, socket="/tmp/does-not-matter.sock",
+            as_json=False, where=["kind=in"])
+        with pytest.raises(SystemExit) as e:
+            _cmd_search(args)
+        assert e.value.code == 2
+        assert called == [], "fell through to a second, in-process search"
+    finally:
+        server_mod.request = real_request
+        api_mod.search = real_search

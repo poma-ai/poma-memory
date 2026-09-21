@@ -225,6 +225,18 @@ class Store:
             "SELECT COUNT(*) AS c FROM files WHERE metadata = ''"
         ).fetchone()["c"]
 
+    def files_without_metadata(self, limit: int = 3) -> list[str]:
+        """A few paths that have never been scanned, to name in the refusal.
+
+        A bare count does not tell you which file to cover, and the usual way
+        to get stuck is a file no `index` run's glob reaches.
+        """
+        rows = self._conn.execute(
+            "SELECT file_path FROM files WHERE metadata = '' "
+            "ORDER BY file_path LIMIT ?", (limit,),
+        ).fetchall()
+        return [r["file_path"] for r in rows]
+
     def get_file_metadata_map(self) -> dict[str, dict]:
         """file_path -> parsed metadata, skipping rows that have none recorded."""
         rows = self._conn.execute(

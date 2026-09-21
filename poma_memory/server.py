@@ -53,7 +53,7 @@ import threading
 import time
 from pathlib import Path
 
-from poma_memory.metadata import MetadataNotIndexed
+from poma_memory.metadata import MetadataNotIndexed, normalize_where
 from poma_memory.search import HybridSearch
 from poma_memory.store import Store
 
@@ -262,6 +262,15 @@ def _handle(req: dict, cache: _IndexCache) -> dict:
     # "not supplied".
     top_k = req.get("top_k")
     min_score = req.get("min_score")
+    # Validate the predicate on its own, before any search work. Wrapping the
+    # whole call in `except ValueError` labelled unrelated failures — a corrupt
+    # `chunk_ids` blob raises json.JSONDecodeError, which IS a ValueError — as
+    # a bad predicate, and the CLI then treats that as a real answer and stops
+    # instead of falling through to the in-process path.
+    try:
+        where = normalize_where(req.get("where"))
+    except ValueError as e:
+        return {"ok": False, "code": "bad_where", "error": str(e)}
     search = cache.get(db)
     try:
         results = search.search(
@@ -269,7 +278,7 @@ def _handle(req: dict, cache: _IndexCache) -> dict:
             top_k=5 if top_k is None else int(top_k),
             min_score=0.0 if min_score is None else float(min_score),
             empty_gate=req.get("empty_gate"),
-            where=req.get("where"),
+            where=where,
         )
     except MetadataNotIndexed as e:
         # A machine-readable code, not just prose. The client has to tell this
@@ -279,8 +288,6 @@ def _handle(req: dict, cache: _IndexCache) -> dict:
         # asked to do. Additive — every other failure keeps the old shape.
         return {"ok": False, "code": "metadata_not_indexed", "error": str(e),
                 "files_without_metadata": e.count}
-    except ValueError as e:
-        return {"ok": False, "code": "bad_where", "error": str(e)}
     return {"ok": True, "results": results, "db": str(db), "indexed": True}
 
 

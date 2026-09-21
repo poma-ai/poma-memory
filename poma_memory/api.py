@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from datetime import datetime
 from pathlib import Path
 
 from poma_memory.store import Store
 from poma_memory.incremental import update_file
+from poma_memory.metadata import load_rules, resolve_paths, rules_hash
 from poma_memory.search import HybridSearch
+
+# Identity of the path-rule set the current rows were resolved against.
+RULES_HASH_KEY = "metadata_rules_hash"
 
 
 def format_updated(upserted_at: float | None) -> str | None:
@@ -31,38 +37,104 @@ def index(
 ) -> dict:
     """Index all markdown files in a directory.
 
+    Also resolves per-file metadata from `.poma-metadata.json` path rules and
+    from each document's own front-matter. This is the only backfill mechanism
+    there is: a legacy row with no metadata, and every row after the rule file
+    changes, are refreshed here with an in-place UPDATE — no re-chunking and no
+    re-embedding.
+
     Args:
         path: Directory to index (default: .agent/)
         db_path: SQLite database path (default: {path}/.poma-memory.db)
         glob: File pattern to match (default: **/*.md)
 
     Returns:
-        dict with keys: files_indexed, chunks_created, chunksets_created
+        dict with keys: files_indexed, chunks_created, chunksets_created,
+        metadata_refreshed
     """
     path = Path(path)
     if db_path is None:
         db_path = path / ".poma-memory.db"
 
     store = Store(db_path)
+    rules, raw = load_rules(path)
+    new_hash = rules_hash(raw)
+    # Editing the rule file touches no document, and update_file short-circuits
+    # on mtime equality — so without this, every row would keep metadata
+    # resolved against rules that no longer exist, and nothing would say so.
+    refresh = store.get_index_meta(RULES_HASH_KEY) != new_hash
+    path_meta = resolve_paths(path, rules)
+
     total_chunks = 0
     total_chunksets = 0
     files_indexed = 0
+    seen: set[str] = set()
 
     for md_file in sorted(path.glob(glob)):
         if md_file.name.startswith("."):
             continue
-        result = update_file(store, str(md_file))
+        key = os.path.realpath(md_file)
+        seen.add(key)
+        result = update_file(
+            store, str(md_file),
+            path_metadata=path_meta.get(key),
+            refresh_metadata=refresh,
+        )
         if result["status"] in ("updated", "reindexed"):
             files_indexed += 1
             total_chunks += result.get("new_chunks", 0)
             total_chunksets += result.get("new_chunksets", 0)
 
+    # Rows whose file is gone from disk. Their indexed content demonstrably has
+    # no metadata to find, and leaving them at '' would make the index
+    # permanently incomplete — every filtered search would refuse forever.
+    orphaned = [
+        fp for fp in store.all_file_paths()
+        if fp not in seen and fp not in store.get_file_metadata_map()
+    ]
+    for fp in orphaned:
+        store.set_file_metadata(fp, "{}")
+        print(f"poma-memory: {fp} is indexed but missing from disk; recorded "
+              "as having no metadata", file=sys.stderr)
+
+    store.set_index_meta(RULES_HASH_KEY, new_hash)
     store.close()
     return {
         "files_indexed": files_indexed,
         "chunks_created": total_chunks,
         "chunksets_created": total_chunksets,
+        "metadata_refreshed": refresh,
     }
+
+
+def index_file(
+    file: str | Path,
+    path: str | Path = ".agent/",
+    db_path: str | Path | None = None,
+) -> dict:
+    """Index one file, resolving it against the directory's path rules.
+
+    Single-file mode still has to see the rules: resolving this file without
+    them would store `{}` where a rule says `kind: event`, and the row would
+    then look scanned-and-empty rather than unscanned — wrong, and invisible.
+
+    Returns:
+        the `update_file` result dict (status and counts)
+    """
+    path = Path(path)
+    if db_path is None:
+        db_path = path / ".poma-memory.db"
+
+    store = Store(db_path)
+    rules, _ = load_rules(path)
+    path_meta = resolve_paths(path, rules)
+    result = update_file(
+        store, str(file),
+        path_metadata=path_meta.get(os.path.realpath(file)),
+        refresh_metadata=True,
+    )
+    store.close()
+    return result
 
 
 def search(
@@ -72,6 +144,7 @@ def search(
     top_k: int = 5,
     min_score: float = 0.0,
     empty_gate: float | None = None,
+    where: dict | None = None,
 ) -> list[dict]:
     """Search indexed content.
 
@@ -84,9 +157,15 @@ def search(
         empty_gate: Suppress ALL results when the best semantic hit's cosine
             is below this (None = embedder's calibrated default, 0.0 =
             disable; env override POMA_MEMORY_EMPTY_GATE)
+        where: Metadata predicate, e.g. {"kind": ["decision", "lesson"]}.
+            AND across keys, OR within a list, case-sensitive equality.
 
     Returns:
         List of dicts with keys: file_path, score, context, chunk_ids
+
+    Raises:
+        MetadataNotIndexed: `where` was given against an index that has files
+            with no metadata recorded. Run `index()` to backfill.
     """
     path = Path(path)
     if db_path is None:
@@ -94,10 +173,13 @@ def search(
 
     store = Store(db_path)
     hybrid = HybridSearch(store)
-    results = hybrid.search(
-        query, top_k=top_k, min_score=min_score, empty_gate=empty_gate
-    )
-    store.close()
+    try:
+        results = hybrid.search(
+            query, top_k=top_k, min_score=min_score, empty_gate=empty_gate,
+            where=where,
+        )
+    finally:
+        store.close()
     return results
 
 

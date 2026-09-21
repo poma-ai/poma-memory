@@ -1,6 +1,6 @@
 """poma-memory: Persistent context for AI coding agents."""
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 # Re-export chunking primitives from poma-primecut-nano
 from poma_primecut_nano import (
@@ -14,7 +14,8 @@ from poma_primecut_nano import (
 )
 
 # poma-memory's own API
-from poma_memory.api import index, search, status
+from poma_memory.api import index, index_file, search, status
+from poma_memory.metadata import MetadataNotIndexed, MetadataRulesError
 
 __all__ = [
     # From poma-primecut-nano (re-exported for convenience)
@@ -27,6 +28,9 @@ __all__ = [
     "normalize_for_embedding",
     # poma-memory API
     "index",
+    "index_file",
     "search",
     "status",
+    "MetadataNotIndexed",
+    "MetadataRulesError",
 ]

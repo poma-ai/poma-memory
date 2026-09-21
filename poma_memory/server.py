@@ -53,6 +53,7 @@ import threading
 import time
 from pathlib import Path
 
+from poma_memory.metadata import MetadataNotIndexed
 from poma_memory.search import HybridSearch
 from poma_memory.store import Store
 
@@ -262,12 +263,24 @@ def _handle(req: dict, cache: _IndexCache) -> dict:
     top_k = req.get("top_k")
     min_score = req.get("min_score")
     search = cache.get(db)
-    results = search.search(
-        query,
-        top_k=5 if top_k is None else int(top_k),
-        min_score=0.0 if min_score is None else float(min_score),
-        empty_gate=req.get("empty_gate"),
-    )
+    try:
+        results = search.search(
+            query,
+            top_k=5 if top_k is None else int(top_k),
+            min_score=0.0 if min_score is None else float(min_score),
+            empty_gate=req.get("empty_gate"),
+            where=req.get("where"),
+        )
+    except MetadataNotIndexed as e:
+        # A machine-readable code, not just prose. The client has to tell this
+        # apart from every other failure: falling back to the in-process path
+        # would raise the same thing half a second and one model load later,
+        # and matching on the message text is not something a client should be
+        # asked to do. Additive — every other failure keeps the old shape.
+        return {"ok": False, "code": "metadata_not_indexed", "error": str(e),
+                "files_without_metadata": e.count}
+    except ValueError as e:
+        return {"ok": False, "code": "bad_where", "error": str(e)}
     return {"ok": True, "results": results, "db": str(db), "indexed": True}
 
 

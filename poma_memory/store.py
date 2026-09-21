@@ -13,7 +13,17 @@ CREATE TABLE IF NOT EXISTS files (
     file_path    TEXT PRIMARY KEY,
     byte_offset  INTEGER NOT NULL DEFAULT 0,
     content_hash TEXT NOT NULL DEFAULT '',
-    mtime        REAL NOT NULL DEFAULT 0
+    mtime        REAL NOT NULL DEFAULT 0,
+    metadata     TEXT NOT NULL DEFAULT '',
+    fm_unparsed  INTEGER NOT NULL DEFAULT 0
+);
+
+-- Index-wide state that is not about any one file. Created with IF NOT EXISTS
+-- rather than added by ALTER, so it appears on databases written by older
+-- versions without a migration step.
+CREATE TABLE IF NOT EXISTS index_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -123,6 +133,37 @@ class Store:
         except sqlite3.OperationalError:
             pass  # column already exists
 
+        # v0.6.0: per-file metadata (path rules + front-matter) as opaque JSON.
+        # Three states matter and '' is one of them: '' means this row predates
+        # metadata indexing, '{}' means it was scanned and has none. Collapsing
+        # them would make a filtered search on a legacy index return [] that is
+        # indistinguishable from "no document matches".
+        for column, ddl in (
+            ("metadata", "ALTER TABLE files ADD COLUMN metadata TEXT NOT NULL DEFAULT ''"),
+            ("fm_unparsed", "ALTER TABLE files ADD COLUMN fm_unparsed INTEGER NOT NULL DEFAULT 0"),
+        ):
+            try:
+                self._conn.execute(ddl)
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+    # --- Index-wide state ---
+
+    def get_index_meta(self, key: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT value FROM index_meta WHERE key = ?", (key,)
+        ).fetchone()
+        return row["value"] if row else None
+
+    def set_index_meta(self, key: str, value: str) -> None:
+        self._conn.execute(
+            """INSERT INTO index_meta (key, value) VALUES (?, ?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (key, value),
+        )
+        self._conn.commit()
+
     def close(self) -> None:
         self._conn.close()
 
@@ -135,18 +176,75 @@ class Store:
         return dict(row) if row else None
 
     def upsert_file_record(
-        self, file_path: str, byte_offset: int, content_hash: str, mtime: float
+        self, file_path: str, byte_offset: int, content_hash: str, mtime: float,
+        metadata: str | None = None, fm_unparsed: bool | None = None,
     ) -> None:
+        """Write a file row. `metadata=None` leaves any existing value alone.
+
+        Callers that are not metadata-aware (and older callers) must not blank
+        the column just by touching the row, so None means "don't change it"
+        rather than "set it to empty".
+        """
+        flag = None if fm_unparsed is None else int(fm_unparsed)
         self._conn.execute(
-            """INSERT INTO files (file_path, byte_offset, content_hash, mtime)
-               VALUES (?, ?, ?, ?)
+            """INSERT INTO files (file_path, byte_offset, content_hash, mtime,
+                                  metadata, fm_unparsed)
+               VALUES (?, ?, ?, ?, COALESCE(?, ''), COALESCE(?, 0))
                ON CONFLICT(file_path) DO UPDATE SET
                    byte_offset=excluded.byte_offset,
                    content_hash=excluded.content_hash,
-                   mtime=excluded.mtime""",
-            (file_path, byte_offset, content_hash, mtime),
+                   mtime=excluded.mtime,
+                   metadata=COALESCE(?, files.metadata),
+                   fm_unparsed=COALESCE(?, files.fm_unparsed)""",
+            (file_path, byte_offset, content_hash, mtime, metadata, flag,
+             metadata, flag),
         )
         self._conn.commit()
+
+    def set_file_metadata(self, file_path: str, metadata: str,
+                          fm_unparsed: bool = False) -> None:
+        """Update metadata in place, without re-chunking or re-embedding.
+
+        This is the whole backfill mechanism. `_full_reindex` would delete,
+        re-chunk and re-embed the file, which on the OpenAI embedder is real
+        money for a column that can be filled from the file head.
+        """
+        self._conn.execute(
+            "UPDATE files SET metadata = ?, fm_unparsed = ? WHERE file_path = ?",
+            (metadata, int(fm_unparsed), file_path),
+        )
+        self._conn.commit()
+
+    def all_file_paths(self) -> list[str]:
+        rows = self._conn.execute("SELECT file_path FROM files").fetchall()
+        return [r["file_path"] for r in rows]
+
+    def count_files_without_metadata(self) -> int:
+        """Files never scanned for metadata. Non-zero blocks a filtered search."""
+        return self._conn.execute(
+            "SELECT COUNT(*) AS c FROM files WHERE metadata = ''"
+        ).fetchone()["c"]
+
+    def get_file_metadata_map(self) -> dict[str, dict]:
+        """file_path -> parsed metadata, skipping rows that have none recorded."""
+        rows = self._conn.execute(
+            "SELECT file_path, metadata FROM files WHERE metadata != ''"
+        ).fetchall()
+        out: dict[str, dict] = {}
+        for r in rows:
+            try:
+                value = json.loads(r["metadata"])
+            except (ValueError, TypeError):
+                continue
+            if isinstance(value, dict):
+                out[r["file_path"]] = value
+        return out
+
+    def unparsed_frontmatter_files(self) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT file_path FROM files WHERE fm_unparsed = 1 ORDER BY file_path"
+        ).fetchall()
+        return [r["file_path"] for r in rows]
 
     # --- Chunks ---
 
@@ -225,6 +323,18 @@ class Store:
             list(chunkset_ids),
         ).fetchone()
         return float(row["m"]) if row and row["m"] is not None else 0.0
+
+    def get_chunkset_files(self) -> list[tuple[int, str]]:
+        """(chunkset_id, file_path) for every chunkset.
+
+        Two columns rather than `get_all_chunksets`, which carries every
+        chunkset's full text: resolving a metadata predicate needs only the
+        mapping, and the search path already loads the contents once.
+        """
+        rows = self._conn.execute(
+            "SELECT chunkset_id, file_path FROM chunksets"
+        ).fetchall()
+        return [(r["chunkset_id"], r["file_path"]) for r in rows]
 
     def get_all_chunksets(self) -> list[dict]:
         rows = self._conn.execute(
@@ -306,4 +416,6 @@ class Store:
             "total_chunks": chunk_count,
             "total_chunksets": chunkset_count,
             "has_embeddings": has_emb,
+            "files_without_metadata": self.count_files_without_metadata(),
+            "unparsed_frontmatter": self.unparsed_frontmatter_files(),
         }

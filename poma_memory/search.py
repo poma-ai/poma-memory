@@ -6,6 +6,7 @@ import os
 from typing import TYPE_CHECKING
 
 from poma_memory.bm25_search import BM25Search
+from poma_memory.metadata import MetadataNotIndexed, matches, normalize_where
 from poma_primecut_nano import expand_chunk_ids, assemble_context
 
 if TYPE_CHECKING:
@@ -26,6 +27,15 @@ class HybridSearch:
         self._store = store
         self._bm25 = BM25Search(store)
         self._semantic = None
+
+        # Metadata lives here, not on the Store, so that it is rebuilt with the
+        # rest of this object. The search daemon caches one HybridSearch per
+        # database and discards it when PRAGMA data_version moves; a map hung
+        # off the long-lived Store would survive a reindex and answer for the
+        # previous corpus.
+        self._file_meta = store.get_file_metadata_map()
+        self._chunkset_files = store.get_chunkset_files()
+        self._files_without_metadata = store.count_files_without_metadata()
 
         if enable_semantic and HAS_SEMANTIC:
             try:
@@ -48,6 +58,7 @@ class HybridSearch:
         max_per_file: int = 3,
         min_score: float = 0.0,
         empty_gate: float | None = None,
+        where: dict | None = None,
     ) -> list[dict]:
         """Search with hybrid BM25 + semantic fusion.
 
@@ -59,15 +70,30 @@ class HybridSearch:
             empty_gate: Suppress ALL results when the best semantic hit's
                 cosine is below this. None = the embedder's calibrated
                 default; 0.0 disables. Env override: POMA_MEMORY_EMPTY_GATE.
+            where: Metadata predicate, e.g. {"kind": ["decision", "lesson"]}.
+                AND across keys, OR within a list. The corpus is narrowed
+                before anything is ranked — see `_allowed_ids`.
 
         Returns:
             List of dicts: [{file_path, score, context, chunk_ids}]
+
+        Raises:
+            MetadataNotIndexed: `where` was given but this index has files with
+                no metadata recorded, so the answer could not be honest.
         """
+        allowed_ids = self._allowed_ids(where)
+        if allowed_ids is not None and not allowed_ids:
+            # Nothing matches the predicate. Returning early also avoids handing
+            # the searchers an all-zero mask, which is not a meaningful ranking.
+            return []
+
         # BM25 always runs
-        bm25_hits = self._bm25.search(query, top_k=top_k * 3)
+        bm25_hits = self._bm25.search(query, top_k=top_k * 3,
+                                      allowed_ids=allowed_ids)
 
         if self._semantic:
-            vec_hits = self._semantic.search(query, top_k=top_k * 3)
+            vec_hits = self._semantic.search(query, top_k=top_k * 3,
+                                             allowed_ids=allowed_ids)
             # Empty gate on ABSOLUTE similarity of the single best semantic
             # hit. RRF fused scores are rank-based: something always tops the
             # list, and a top-of-both-lists hit scores ~0.033 whether it is a
@@ -147,6 +173,31 @@ class HybridSearch:
         if min_score > 0.0:
             results = [r for r in results if r["score"] >= min_score]
         return results
+
+    def _allowed_ids(self, where: dict | None) -> set[int] | None:
+        """Chunkset ids the predicate admits, or None when there is no predicate.
+
+        Resolved before ranking, which is the entire point: the empty gate is
+        taken from the top-1 cosine of the ranked list, so a corpus narrowed
+        afterwards would leave the gate answering for documents the caller
+        excluded.
+        """
+        where = normalize_where(where)
+        if where is None:
+            return None
+        if self._files_without_metadata:
+            # An empty result here would be indistinguishable from an honest
+            # "nothing matches", so refuse instead of guessing.
+            raise MetadataNotIndexed(self._files_without_metadata,
+                                     self._store.db_path)
+        keep_files = {
+            path for path, meta in self._file_meta.items()
+            if matches(meta, where)
+        }
+        return {
+            cs_id for cs_id, file_path in self._chunkset_files
+            if file_path in keep_files
+        }
 
     def _resolve_empty_gate(self, empty_gate: float | None) -> float:
         """Precedence: explicit param > POMA_MEMORY_EMPTY_GATE env >

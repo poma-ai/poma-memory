@@ -43,6 +43,7 @@ pip install 'poma-memory[semantic,mcp]'           # recommended combo
 ```bash
 poma-memory index .claude/                                    # index your context files
 poma-memory search "authentication middleware" --path .claude/ # search
+poma-memory search "rollback" --path .claude/ --where kind=runbook  # search one kind
 ```
 
 ## MCP server (Claude Code)
@@ -67,6 +68,63 @@ for r in results:
     print(f"{r['file_path']} (score: {r['score']:.4f})")
     print(r['context'])
 ```
+
+---
+
+## Filtering by metadata
+
+One index can hold more than one kind of document. To search a subset, give
+each file some metadata and pass a predicate.
+
+Metadata comes from two places. **Path rules** name what your layout already
+says, and need no change to the files themselves — put a
+`.poma-metadata.json` at the root of the indexed directory:
+
+```json
+{
+  "rules": [
+    {"glob": "events/**/*.md", "metadata": {"kind": "event"}},
+    {"glob": "DECISIONS.md",   "metadata": {"kind": "decision"}},
+    {"glob": "**/*.md",        "metadata": {"kind": "note"}}
+  ]
+}
+```
+
+First matching rule wins, so put the catch-all last. **Front-matter** is the
+second source, and wins per key over a path rule:
+
+```markdown
+---
+kind: event
+session: laptop-2
+---
+```
+
+Then filter:
+
+```bash
+poma-memory search "disk pressure" --path .agent/ --where kind=event
+poma-memory search "disk pressure" --path .agent/ --where kind=event --where kind=decision
+```
+
+```python
+search("disk pressure", path=".agent/", where={"kind": ["event", "decision"]})
+```
+
+Keys are AND-ed, values within a list are OR-ed, and comparison is
+case-sensitive string equality. There are no operators and no negation: the
+predicate cannot express "kind is not X" or "key is absent", so emit the key
+on every document and filter positively.
+
+Filtering narrows the corpus **before** anything is ranked. That matters
+because the relevance gate reads the top semantic score, and a gate that saw
+documents you filtered out would answer for a corpus you did not ask about.
+
+Run `poma-memory index` after adding metadata or editing the rules file — it
+re-reads metadata in place, with no re-chunking and no re-embedding. Until
+then, a filtered search **refuses** rather than returning an empty list you
+could not tell apart from "nothing matches". `poma-memory status` shows
+whether the index is complete.
 
 ---
 

@@ -24,6 +24,7 @@ def poma_search(
     top_k: int = 5,
     min_score: float = 0.0,
     empty_gate: float | None = None,
+    where: dict | None = None,
 ) -> str:
     """Search indexed .agent/ content with structure-preserving hierarchical context.
 
@@ -38,12 +39,21 @@ def poma_search(
         min_score: Drop results below this fused score (0.0 = no floor)
         empty_gate: Suppress ALL results when the best semantic hit's cosine
             is below this (default: embedder-calibrated; 0 disables)
+        where: Metadata predicate over the indexed files, e.g.
+            {"kind": ["decision", "lesson"]}. AND across keys, OR within a
+            list, case-sensitive equality. Requires the index to have been
+            built with metadata (see `.poma-metadata.json`).
     """
     from poma_memory.api import search
+    from poma_memory.metadata import MetadataNotIndexed
 
-    results = search(
-        query=query, path=path, top_k=top_k, min_score=min_score, empty_gate=empty_gate
-    )
+    try:
+        results = search(
+            query=query, path=path, top_k=top_k, min_score=min_score,
+            empty_gate=empty_gate, where=where,
+        )
+    except (MetadataNotIndexed, ValueError) as e:
+        return f"Search failed: {e}"
 
     if not results:
         return "No results found."
@@ -75,17 +85,10 @@ def poma_index(path: str = ".agent/", file: str | None = None, glob: str = "**/*
         file: Optional single file to index (for incremental updates)
         glob: File pattern to match (default: **/*.md)
     """
-    from pathlib import Path
-
-    from poma_memory.store import Store
-    from poma_memory.incremental import update_file
-
     if file:
-        p = Path(path)
-        db_path = str(p / ".poma-memory.db")
-        store = Store(db_path)
-        result = update_file(store, file)
-        store.close()
+        from poma_memory.api import index_file
+
+        result = index_file(file, path=path)
         return (
             f"{file}: {result['status']}"
             f" ({result.get('new_chunks', 0)} chunks,"

@@ -38,6 +38,10 @@ def main(argv: list[str] | None = None) -> None:
     p_search.add_argument("--empty-gate", type=float, default=None, dest="empty_gate",
                           help="Suppress ALL results when the best semantic hit's cosine "
                                "is below this (default: embedder-calibrated; 0 disables)")
+    p_search.add_argument("--where", action="append", default=None, metavar="KEY=VALUE",
+                          help="Metadata filter, repeatable. Repeats of one key are "
+                               "OR'd, different keys are AND'd. Requires an index "
+                               "built with metadata (.poma-metadata.json).")
     p_search.add_argument("--socket", default="auto",
                           help="Daemon socket: 'auto' (default), a path, or "
                                "'off' to force in-process search")
@@ -84,18 +88,13 @@ def main(argv: list[str] | None = None) -> None:
 
 def _cmd_index(args: argparse.Namespace) -> None:
     """Index command: index all markdown files in a directory."""
-    from poma_memory.api import index
-    from poma_memory.store import Store
-    from poma_memory.incremental import update_file
-    from pathlib import Path
+    from poma_memory.api import index, index_file
 
     if args.file:
-        # Single file mode
-        path = Path(args.path)
-        db_path = args.db or str(path / ".poma-memory.db")
-        store = Store(db_path)
-        result = update_file(store, args.file)
-        store.close()
+        # Single file mode. Goes through index_file so the directory's path
+        # rules still apply — resolving one file without them would record
+        # "scanned, no metadata" where a rule says otherwise.
+        result = index_file(args.file, path=args.path, db_path=args.db)
         print(f"{args.file}: {result['status']}"
               f" ({result.get('new_chunks', 0)} chunks,"
               f" {result.get('new_chunksets', 0)} chunksets)")
@@ -106,9 +105,33 @@ def _cmd_index(args: argparse.Namespace) -> None:
               f" {result['chunksets_created']} chunksets")
 
 
+def _parse_where(pairs: list[str] | None) -> dict | None:
+    """Turn repeated `--where key=value` into the predicate dict.
+
+    Repeats of one key become a list (OR); distinct keys stay separate (AND).
+    A flat encoding on purpose: anything richer on the command line would be a
+    filter DSL, and the predicate deliberately is not one.
+    """
+    if not pairs:
+        return None
+    out: dict[str, list[str]] = {}
+    for pair in pairs:
+        key, sep, value = pair.partition("=")
+        key = key.strip()
+        if not sep or not key:
+            raise SystemExit(f"--where expects KEY=VALUE, got {pair!r}")
+        out.setdefault(key, []).append(value)
+    # One value stays a scalar so the wire form matches what the API documents.
+    return {k: (v[0] if len(v) == 1 else v) for k, v in out.items()}
+
+
 def _cmd_search(args: argparse.Namespace) -> None:
     """Search command: search indexed content."""
     import os
+
+    from poma_memory.metadata import MetadataNotIndexed
+
+    where = _parse_where(getattr(args, "where", None))
 
     # The env overrides documented on `search` (POMA_MEMORY_EMPTY_GATE selects the
     # relevance gate, POMA_EMBEDDER selects the embedder) are read inside the
@@ -151,23 +174,37 @@ def _cmd_search(args: argparse.Namespace) -> None:
                 "top_k": args.top,
                 "min_score": args.min_score,
                 "empty_gate": empty_gate,
+                "where": where,
             }, sock)
             if resp.get("ok"):
                 results = resp.get("results", [])
+            elif resp.get("code") in ("metadata_not_indexed", "bad_where"):
+                # A real answer, not a daemon problem. Falling through to the
+                # in-process path would reach the same refusal ~0.5s and one
+                # model load later.
+                print(f"poma-memory: {resp.get('error')}", file=sys.stderr)
+                raise SystemExit(2)
+        except SystemExit:
+            raise
         except Exception:
             results = None
 
     if results is None:
         from poma_memory.api import search
 
-        results = search(
-            query=args.query,
-            path=args.path,
-            db_path=args.db,
-            top_k=args.top,
-            min_score=args.min_score,
-            empty_gate=empty_gate,
-        )
+        try:
+            results = search(
+                query=args.query,
+                path=args.path,
+                db_path=args.db,
+                top_k=args.top,
+                min_score=args.min_score,
+                empty_gate=empty_gate,
+                where=where,
+            )
+        except (MetadataNotIndexed, ValueError) as e:
+            print(f"poma-memory: {e}", file=sys.stderr)
+            raise SystemExit(2)
 
     if args.as_json:
         print(json.dumps(results, indent=2))
@@ -201,6 +238,13 @@ def _cmd_status(args: argparse.Namespace) -> None:
     print(f"Chunks:    {info['total_chunks']}")
     print(f"Chunksets: {info['total_chunksets']}")
     print(f"Semantic:  {'yes' if info['has_embeddings'] else 'no'}")
+    missing = info.get("files_without_metadata", 0)
+    if missing:
+        print(f"Metadata:  {missing} file(s) unscanned - run `poma-memory index`")
+    else:
+        print("Metadata:  complete")
+    for f in info.get("unparsed_frontmatter", []):
+        print(f"  ! unparsed front-matter: {f}")
     for f in info["files"]:
         print(f"  - {f}")
 

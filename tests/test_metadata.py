@@ -1215,3 +1215,117 @@ def test_a_held_hybrid_search_does_not_answer_from_a_stale_metadata_map():
         assert held.search("sqlite", where={"kind": "decision"}) == []
         assert held.search("sqlite", where={"kind": "superseded"})
         store.close()
+
+
+@pytest.mark.parametrize("break_it", [
+    lambda p: os.chmod(p, 0o000),
+    lambda p: p.write_bytes(json.dumps({"rules": _V1}).encode("utf-16")),
+])
+def test_an_unreadable_rules_file_refuses_on_every_surface(break_it):
+    """The READ needs the same guard the parse has. Left bare it raised
+    PermissionError or UnicodeDecodeError, neither a MetadataIncomplete, so no
+    surface caught it -- and `index`, the remedy the message recommends,
+    tracebacked the same way."""
+    from poma_memory.metadata import MetadataIncomplete
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _two_kinds(root)
+        _write_rules(root, _V1)
+        api.index(root)
+        rf = root / ".poma-metadata.json"
+        break_it(rf)
+        try:
+            for call in (lambda: api.search("sqlite", path=root,
+                                            where={"kind": "decision"}),
+                         lambda: api.index(root)):
+                with pytest.raises(MetadataRulesError) as e:
+                    call()
+                assert isinstance(e.value, MetadataIncomplete)
+                assert "cannot be read" in str(e.value)
+        finally:
+            os.chmod(rf, 0o644)
+
+
+def test_the_daemon_reports_an_unreadable_rules_file_as_bad_rules():
+    from poma_memory.server import _IndexCache, _handle
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _two_kinds(root)
+        _write_rules(root, _V1)
+        api.index(root)
+        rf = root / ".poma-metadata.json"
+        rf.write_bytes(json.dumps({"rules": _V1}).encode("utf-16"))
+        resp = _handle({"op": "search", "query": "sqlite", "path": str(root),
+                        "db_path": None, "where": {"kind": "decision"}},
+                       _IndexCache())
+        assert resp["ok"] is False and resp["code"] == "bad_rules"
+
+
+def test_index_file_refuses_a_path_that_does_not_contain_the_file():
+    """`path` supplies the rules AND is recorded as their source, so a file
+    outside it would be stamped `{}` against that root's CURRENT hash: up to
+    date forever, silently absent from every filtered result, `status`
+    complete. The MCP tool reaches this with its own defaults."""
+    with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+        ra, rb = Path(a), Path(b)
+        _two_kinds(ra)
+        _write_rules(ra, _V1)
+        _write_rules(rb, _V1)
+        with pytest.raises(ValueError, match="is not inside"):
+            api.index_file(ra / "DECISIONS.md", path=rb,
+                           db_path=ra / ".poma-memory.db")
+        # The legitimate call is untouched.
+        assert api.index_file(ra / "DECISIONS.md", path=ra)["status"]
+
+
+def test_a_second_root_going_stale_is_noticed():
+    """Two roots sharing one database is the configuration round five fixed,
+    and nothing exercised it: a `stale_files` that checked only the FIRST root
+    passed the whole suite."""
+    with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b, \
+            tempfile.TemporaryDirectory() as c:
+        ra, rb, db = Path(a), Path(b), Path(c) / "shared.sqlite"
+        _two_kinds(ra)
+        (rb / "OTHER.md").write_text("# Other\n\nsqlite elsewhere.\n")
+        _write_rules(ra, _V1)
+        _write_rules(rb, [{"glob": "*.md", "metadata": {"kind": "other"}}])
+        api.index(ra, db_path=db)
+        api.index(rb, db_path=db)
+        assert api.search("sqlite", path=ra, db_path=db, where={"kind": "decision"})
+
+        # Edit ONLY the second root's rules. The first root is still current,
+        # so a check that stops after one root sees nothing wrong.
+        _write_rules(rb, [{"glob": "*.md", "metadata": {"kind": "moved"}}])
+        with pytest.raises(MetadataStale):
+            api.search("sqlite", path=ra, db_path=db, where={"kind": "decision"})
+        assert [Path(p).name for p in api.status(ra, db_path=db)["stale_rules"]] \
+            == ["OTHER.md"]
+
+
+def test_reordering_keys_in_the_rules_file_does_not_refuse():
+    """`sort_keys=True` is what makes the canonical hash survive a formatter,
+    and `jq -S` reordering object keys is the case it exists for."""
+    a = [{"glob": "*.md", "metadata": {"kind": "note", "area": "x"}}]
+    b = [{"metadata": {"area": "x", "kind": "note"}, "glob": "*.md"}]
+    assert rules_hash(a) == rules_hash(b)
+    assert rules_hash(a) != rules_hash(
+        [{"glob": "*.md", "metadata": {"kind": "note", "area": "y"}}])
+
+
+def test_stale_files_checks_every_root_not_just_the_first():
+    """Deterministic version of the two-root case. The integration test above
+    feeds rows in `ORDER BY file_path`, so whether the stale root comes first
+    depends on the temp directory names -- a check that stopped after one root
+    passed it about half the time. Here the CURRENT root is first by
+    construction, so stopping early can only return [].
+    """
+    with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+        ra, rb = Path(a), Path(b)
+        _write_rules(ra, _V1)
+        _write_rules(rb, [{"glob": "*.md", "metadata": {"kind": "other"}}])
+        current_a = rules_hash(_V1)
+        rows = [
+            (str(ra / "a.md"), str(ra), current_a),      # current, listed first
+            (str(rb / "b.md"), str(rb), "0" * 64),       # stale, listed second
+        ]
+        assert stale_files(rows) == [str(rb / "b.md")]

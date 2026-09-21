@@ -10,7 +10,8 @@ from pathlib import Path
 from poma_memory.store import Store
 from poma_memory.incremental import update_file
 from poma_memory.metadata import (
-    MetadataRulesError, load_rules, resolve_paths, rules_hash, stale_files,
+    RULES_FILENAME, MetadataRulesError, load_rules, resolve_paths, rules_hash,
+    stale_files,
 )
 from poma_memory.search import HybridSearch
 
@@ -202,6 +203,25 @@ def index_file(
     if db_path is None:
         db_path = path / ".poma-memory.db"
 
+    # `path` supplies the rules AND is recorded on the row as their source, so
+    # a file outside it gets a root that cannot describe it: `path_meta` misses,
+    # the row is stamped `{}` against that root's CURRENT hash, and it therefore
+    # reads as up to date forever while being silently absent from every
+    # filtered result and counted complete by `status`. The MCP tool reaches
+    # this with its own defaults — `poma_index(file=X)` keeps `path=".agent/"`.
+    file_real = os.path.realpath(file)
+    root_real = os.path.realpath(path)
+    try:
+        inside = os.path.commonpath([file_real, root_real]) == root_real
+    except ValueError:
+        inside = False  # different drives on Windows
+    if not inside:
+        raise ValueError(
+            f"{file_real} is not inside {root_real}, so that directory's "
+            f"{RULES_FILENAME} cannot describe it. Pass `path` as the "
+            "directory the file lives in."
+        )
+
     store = Store(db_path)
     rules, _ = load_rules(path)
     path_meta = resolve_paths(path, rules)
@@ -214,7 +234,7 @@ def index_file(
               "up to date now that it exists", file=sys.stderr)
     result = update_file(
         store, str(file),
-        path_metadata=path_meta.get(os.path.realpath(file)),
+        path_metadata=path_meta.get(file_real),
         rules_hash=rules_hash(rules),
         rules_root=os.path.realpath(path),
     )

@@ -87,8 +87,12 @@ def poma_index(path: str = ".agent/", file: str | None = None, glob: str = "**/*
     """
     if file:
         from poma_memory.api import index_file
+        from poma_memory.metadata import MetadataRulesError
 
-        result = index_file(file, path=path)
+        try:
+            result = index_file(file, path=path)
+        except (ValueError, MetadataRulesError) as e:
+            return f"Index failed: {e}"
         return (
             f"{file}: {result['status']}"
             f" ({result.get('new_chunks', 0)} chunks,"

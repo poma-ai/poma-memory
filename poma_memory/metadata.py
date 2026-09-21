@@ -134,7 +134,16 @@ def load_rules(root: str | Path) -> tuple[list[dict], str]:
         return [], ""
     # utf-8-sig: an editor-written BOM is not a syntax error the user can see,
     # and `json.loads` rejects it. The front-matter parser already strips one.
-    raw = p.read_text(encoding="utf-8-sig")
+    #
+    # The READ needs the same guard the parse below has. Left bare it raised
+    # PermissionError or UnicodeDecodeError -- neither a `MetadataIncomplete`,
+    # so no surface caught it -- and staleness is checked per query now, so a
+    # rules file saved as UTF-16 by a Windows shell tracebacked out of `status`,
+    # `search` AND `index`, which is the remedy the message recommends.
+    try:
+        raw = p.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError) as e:
+        raise MetadataRulesError(f"{p}: cannot be read ({e})") from e
     try:
         doc = json.loads(raw)
     except json.JSONDecodeError as e:

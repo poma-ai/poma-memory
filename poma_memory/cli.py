@@ -90,16 +90,26 @@ def _cmd_index(args: argparse.Namespace) -> None:
     """Index command: index all markdown files in a directory."""
     from poma_memory.api import index, index_file
 
+    from poma_memory.metadata import MetadataRulesError
+
     if args.file:
         # Single file mode. Goes through index_file so the directory's path
         # rules still apply — resolving one file without them would record
         # "scanned, no metadata" where a rule says otherwise.
-        result = index_file(args.file, path=args.path, db_path=args.db)
+        try:
+            result = index_file(args.file, path=args.path, db_path=args.db)
+        except (ValueError, MetadataRulesError) as e:
+            print(f"poma-memory: {e}", file=sys.stderr)
+            raise SystemExit(2)
         print(f"{args.file}: {result['status']}"
               f" ({result.get('new_chunks', 0)} chunks,"
               f" {result.get('new_chunksets', 0)} chunksets)")
     else:
-        result = index(path=args.path, db_path=args.db, glob=args.glob)
+        try:
+            result = index(path=args.path, db_path=args.db, glob=args.glob)
+        except MetadataRulesError as e:
+            print(f"poma-memory: {e}", file=sys.stderr)
+            raise SystemExit(2)
         print(f"Indexed {result['files_indexed']} files:"
               f" {result['chunks_created']} chunks,"
               f" {result['chunksets_created']} chunksets")

@@ -10,7 +10,7 @@ from pathlib import Path
 from poma_memory.store import Store
 from poma_memory.incremental import update_file
 from poma_memory.metadata import (
-    current_rules_hash, load_rules, resolve_paths, rules_hash,
+    MetadataRulesError, load_rules, resolve_paths, rules_hash, stale_files,
 )
 from poma_memory.search import HybridSearch
 
@@ -72,8 +72,11 @@ def index(
         db_path = path / ".poma-memory.db"
 
     store = Store(db_path)
-    rules, raw = load_rules(path)
-    new_hash = rules_hash(raw)
+    rules, _ = load_rules(path)
+    new_hash = rules_hash(rules)
+    # Recorded on every row this run writes, so a later search re-reads THIS
+    # directory's rules for these files however the database is addressed.
+    root_key = os.path.realpath(path)
     path_meta = resolve_paths(path, rules)
 
     total_chunks = 0
@@ -103,6 +106,7 @@ def index(
                 store, str(md_file),
                 path_metadata=path_meta.get(key),
                 rules_hash=new_hash,
+                rules_root=root_key,
             )
         except (OSError, UnicodeDecodeError) as e:
             # A dangling symlink or an unreadable file used to abort the whole
@@ -144,18 +148,25 @@ def index(
     # Re-read: the loop above may have added rows.
     states = {fp: _disk_state(fp) for fp in store.all_file_paths()
               if fp not in seen}
-    orphaned = [fp for fp, st in states.items()
-                if st == "gone" and fp not in scanned]
-    for fp in orphaned:
-        store.set_file_metadata(fp, "{}", False, new_hash)
-        print(f"poma-memory: {fp} is indexed but no longer on disk; recorded "
-              "as having no metadata", file=sys.stderr)
+    gone = [fp for fp, st in states.items() if st == "gone"]
+    for fp in gone:
+        # EVERY gone row, not only the never-scanned ones. A row scanned under
+        # an earlier rule set whose file is then deleted or renamed can be
+        # reached by no glob — the file does not exist — so leaving its hash
+        # behind made every later filtered search refuse permanently, with
+        # remediation text that could not be followed. Its content demonstrably
+        # has no metadata to find, so recording it against the current rules is
+        # both true and terminal.
+        store.set_file_metadata(fp, "{}", False, new_hash, root_key)
+        if fp not in scanned:
+            print(f"poma-memory: {fp} is indexed but no longer on disk; "
+                  "recorded as having no metadata", file=sys.stderr)
 
     # Rows this run did not reach — a narrower glob, a name `index()` skips, a
     # file it could not read. Their metadata is whatever an earlier rule set
     # produced. Per-file hashes mean the next run that reaches them fixes it,
     # but nothing would otherwise say the rule set is only partly applied.
-    stale = store.files_with_other_rules(new_hash)
+    stale = stale_files(store.scanned_rows_rules())
     if stale:
         shown = ", ".join(stale[:3]) + (", ..." if len(stale) > 3 else "")
         print(f"poma-memory: {len(stale)} file(s) still hold metadata from an "
@@ -192,7 +203,7 @@ def index_file(
         db_path = path / ".poma-memory.db"
 
     store = Store(db_path)
-    rules, raw = load_rules(path)
+    rules, _ = load_rules(path)
     path_meta = resolve_paths(path, rules)
     if Path(file).name.startswith("."):
         # `index()` does not pick dot-prefixed names up on its own, so this
@@ -204,7 +215,8 @@ def index_file(
     result = update_file(
         store, str(file),
         path_metadata=path_meta.get(os.path.realpath(file)),
-        rules_hash=rules_hash(raw),
+        rules_hash=rules_hash(rules),
+        rules_root=os.path.realpath(path),
     )
     store.close()
     return result
@@ -242,6 +254,7 @@ def search(
         MetadataStale: `where` was given against an index whose rows were
             resolved against a rule set that is no longer current. Run
             `index()` with a glob that covers them.
+        MetadataRulesError: a rules file a row points at cannot be read.
     """
     path = Path(path)
     if db_path is None:
@@ -253,10 +266,6 @@ def search(
         results = hybrid.search(
             query, top_k=top_k, min_score=min_score, empty_gate=empty_gate,
             where=where,
-            # Only when there is a predicate: locating the rules file costs a
-            # read and can raise on a malformed one, and an unfiltered search
-            # neither uses metadata nor should start failing because of it.
-            rules_hash=current_rules_hash(path, db_path) if where else None,
         )
     finally:
         store.close()
@@ -279,9 +288,16 @@ def status(
     if not Path(db_path).exists():
         return {"files": [], "total_chunks": 0, "total_chunksets": 0,
                 "has_embeddings": False, "files_without_metadata": 0,
-                "unparsed_frontmatter": []}
+                "unparsed_frontmatter": [], "stale_rules": []}
 
     store = Store(db_path)
     info = store.status()
+    try:
+        info["stale_rules"] = stale_files(store.scanned_rows_rules())
+    except MetadataRulesError as e:
+        # `status` reports; it does not fail. An unreadable rules file is
+        # itself the thing worth showing.
+        info["stale_rules"] = []
+        info["rules_error"] = str(e)
     store.close()
     return info

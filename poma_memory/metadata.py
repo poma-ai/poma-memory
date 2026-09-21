@@ -88,40 +88,33 @@ class MetadataStale(MetadataIncomplete):
     """
 
     def __init__(self, count: int, db_path: str | os.PathLike | None = None,
-                 examples: list[str] | None = None,
-                 from_rules_file: bool = True):
+                 examples: list[str] | None = None):
         self.count = count
         self.db_path = str(db_path) if db_path is not None else None
         self.examples = list(examples or [])
-        self.from_rules_file = from_rules_file
         where = f" in {self.db_path}" if self.db_path else ""
         shown = ", ".join(self.examples[:3])
         if shown and count > len(self.examples[:3]):
             shown += ", ..."
         detail = f" (e.g. {shown})" if shown else ""
-        if from_rules_file:
-            what = (f"{count} indexed file(s){where} still hold metadata "
-                    f"resolved against an earlier rule set{detail}, so a "
-                    "metadata filter would answer from rules that are no longer "
-                    "in effect.")
-        else:
-            # Without the rules file we know only that the rows disagree, not
-            # which side is current -- naming the smaller group as "earlier"
-            # would be a guess, and on an even split an arbitrary one. Refusing
-            # is still right; claiming to know which files are wrong is not.
-            what = (f"indexed file(s){where} were resolved against more than "
-                    f"one rule set, {count} of them in the smaller group"
-                    f"{detail}, so a metadata filter cannot say which rules are "
-                    "in effect.")
         super().__init__(
-            what + " Run `poma-memory index` with a glob that covers every "
-            "indexed file (it re-reads metadata only; no re-chunking or "
-            "re-embedding)."
+            f"{count} indexed file(s){where} still hold metadata resolved "
+            f"against an earlier rule set{detail}, so a metadata filter would "
+            "answer from rules that are no longer in effect. Run `poma-memory "
+            "index` over the directory each one came from (it re-reads metadata "
+            "only; no re-chunking or re-embedding)."
         )
 
 
-class MetadataRulesError(ValueError):
-    """`.poma-metadata.json` exists but cannot be used."""
+class MetadataRulesError(MetadataIncomplete, ValueError):
+    """`.poma-metadata.json` exists but cannot be used.
+
+    A `MetadataIncomplete` as well as a `ValueError`: if the rules cannot be
+    read then a predicate cannot be answered honestly, which is the same
+    contract the other two carry. It reaches the search path now that staleness
+    is checked per query, and every surface already catches the base — leaving
+    it outside meant a typo in the rules file surfaced as a raw traceback.
+    """
 
 
 def rules_path(root: str | Path) -> Path:
@@ -139,7 +132,9 @@ def load_rules(root: str | Path) -> tuple[list[dict], str]:
     p = rules_path(root)
     if not p.exists():
         return [], ""
-    raw = p.read_text(encoding="utf-8")
+    # utf-8-sig: an editor-written BOM is not a syntax error the user can see,
+    # and `json.loads` rejects it. The front-matter parser already strips one.
+    raw = p.read_text(encoding="utf-8-sig")
     try:
         doc = json.loads(raw)
     except json.JSONDecodeError as e:
@@ -190,35 +185,54 @@ def load_rules(root: str | Path) -> tuple[list[dict], str]:
     return doc["rules"], raw
 
 
-def rules_hash(raw: str) -> str:
+def rules_hash(rules: list[dict]) -> str:
     """Identity of the rule set, stored so a rule edit is detectable.
 
     Editing the rules file touches no indexed document, and `update_file`
     short-circuits on mtime equality -- so without this every row would keep
     metadata resolved from the superseded rules, silently.
+
+    Over the PARSED rules in canonical form, not the raw bytes. Hashing bytes
+    made a reformat with no change of meaning -- a trailing newline, CRLF from a
+    checkout, a formatter's re-indent -- refuse every filtered search until the
+    corpus was re-indexed. Detection is unchanged: any rule that differs differs
+    here too.
     """
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return hashlib.sha256(
+        json.dumps(rules, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
-def current_rules_hash(root: str | Path, db_path: str | Path) -> str | None:
-    """Hash of the rule set governing `db_path`, or None when that is unknown.
+def stale_files(rows: list[tuple[str, str, str]]) -> list[str]:
+    """Which scanned rows carry a rule set that is no longer current.
 
-    A search has to compare what the rows were resolved against with what the
-    rules file says *now* -- a rule edit moves no mtime and writes no row, so
-    without reading the file at query time an index that has simply not been
-    re-indexed answers from rules that no longer exist.
+    `rows` is (file_path, rules_root, rules_hash) from `store.scanned_rows_rules`.
+    Each row names the directory whose rules produced it, so the current rules
+    are re-read from THAT directory and compared. Nothing is inferred from where
+    the database happens to live.
 
-    Returns None rather than guessing when `db_path` is not the database that
-    `root` owns. `root` defaults to `.agent/` on every public entry point, so an
-    explicit database somewhere else would otherwise be compared against an
-    unrelated directory's rules file (usually a missing one) and refuse every
-    filtered search forever. The caller falls back to checking the rows against
-    each other, which needs no filesystem at all.
+    That inference is what the previous cut got wrong twice at once. It skipped
+    the check whenever the database was not beside the rules file, which left
+    `--db` callers with no check at all -- and the row-versus-row fallback it
+    used instead is blind exactly when every row is stale together, which is the
+    normal shape of a rule edit. It also refused forever when two roots shared
+    one database, since neither run could restamp the other's rows.
+
+    A row with no recorded root predates this and cannot be verified, so it
+    counts as stale: one re-index settles it, where trusting it would be a guess.
     """
-    root = Path(root)
-    if Path(db_path).resolve() != (root / ".poma-memory.db").resolve():
-        return None
-    return rules_hash(load_rules(root)[1])
+    by_root: dict[str, list[tuple[str, str]]] = {}
+    for file_path, root, stored in rows:
+        by_root.setdefault(root, []).append((file_path, stored))
+
+    stale: list[str] = []
+    for root, items in by_root.items():
+        if not root:
+            stale.extend(fp for fp, _ in items)
+            continue
+        current = rules_hash(load_rules(root)[0])
+        stale.extend(fp for fp, stored in items if stored != current)
+    return sorted(stale)
 
 
 def resolve_paths(root: str | Path, rules: list[dict]) -> dict[str, dict]:

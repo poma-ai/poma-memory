@@ -65,12 +65,19 @@ def extract_block(text: str) -> str | None:
     # two disagreed, and `"--- \n"` -- an invisible trailing space, which YAML
     # itself accepts and PyYAML parses -- made the whole block vanish: no
     # metadata, `ok=True` so not flagged unparsed, invisible in `status()`, and
-    # a filtered search silently omitting the document. A silent wrong result is
-    # exactly what this grammar refuses to produce.
+    # a filtered search silently omitting the document.
     #
-    # A bare `---` with no line terminator is still not front-matter: stripping
-    # leaves "", which fails the check, so a one-line horizontal rule is safe.
-    if after.lstrip(" \t")[:1] not in ("\n", "\r"):
+    # `str.strip()`, not a hand-listed set: a first cut allowed only space and
+    # tab, which left NBSP, form feed, vertical tab and U+2003 still vanishing
+    # silently -- the same defect one character class over, and NBSP is what
+    # Option+Space types on a Mac. `rstrip()` on the closing side accepts all of
+    # them, so anything narrower here re-opens the asymmetry.
+    #
+    # A bare `---` with no line terminator is still not front-matter: `rest` is
+    # then the whole remainder and empty, which the second test rejects, so a
+    # one-line horizontal rule is safe.
+    rest, _, _ = after.partition("\n")
+    if after[:1] not in ("\n", "\r") and (rest.strip() or not rest):
         return None  # "---foo", a horizontal rule, something else entirely
     lines = text[:MAX_BLOCK_BYTES].splitlines()
     for i, line in enumerate(lines[1:], start=1):

@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS files (
     mtime        REAL NOT NULL DEFAULT 0,
     metadata     TEXT NOT NULL DEFAULT '',
     fm_unparsed  INTEGER NOT NULL DEFAULT 0,
-    rules_hash   TEXT NOT NULL DEFAULT ''
+    rules_hash   TEXT NOT NULL DEFAULT '',
+    rules_root   TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -135,6 +136,11 @@ class Store:
             ("metadata", "ALTER TABLE files ADD COLUMN metadata TEXT NOT NULL DEFAULT ''"),
             ("fm_unparsed", "ALTER TABLE files ADD COLUMN fm_unparsed INTEGER NOT NULL DEFAULT 0"),
             ("rules_hash", "ALTER TABLE files ADD COLUMN rules_hash TEXT NOT NULL DEFAULT ''"),
+            # The directory whose `.poma-metadata.json` produced this row. Stored
+            # rather than inferred from the database's location: a database can
+            # live anywhere (`--db`), and two roots can share one, so location
+            # answers "which rules govern this row" only by accident.
+            ("rules_root", "ALTER TABLE files ADD COLUMN rules_root TEXT NOT NULL DEFAULT ''"),
         ):
             try:
                 self._conn.execute(ddl)
@@ -156,7 +162,7 @@ class Store:
     def upsert_file_record(
         self, file_path: str, byte_offset: int, content_hash: str, mtime: float,
         metadata: str | None = None, fm_unparsed: bool | None = None,
-        rules_hash: str | None = None,
+        rules_hash: str | None = None, rules_root: str | None = None,
     ) -> None:
         """Write a file row. `metadata=None` leaves any existing value alone.
 
@@ -167,24 +173,26 @@ class Store:
         flag = None if fm_unparsed is None else int(fm_unparsed)
         self._conn.execute(
             """INSERT INTO files (file_path, byte_offset, content_hash, mtime,
-                                  metadata, fm_unparsed, rules_hash)
+                                  metadata, fm_unparsed, rules_hash, rules_root)
                VALUES (?, ?, ?, ?, COALESCE(?, ''), COALESCE(?, 0),
-                       COALESCE(?, ''))
+                       COALESCE(?, ''), COALESCE(?, ''))
                ON CONFLICT(file_path) DO UPDATE SET
                    byte_offset=excluded.byte_offset,
                    content_hash=excluded.content_hash,
                    mtime=excluded.mtime,
                    metadata=COALESCE(?, files.metadata),
                    fm_unparsed=COALESCE(?, files.fm_unparsed),
-                   rules_hash=COALESCE(?, files.rules_hash)""",
+                   rules_hash=COALESCE(?, files.rules_hash),
+                   rules_root=COALESCE(?, files.rules_root)""",
             (file_path, byte_offset, content_hash, mtime, metadata, flag,
-             rules_hash, metadata, flag, rules_hash),
+             rules_hash, rules_root,
+             metadata, flag, rules_hash, rules_root),
         )
         self._conn.commit()
 
     def set_file_metadata(self, file_path: str, metadata: str,
                           fm_unparsed: bool = False,
-                          rules_hash: str = "") -> None:
+                          rules_hash: str = "", rules_root: str = "") -> None:
         """Update metadata in place, without re-chunking or re-embedding.
 
         This is the whole backfill mechanism. `_full_reindex` would delete,
@@ -192,9 +200,9 @@ class Store:
         money for a column that can be filled from the file head.
         """
         self._conn.execute(
-            "UPDATE files SET metadata = ?, fm_unparsed = ?, rules_hash = ? "
-            "WHERE file_path = ?",
-            (metadata, int(fm_unparsed), rules_hash, file_path),
+            "UPDATE files SET metadata = ?, fm_unparsed = ?, rules_hash = ?, "
+            "rules_root = ? WHERE file_path = ?",
+            (metadata, int(fm_unparsed), rules_hash, rules_root, file_path),
         )
         self._conn.commit()
 
@@ -220,30 +228,19 @@ class Store:
         ).fetchall()
         return [r["file_path"] for r in rows]
 
-    def files_with_other_rules(self, rules_hash: str) -> list[str]:
-        """Rows resolved against a different rule set than the current one.
+    def scanned_rows_rules(self) -> list[tuple[str, str, str]]:
+        """(file_path, rules_root, rules_hash) for every row that was scanned.
 
-        Scanned, so they never raise; just answering from superseded rules.
+        Provenance travels with the row, so deciding whether a row is current
+        needs no guess about which directory owns the database. Unscanned rows
+        are excluded: `MetadataNotIndexed` already covers them, and they have no
+        rules to be stale against.
         """
         rows = self._conn.execute(
-            "SELECT file_path FROM files WHERE metadata != '' AND rules_hash != ? "
-            "ORDER BY file_path", (rules_hash,),
+            "SELECT file_path, rules_root, rules_hash FROM files "
+            "WHERE metadata != '' ORDER BY file_path"
         ).fetchall()
-        return [r["file_path"] for r in rows]
-
-    def majority_rules_hash(self) -> str | None:
-        """The rule set most scanned rows were resolved against, or None.
-
-        Used only when the rules file itself cannot be located: rows that
-        disagree with each other prove a rule edit was applied to part of the
-        corpus, without saying which part is current. Naming the minority is the
-        useful half of that answer, and the count is honest either way.
-        """
-        row = self._conn.execute(
-            "SELECT rules_hash FROM files WHERE metadata != '' "
-            "GROUP BY rules_hash ORDER BY COUNT(*) DESC, rules_hash LIMIT 1"
-        ).fetchone()
-        return row["rules_hash"] if row else None
+        return [(r["file_path"], r["rules_root"], r["rules_hash"]) for r in rows]
 
     def get_file_metadata_map(self) -> dict[str, dict]:
         """file_path -> parsed metadata, skipping rows that have none recorded."""

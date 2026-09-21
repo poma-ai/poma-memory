@@ -136,12 +136,13 @@ then, a filtered search **refuses** rather than returning an empty list you
 could not tell apart from "nothing matches". That covers both ways the index
 can be behind: a file never scanned for metadata, and a file still carrying
 what an earlier version of the rules file said about it. `poma-memory status`
-shows the first; the second is reported by `index` itself, naming the files a
-run could not reach.
+shows both.
 
-A run given a narrower `--glob` reaches only part of the corpus, so it leaves
-the rest on the old rules and says so. Re-run with a glob that covers every
-indexed file to clear it.
+Each row records which directory's rules produced it, so this holds however the
+database is addressed — including `--db` pointing somewhere else, and two
+directories sharing one database. A run given a narrower `--glob` reaches only
+part of the corpus and leaves the rest on the old rules; re-run over each
+directory to clear it.
 
 ---
 

@@ -125,6 +125,14 @@ def _parse_where(pairs: list[str] | None) -> dict | None:
     return {k: (v[0] if len(v) == 1 else v) for k, v in out.items()}
 
 
+# Daemon codes that are a real answer about the index, not a daemon fault.
+# Falling through to the in-process path on one of these reaches the same
+# refusal a model load later — and `bad_rules` used to be missing here, so the
+# fallback ran and the user got a raw traceback instead of the daemon's clean
+# message.
+_REFUSAL_CODES = frozenset({"bad_rules"})
+
+
 def _cmd_search(args: argparse.Namespace) -> None:
     """Search command: search indexed content."""
     import os
@@ -183,7 +191,8 @@ def _cmd_search(args: argparse.Namespace) -> None:
             }, sock)
             if resp.get("ok"):
                 results = resp.get("results", [])
-            elif str(resp.get("code", "")).startswith("metadata_"):
+            elif str(resp.get("code", "")) in _REFUSAL_CODES or str(
+                    resp.get("code", "")).startswith("metadata_"):
                 # A real answer, not a daemon problem. Falling through to the
                 # in-process path would reach the same refusal ~0.5s and one
                 # model load later.
@@ -245,11 +254,22 @@ def _cmd_status(args: argparse.Namespace) -> None:
     print(f"Chunks:    {info['total_chunks']}")
     print(f"Chunksets: {info['total_chunksets']}")
     print(f"Semantic:  {'yes' if info['has_embeddings'] else 'no'}")
+    # Both ways the index can be behind, because this is the surface a user
+    # checks when a filtered search refuses. Reporting only the first said
+    # "complete" while every filtered search exited 2.
     missing = info.get("files_without_metadata", 0)
-    if missing:
+    stale = info.get("stale_rules", [])
+    if info.get("rules_error"):
+        print(f"Metadata:  rules file unusable - {info['rules_error']}")
+    elif missing:
         print(f"Metadata:  {missing} file(s) unscanned - run `poma-memory index`")
+    elif stale:
+        print(f"Metadata:  {len(stale)} file(s) on an earlier rule set - "
+              "run `poma-memory index`")
     else:
         print("Metadata:  complete")
+    for f in stale[:3]:
+        print(f"  ! earlier rule set: {f}")
     for f in info.get("unparsed_frontmatter", []):
         print(f"  ! unparsed front-matter: {f}")
     for f in info["files"]:

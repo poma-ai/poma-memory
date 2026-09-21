@@ -128,8 +128,18 @@ def poma_status(path: str = ".agent/") -> str:
     # An agent told "N files have no metadata" by poma_search needs a surface
     # that confirms and quantifies it; without these it has none.
     missing = info.get("files_without_metadata", 0)
-    lines.append(f"Metadata:  {missing} file(s) unscanned - run poma_index"
-                 if missing else "Metadata:  complete")
+    stale = info.get("stale_rules", [])
+    if info.get("rules_error"):
+        lines.append(f"Metadata:  rules file unusable - {info['rules_error']}")
+    elif missing:
+        lines.append(f"Metadata:  {missing} file(s) unscanned - run poma_index")
+    elif stale:
+        lines.append(f"Metadata:  {len(stale)} file(s) on an earlier rule set "
+                     "- run poma_index")
+    else:
+        lines.append("Metadata:  complete")
+    for f in stale[:3]:
+        lines.append(f"  ! earlier rule set: {f}")
     for f in info.get("unparsed_frontmatter", []):
         lines.append(f"  ! unparsed front-matter: {f}")
     for f in info["files"]:

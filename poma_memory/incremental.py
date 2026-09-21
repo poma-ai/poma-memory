@@ -57,6 +57,7 @@ def update_file(
     file_path: str,
     path_metadata: dict | None = None,
     rules_hash: str = "",
+    rules_root: str = "",
 ) -> dict:
     """Incrementally update index for a single file.
 
@@ -84,12 +85,19 @@ def update_file(
         # had any, and a rule edit changes what this file resolves to without
         # touching the file. Both are an in-place UPDATE — no re-chunk, no
         # re-embed.
+        # `rules_root` belongs in this test as much as the hash does. Without
+        # it, a row carrying metadata and a matching hash but no recorded root
+        # is refused by search (an unverifiable row is not trusted) and skipped
+        # by this refresh, so `index` could never heal it -- refusing forever,
+        # which is the failure this whole mechanism exists to prevent.
         stale = (not record.get("metadata")
-                 or record.get("rules_hash") != rules_hash)
+                 or record.get("rules_hash") != rules_hash
+                 or record.get("rules_root") != rules_root)
         resolved = _resolve_metadata(file_path, path_metadata) if stale else None
         if stale and resolved is not None:
             meta_json, fm_unparsed = resolved
-            store.set_file_metadata(file_path, meta_json, fm_unparsed, rules_hash)
+            store.set_file_metadata(file_path, meta_json, fm_unparsed,
+                                    rules_hash, rules_root)
         elif stale:
             # Unreadable right now. Leave the row exactly as it was so the
             # next run that can read it resolves it properly.
@@ -117,18 +125,18 @@ def update_file(
                 store.upsert_file_record(
                     file_path, len(full_text),
                     prefix_hash, stat.st_mtime,
-                    meta_json, fm_unparsed, rules_hash,
+                    meta_json, fm_unparsed, rules_hash, rules_root,
                 )
                 return {"status": "unchanged"}
 
             return _incremental_update(
                 store, file_path, full_text, new_text, stat.st_mtime,
-                meta_json, fm_unparsed, rules_hash,
+                meta_json, fm_unparsed, rules_hash, rules_root,
             )
 
     # Full reindex (first time or prefix was modified)
     return _full_reindex(store, file_path, full_text, stat.st_mtime,
-                         meta_json, fm_unparsed, rules_hash)
+                         meta_json, fm_unparsed, rules_hash, rules_root)
 
 
 def _incremental_update(
@@ -140,6 +148,7 @@ def _incremental_update(
     meta_json: str = "{}",
     fm_unparsed: bool = False,
     rules_hash: str = "",
+    rules_root: str = "",
 ) -> dict:
     """Process only the appended portion of a file."""
     # Get heading context from existing chunks for proper depth assignment
@@ -166,7 +175,7 @@ def _incremental_update(
     if not new_chunks:
         store.upsert_file_record(
             file_path, len(full_text),
-            _hash(full_text), mtime, meta_json, fm_unparsed, rules_hash,
+            _hash(full_text), mtime, meta_json, fm_unparsed, rules_hash, rules_root,
         )
         return {"status": "updated", "new_chunks": 0, "new_chunksets": 0}
 
@@ -191,7 +200,7 @@ def _incremental_update(
 
     store.upsert_file_record(
         file_path, len(full_text),
-        _hash(full_text), mtime, meta_json, fm_unparsed, rules_hash,
+        _hash(full_text), mtime, meta_json, fm_unparsed, rules_hash, rules_root,
     )
 
     return {
@@ -204,6 +213,7 @@ def _incremental_update(
 def _full_reindex(
     store: Store, file_path: str, full_text: str, mtime: float,
     meta_json: str = "{}", fm_unparsed: bool = False, rules_hash: str = "",
+    rules_root: str = "",
 ) -> dict:
     """Full reindex: delete existing data and re-chunk entire file."""
     store.delete_file_data(file_path)
@@ -215,7 +225,7 @@ def _full_reindex(
     if not chunks:
         store.upsert_file_record(file_path, len(full_text),
                                   _hash(full_text), mtime,
-                                  meta_json, fm_unparsed, rules_hash)
+                                  meta_json, fm_unparsed, rules_hash, rules_root)
         return {"status": "reindexed", "new_chunks": 0, "new_chunksets": 0}
 
     store.insert_chunks(file_path, chunks)
@@ -225,7 +235,7 @@ def _full_reindex(
 
     store.upsert_file_record(
         file_path, len(full_text),
-        _hash(full_text), mtime, meta_json, fm_unparsed, rules_hash,
+        _hash(full_text), mtime, meta_json, fm_unparsed, rules_hash, rules_root,
     )
 
     return {

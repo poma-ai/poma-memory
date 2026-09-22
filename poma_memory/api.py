@@ -47,10 +47,17 @@ def format_updated(upserted_at: float | None) -> str | None:
         return None
 
 
+# Below this many missing files, a run prunes without asking however small the
+# index is: three deletions out of four documents is a plausible afternoon, and
+# refusing there would make the guard a nuisance rather than a safeguard.
+_PRUNE_FLOOR = 5
+
+
 def index(
     path: str | Path = ".agent/",
     db_path: str | Path | None = None,
     glob: str = "**/*.md",
+    prune: bool | None = None,
 ) -> dict:
     """Index all markdown files in a directory.
 
@@ -64,10 +71,14 @@ def index(
         path: Directory to index (default: .agent/)
         db_path: SQLite database path (default: {path}/.poma-memory.db)
         glob: File pattern to match (default: **/*.md)
+        prune: Remove indexed files that are gone from disk. None (default)
+            removes them unless that would take most of the index in one run,
+            which is more like an unmounted directory than a deletion; True
+            always removes; False never does.
 
     Returns:
         dict with keys: files_indexed, chunks_created, chunksets_created,
-        metadata_refreshed
+        metadata_refreshed, unreadable, stale_rules, pruned, prune_held_back
     """
     path = Path(path)
     if db_path is None:
@@ -186,6 +197,34 @@ def index(
         # from one consistent view...
         gone = [fp for fp in candidates if _disk_state(fp) == "gone"]
 
+        # A whole subtree vanishing is NOT the same event as a file being
+        # deleted, and the filesystem cannot tell them apart: an unmounted
+        # mountpoint nested inside a present root reports ENOENT for everything
+        # under it, exactly as a deleted directory does. The root-present gate
+        # above only catches the case where the ROOT is the mountpoint.
+        #
+        # So this does not try to divine intent. It refuses to remove most of an
+        # index in one run without being asked, which is the outcome worth
+        # blocking whatever produced it, and leaves ordinary single-file deletes
+        # automatic. `prune=True` is the explicit yes; `prune=False` never
+        # removes anything.
+        held_back: list[str] = []
+        if gone and prune is None:
+            tracked_here = len(candidates) + len(seen)
+            if len(gone) > max(_PRUNE_FLOOR, tracked_here // 2):
+                held_back, gone = gone, []
+                shown = ", ".join(held_back[:3]) + (
+                    ", ..." if len(held_back) > 3 else "")
+                print(
+                    f"poma-memory: {len(held_back)} of {tracked_here} indexed "
+                    f"file(s) under {root_key} are missing ({shown}). That is "
+                    "most of this index, which is more like a directory that "
+                    "did not mount than a deletion, so nothing was removed. "
+                    "Re-run with --prune to remove them, or --no-prune to stop "
+                    "asking.", file=sys.stderr)
+        elif prune is False:
+            held_back, gone = gone, []
+
         pruned: list[str] = []
         for fp in gone:
             # ...then re-checked here, because deleting the first row takes time and
@@ -227,6 +266,7 @@ def index(
             "unreadable": unreadable,
             "stale_rules": stale,
             "pruned": pruned,
+        "prune_held_back": held_back,
         }
     finally:
         store.close()

@@ -147,7 +147,10 @@ directory to clear it.
 `index` also **removes** documents that are gone from disk, so a deleted or
 renamed file stops appearing in results. It only does this for files under the
 directory it was given, and only when that directory itself is present — a run
-against an unmounted drive removes nothing. A change is detected by mtime, size
+against an unmounted drive removes nothing. It also stops short of removing
+most of an index in one go, since that looks more like a directory that failed
+to mount than a deletion; `--prune` says do it anyway, `--no-prune` never
+removes. A change is detected by mtime, size
 or ctime, so an edit restored from a backup with its timestamp intact is still
 picked up.
 

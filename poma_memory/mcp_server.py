@@ -113,6 +113,13 @@ def poma_index(path: str = ".agent/", file: str | None = None, glob: str = "**/*
     # a caller should have to read a logfile to discover.
     if result.get("pruned"):
         summary += (f" ({len(result['pruned'])} removed: no longer on disk)")
+    if result.get("prune_held_back"):
+        # Deliberately loud: the index is missing most of its files and nothing
+        # was deleted, which the agent has to know to interpret later searches.
+        summary += (f" ({len(result['prune_held_back'])} indexed files are"
+                    " missing and were NOT removed — that is most of this"
+                    " index, so it looks like an unmounted directory rather"
+                    " than a deletion)")
     return summary
 
 

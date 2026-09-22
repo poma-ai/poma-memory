@@ -1849,3 +1849,109 @@ def test_a_file_that_returns_before_its_turn_is_not_pruned(monkeypatch):
             assert target in store.all_file_paths()
         finally:
             store.close()
+
+
+def _many(root: Path, n: int, sub: str | None = None) -> Path:
+    d = root / sub if sub else root
+    d.mkdir(parents=True, exist_ok=True)
+    for i in range(n):
+        (d / f"f{i}.md").write_text(f"# F{i}\n\nsqlite {i}\n")
+    return d
+
+
+def test_a_vanished_subtree_is_not_removed_without_being_asked():
+    """The root-present gate catches an unmounted ROOT. A mountpoint NESTED
+    inside a present root reports ENOENT for everything under it, exactly as a
+    deleted directory does, and the filesystem cannot tell them apart. So this
+    does not guess: it refuses to remove most of an index in one run."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _many(root, 2)
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        nested = _many(root, 8, sub="sub")
+        api.index(root)
+        store = Store(root / ".poma-memory.db")
+        before = len(store.all_file_paths())
+        store.close()
+
+        shutil.rmtree(nested)
+        result = api.index(root)
+        assert result["pruned"] == []
+        assert len(result["prune_held_back"]) == 8
+        store = Store(root / ".poma-memory.db")
+        try:
+            assert len(store.all_file_paths()) == before
+        finally:
+            store.close()
+
+        # And there is an explicit way through, so a genuinely deleted subtree
+        # is not stuck in the index forever.
+        result = api.index(root, prune=True)
+        assert len(result["pruned"]) == 8
+
+
+def test_ordinary_deletions_still_prune_without_being_asked():
+    """The guard must not become a nuisance: deleting a few documents out of
+    many is routine and stays automatic."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _many(root, 6)
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        api.index(root)
+        os.remove(root / "f1.md")
+        assert len(api.index(root)["pruned"]) == 1
+        os.remove(root / "f2.md")
+        os.remove(root / "f3.md")
+        result = api.index(root)
+        assert len(result["pruned"]) == 2
+        assert result["prune_held_back"] == []
+
+
+def test_prune_false_never_removes_anything():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _many(root, 3)
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        api.index(root)
+        os.remove(root / "f0.md")
+        result = api.index(root, prune=False)
+        assert result["pruned"] == []
+        assert len(result["prune_held_back"]) == 1
+        store = Store(root / ".poma-memory.db")
+        try:
+            assert len(store.all_file_paths()) == 3
+        finally:
+            store.close()
+
+
+def test_the_surfaces_say_when_removals_were_held_back():
+    from poma_memory import cli, mcp_server
+    import io, contextlib
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _many(root, 1)
+        nested = _many(root, 8, sub="sub")
+        api.index(root)
+        shutil.rmtree(nested)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli._cmd_index(argparse.Namespace(
+                path=str(root), db=None, glob="**/*.md", file=None, prune=None))
+        assert "missing, kept" in buf.getvalue(), buf.getvalue()
+
+        out = mcp_server.poma_index(path=str(root))
+        assert "were NOT removed" in out, out
+
+        # And `--prune` must actually reach `index()`: dropping the pass-through
+        # leaves the default in place, which every other test here also sees.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli._cmd_index(argparse.Namespace(
+                path=str(root), db=None, glob="**/*.md", file=None, prune=True))
+        assert "8 removed" in buf.getvalue(), buf.getvalue()
+        store = Store(root / ".poma-memory.db")
+        try:
+            assert len(store.all_file_paths()) == 1
+        finally:
+            store.close()

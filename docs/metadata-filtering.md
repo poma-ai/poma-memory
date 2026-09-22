@@ -244,14 +244,23 @@ and the row. Earlier revisions stamped it `'{}'`; that left a deleted document
 answering searches, and a row no glob can reach can never be corrected, so
 whatever was stamped on it was permanent.
 
-Pruning is the only destructive operation in the package and is gated three
+Pruning is the only destructive operation in the package and is gated four
 ways, each of which was a reproduced way to delete live data: the run's own
 root must be present (an unmounted volume yields ENOENT, not "some other
 OSError", so every row under it read as deleted and a whole corpus went); only
 rows under that root are candidates (two roots may share one database, and a
-run given A must not delete B); and the disk state is re-checked immediately
-before each delete, because it was sampled for every row before any were
-removed. `size_bytes` and `ctime` are what let an edit be noticed at all when
+run given A must not delete B); the disk state is re-checked immediately before
+each delete, because it was sampled for every row before any were removed; and
+a run will not remove MOST of an index without being asked.
+
+That last one is not a guess about intent, because there is no guess to be
+made: a mountpoint nested inside a present root reports ENOENT for everything
+under it, exactly as a deleted directory does, and no filesystem call
+distinguishes them. So it refuses the outcome rather than trying to classify
+the cause — losing most of an index in one run is worth blocking whatever
+produced it, while deleting a handful of documents stays automatic.
+`prune=True` (`--prune`) is the explicit yes and `prune=False` (`--no-prune`)
+the explicit no, so a genuinely deleted subtree is never stuck in the index. `size_bytes` and `ctime` are what let an edit be noticed at all when
 the timestamp was restored — see `incremental._stat_agrees`.
 
 ### 3.6 The pre-filter mechanism

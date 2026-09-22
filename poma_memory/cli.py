@@ -25,6 +25,12 @@ def main(argv: list[str] | None = None) -> None:
     p_index.add_argument("--file", help="Index a single file")
     p_index.add_argument("--db", help="Database path (default: {path}/.poma-memory.db)")
     p_index.add_argument("--glob", default="**/*.md", help="File pattern")
+    p_prune = p_index.add_mutually_exclusive_group()
+    p_prune.add_argument("--prune", dest="prune", action="store_true", default=None,
+                         help="Remove indexed files that are gone from disk, "
+                              "even when that is most of the index")
+    p_prune.add_argument("--no-prune", dest="prune", action="store_false",
+                         help="Never remove indexed files that are gone")
 
     # search
     p_search = sub.add_parser("search", help="Search indexed content")
@@ -106,7 +112,8 @@ def _cmd_index(args: argparse.Namespace) -> None:
               f" {result.get('new_chunksets', 0)} chunksets)")
     else:
         try:
-            result = index(path=args.path, db_path=args.db, glob=args.glob)
+            result = index(path=args.path, db_path=args.db, glob=args.glob,
+                           prune=getattr(args, "prune", None))
         except MetadataRulesError as e:
             print(f"poma-memory: {e}", file=sys.stderr)
             raise SystemExit(2)
@@ -118,6 +125,9 @@ def _cmd_index(args: argparse.Namespace) -> None:
         if result.get("pruned"):
             summary += (f" ({len(result['pruned'])} removed:"
                         " no longer on disk)")
+        if result.get("prune_held_back"):
+            summary += (f" ({len(result['prune_held_back'])} missing, kept"
+                        " — see above)")
         print(summary)
 
 

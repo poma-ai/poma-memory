@@ -52,7 +52,7 @@ Add poma-memory as an MCP server so Claude Code can search your project memory a
 
 ```bash
 claude mcp add --transport stdio --scope user poma-memory -- poma-memory-mcp
-# Exposes poma_search, poma_index, poma_status tools
+# Exposes poma_search, poma_index, poma_forget, poma_status tools
 ```
 
 Once added, Claude Code can call `poma_search` during planning and exploration to surface relevant decisions, patterns, and context from prior sessions.
@@ -163,9 +163,11 @@ never removes anything. A handful of individual files going missing is removed
 without asking. A change is detected by mtime, size or ctime, so an edit
 restored from a backup with its timestamp intact is still picked up.
 
-`--prune` overrides the proportional hold-back, not the other two: a run whose
-directory is absent removes nothing whatever the flag says, because at that
-moment nothing can tell an unmounted drive from a deleted one.
+`--prune` overrides both hold-backs — the proportional one and a vanished
+subdirectory — but never the absent-root gate: a run whose own directory is
+absent removes nothing whatever the flag says, because at that moment nothing
+can tell an unmounted drive from a deleted one. (It also creates nothing, so
+the directory's absence stays true for the next run.)
 
 For a directory that is gone for good, **`poma-memory forget <dir> --db <db>`**
 drops its rows — it does not need the directory to exist, and it reaches

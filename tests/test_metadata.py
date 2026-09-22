@@ -2491,3 +2491,131 @@ def test_the_mcp_directory_branch_reports_unusable_rules():
         out = mcp_server.poma_index(path=str(root))
         assert out.startswith("Index failed:")
         assert "invalid JSON" in out and RULES_FILENAME in out
+
+
+def test_indexing_an_absent_root_creates_nothing_and_cannot_arm_a_prune():
+    """The two-command data-loss path, end to end.
+
+    `Store.__init__` makes its database's parent, and the default database sits
+    inside `path`, so `poma-memory index R` with R gone RECREATED R and left an
+    empty database in it. R's absence is exactly what the root-present gate
+    reads, so the next run saw a present root, found rows whose files were gone
+    -- under the floor, and with the parent directory now existing so the
+    missing-directory rule did not apply either -- and deleted every one of
+    them. Two ordinary commands, no flags, no prompt, rows 3 -> 0.
+
+    `test_an_absent_root_prunes_nothing` cannot see this: it passes `db_path=`
+    outside the root, which is the one arrangement where nothing gets created.
+    """
+    with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as c:
+        root, db = Path(td) / "R", Path(c) / "shared.sqlite"
+        root.mkdir()
+        _many(root, 3)
+        api.index(root, db_path=db)
+        shutil.rmtree(root)
+
+        result = api.index(root)              # no db_path: default is inside R
+        assert not root.exists(), "index recreated the root it was given"
+        assert not (root / ".poma-memory.db").exists()
+        assert result["files_indexed"] == 0 and result["pruned"] == []
+
+        # ...so the gate is still armed for the run that would have deleted.
+        assert api.index(root, db_path=db)["pruned"] == []
+        store = Store(db)
+        try:
+            assert len(store.all_file_paths()) == 3
+        finally:
+            store.close()
+
+
+def test_an_existing_database_outside_an_absent_root_still_runs():
+    """The other half of the rule: opening a database that is already there
+    creates nothing, so that run must not be refused -- two roots sharing a
+    database, one of them temporarily unmounted, is ordinary."""
+    with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as c:
+        root, db = Path(td) / "R", Path(c) / "shared.sqlite"
+        root.mkdir()
+        _many(root, 3)
+        api.index(root, db_path=db)
+        shutil.rmtree(root)
+        result = api.index(root, db_path=db)
+        assert result["pruned"] == [] and result["prune_held_back"] == []
+        assert not root.exists()
+
+
+def test_prune_clears_a_vanished_subdirectory_as_the_docs_now_say():
+    """`--prune` overrides BOTH hold-backs. The README and the design doc said
+    it overrode only the proportional one, which is the wrong rule for the flag
+    that deletes data."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "R"
+        (root / "sub").mkdir(parents=True)
+        _many(root, 10)
+        for i in range(2):
+            (root / "sub" / f"s{i}.md").write_text(f"# S{i}\n\nsqlite s{i}\n")
+        api.index(root)
+        shutil.rmtree(root / "sub")
+        # Two of twelve is under the floor, so only the missing DIRECTORY holds
+        # them -- which is the hold-back the docs claimed `--prune` could not
+        # clear.
+        assert len(api.index(root)["prune_held_back"]) == 2
+        assert len(api.index(root, prune=True)["pruned"]) == 2
+
+
+def test_the_corrupt_blob_refusal_names_a_remedy_that_works_when_the_file_is_gone():
+    """Refusing needs a way out, and "re-run index" is not one for a row whose
+    file has been deleted -- `index` reports the file missing, heals nothing,
+    and the refusal repeats verbatim. `MetadataStale` branches on disk state;
+    this refusal did not, which is the round-five mistake one class over."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _two_kinds(root)
+        _write_rules(root, _V1)
+        api.index(root)
+        target = os.path.realpath(root / "DECISIONS.md")
+        store = Store(root / ".poma-memory.db")
+        record = store.get_file_record(target)
+        store.set_file_metadata(target, "[1, 2]", False,
+                                record["rules_hash"], record["rules_root"])
+        store.close()
+        os.remove(target)
+
+        with pytest.raises(MetadataIncomplete) as e:
+            api.search("sqlite", path=root, where={"kind": "decision"})
+        msg = str(e.value)
+        assert "forget" in msg and os.path.realpath(root) in msg
+        assert f"--db {root / '.poma-memory.db'}" in msg
+        # And it is not a dead end: the command it names clears the row.
+        api.forget(root, db_path=root / ".poma-memory.db")
+        assert api.search("sqlite", path=root, where={"kind": "decision"}) == []
+
+
+@pytest.mark.parametrize("command", ["forget", "search", "status"])
+def test_a_db_that_is_not_a_database_is_reported_not_tracebacked(command, tmp_path):
+    """`--db` is typed by hand, out of an error message, so pointing it at the
+    wrong file is the expected mistake. `sqlite3.DatabaseError` is not an
+    `OSError`, so it went out of `main` as a traceback with exit 1."""
+    from poma_memory import cli
+
+    junk = tmp_path / "junk.db"
+    junk.write_text("this is not a database, it is a text file\n" * 40)
+    work = tmp_path / "proj"
+    work.mkdir()
+    (work / "a.md").write_text("# A\n\nsqlite notes\n")
+
+    argv = {
+        "forget": ["forget", str(work), "--db", str(junk)],
+        "search": ["search", "sqlite", "--path", str(work), "--db", str(junk),
+                   "--socket", "off"],
+        "status": ["status", "--path", str(work), "--db", str(junk)],
+    }[command]
+    with pytest.raises(SystemExit) as e:
+        cli.main(argv)
+    assert e.value.code == 2
+
+
+def test_poma_forget_is_advertised_where_the_other_tools_are():
+    """It shipped without appearing in either place a caller looks for it."""
+    from poma_memory import mcp_server
+    assert "forget" in (mcp_server.__doc__ or "")
+    assert "poma_forget" in Path("README.md").read_text()

@@ -128,6 +128,11 @@ class _IndexCache:
     def __init__(self, limit: int = MAX_CACHED_INDEXES):
         self._limit = limit
         self._entries: dict[str, dict] = {}
+        # `_entries` is touched by every worker thread. Held only around the
+        # dict itself, never across a build: a cold build is ~0.4s, and holding
+        # this through one would re-serialise every index behind the slowest,
+        # which is what the per-index `_LockTable` exists to avoid.
+        self._guard = threading.Lock()
         # Every rebuild is ~0.4s of model load and embedding reads. A daemon that
         # silently rebuilds on every request has lost its entire reason to exist
         # while still looking healthy, so the count is observable via `stats`.
@@ -182,14 +187,23 @@ class _IndexCache:
 
     def get(self, db: Path) -> HybridSearch:
         key = str(db)
-        entry = self._entries.get(key)
+        with self._guard:
+            entry = self._entries.get(key)
 
         if entry is not None:
             if self._stamp(entry["store"], db) == entry["stamp"]:
                 entry["used"] = time.time()
                 return entry["search"]
             # Another process wrote the index — drop the warm copy and rebuild.
-            self._close(key)
+            # Closing IS safe here, unlike in `_evict`: the caller holds this
+            # database's lock, so no other thread can be inside a search on it.
+            with self._guard:
+                if self._entries.get(key) is entry:
+                    del self._entries[key]
+            try:
+                entry["store"].close()
+            except Exception:
+                pass
 
         # Stamp before AND after building. An indexer that commits while
         # HybridSearch is reading would otherwise be recorded as "already
@@ -214,38 +228,58 @@ class _IndexCache:
             search = HybridSearch(store)
             after = self._stamp(store, db)
 
-        self.builds += 1
-        self._entries[key] = {
-            "store": store,
-            "search": search,
-            "stamp": after,
-            "used": time.time(),
-        }
-        self._evict()
+        with self._guard:
+            self.builds += 1
+            self._entries[key] = {
+                "store": store,
+                "search": search,
+                "stamp": after,
+                "used": time.time(),
+            }
+            self._evict()
         return search
 
-    def _close(self, key: str) -> None:
-        entry = self._entries.pop(key, None)
-        if entry is None:
-            return
-        try:
-            entry["store"].close()
-        except Exception:
-            pass
-
     def _evict(self) -> None:
+        """Drop the least recently used entries. Caller holds `_guard`.
+
+        It DROPS the reference and does not close the `Store`, which is the
+        whole point. Eviction crosses databases by construction — building an
+        entry for db A is what evicts db B — so the per-index lock cannot make
+        it safe, and closing here closed a connection another thread was
+        running a query on. With `MAX_CACHED_INDEXES = 8`, nine databases
+        queried concurrently was enough: "Cannot operate on a closed database",
+        and on the next run a **SIGSEGV** (exit 139). Ten databases against a
+        limit of twenty is clean, which is the tell.
+
+        Dropping is sufficient because nothing else needs to happen. The thread
+        mid-search still holds the `HybridSearch`, which holds the `Store`, so
+        the connection stays alive exactly as long as it is in use and CPython
+        closes it on the last reference — there is no cycle here, so that is
+        immediate rather than at some later collection. The cost of an eviction
+        that was still warm is one rebuild, which is what eviction means.
+        """
         while len(self._entries) > self._limit:
             oldest = min(self._entries, key=lambda k: self._entries[k]["used"])
-            self._close(oldest)
+            self._entries.pop(oldest, None)
 
     def close_all(self) -> None:
-        for key in list(self._entries):
-            self._close(key)
+        """Shutdown only, after the worker threads have been joined — which is
+        why this may close where `_evict` may not."""
+        with self._guard:
+            entries = list(self._entries.values())
+            self._entries.clear()
+        for entry in entries:
+            try:
+                entry["store"].close()
+            except Exception:
+                pass
 
     def stats(self) -> list[dict]:
+        with self._guard:
+            items = list(self._entries.items())
         return [
             {"db": k, "age_s": round(time.time() - v["used"], 1)}
-            for k, v in self._entries.items()
+            for k, v in items
         ]
 
 

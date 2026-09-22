@@ -77,6 +77,102 @@ class MetadataNotIndexed(MetadataIncomplete):
         )
 
 
+def _stuck_remedy(examples: list[str], roots: list[str],
+                  db_path: str | None) -> str:
+    """The sentence telling someone how to unstick a row, by WHY it is stuck.
+
+    Shared by every refusal about a row that was scanned and can no longer be
+    trusted, because every one of them has the same three cases and getting any
+    of them wrong sends the user somewhere that silently does nothing. Naming
+    `index` is useless when the run that would fix the row is the run that just
+    skipped it, and a deleted file can be reached by no glob and no re-read.
+
+    `os.stat` and `os.access`, never `open`: this runs inside an exception
+    constructor on the search path, and opening a FIFO blocks forever waiting
+    for a writer. Measured: >6 s and counting. A dead network mount does the
+    same. `os.access` can disagree with real openability under ACLs or as root,
+    which is acceptable in a diagnostic string where a hang is not.
+    """
+    gone, unreadable = [], []
+    for path in examples:
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            gone.append(path)
+            continue
+        except OSError:
+            unreadable.append(path)
+            continue
+        if not stat_module.S_ISREG(st.st_mode) or not os.access(path, os.R_OK):
+            unreadable.append(path)
+
+    roots = [r for r in roots if r]
+    db = f" --db {db_path}" if db_path else ""
+    if gone:
+        # Print the command, whole. Two earlier cuts printed one that did not
+        # work, and the second was worse than the first: "run `poma-memory
+        # index`" sends you to the run that just skipped the row, and "run
+        # `index <dir> --prune`" names a command that will not prune a
+        # directory it cannot see AND whose default database lives inside that
+        # directory -- so following it RECREATED the directory the user had
+        # deleted, left an empty database in it, printed "Indexed 0 files", and
+        # changed nothing.
+        if len(roots) == 1:
+            each = f"`poma-memory forget {roots[0]}{db}`"
+        elif roots:
+            each = (f"`poma-memory forget <dir>{db}` for each of "
+                    + ", ".join(roots[:3]))
+        else:
+            each = f"`poma-memory forget <dir>{db}`"
+        return (f" {len(gone)} of them no longer exist (e.g. {gone[0]}); no "
+                "glob and no re-read can reach a deleted file, and "
+                "`index --prune` will not remove rows for a directory it "
+                f"cannot see. Run {each} to drop them.")
+    if unreadable:
+        return (f" {len(unreadable)} of them cannot be read "
+                f"(e.g. {unreadable[0]}); fix the permissions, then re-run "
+                "`poma-memory index` — the run cannot resolve a file it "
+                "cannot open.")
+    where = f" (e.g. {roots[0]})" if roots else ""
+    return (f" Run `poma-memory index` over the directory each one came "
+            f"from{where}; it re-reads metadata only, with no re-chunking and "
+            "no re-embedding.")
+
+
+class MetadataUnreadable(MetadataIncomplete):
+    """A row was scanned, but what it holds is not a metadata object.
+
+    A hand edit or a third-party writer, and it passes the completeness check
+    because the column is not `''`. Skipping such a row dropped its document
+    out of every filtered result silently -- an answer the caller cannot tell
+    from a correct one, which is what this whole mechanism exists to refuse.
+
+    It carries the same remedy as `MetadataStale` rather than a fixed "re-run
+    index", because the row can be stuck for the same three reasons: an
+    unrelated `index` run over a corpus where six other files are missing
+    reports "6 missing, kept", heals nothing, and the refusal repeats verbatim.
+    """
+
+    def __init__(self, count: int, db_path: str | os.PathLike | None = None,
+                 examples: list[str] | None = None,
+                 roots: list[str] | None = None):
+        self.count = count
+        self.db_path = str(db_path) if db_path is not None else None
+        self.examples = list(examples or [])
+        self.roots = [r for r in (roots or []) if r]
+        where = f" in {self.db_path}" if self.db_path else ""
+        shown = ", ".join(self.examples[:3])
+        if shown and count > len(self.examples[:3]):
+            shown += ", ..."
+        detail = f" (e.g. {shown})" if shown else ""
+        super().__init__(
+            f"{count} indexed file(s){where} have metadata recorded that is "
+            f"not a JSON object{detail}, so a metadata filter cannot be "
+            "answered honestly."
+            + _stuck_remedy(self.examples, self.roots, self.db_path)
+        )
+
+
 class MetadataStale(MetadataIncomplete):
     """Rows hold metadata resolved against a rule set that is not the current one.
 
@@ -103,73 +199,11 @@ class MetadataStale(MetadataIncomplete):
         if shown and count > len(self.examples[:3]):
             shown += ", ..."
         detail = f" (e.g. {shown})" if shown else ""
-        # Naming `index` is useless when the run that would fix a row is the
-        # run that just skipped it, so the remedy depends on WHY it is stuck --
-        # and the three cases need three different answers. A deleted file can
-        # be reached by no glob and no re-read: only `--prune` clears it, and
-        # telling that user to fix permissions (as the first cut did, because
-        # it caught bare OSError) points at a file that is not there.
-        #
-        # `os.stat` and `os.access`, never `open`: this runs inside an exception
-        # constructor on the search path, and opening a FIFO blocks forever
-        # waiting for a writer. Measured: >6 s and counting. A dead network
-        # mount does the same. `os.access` can disagree with real openability
-        # under ACLs or as root, which is acceptable in a diagnostic string and
-        # a hang is not.
-        gone, unreadable = [], []
-        for path in self.examples:
-            try:
-                st = os.stat(path)
-            except FileNotFoundError:
-                gone.append(path)
-                continue
-            except OSError:
-                unreadable.append(path)
-                continue
-            if not stat_module.S_ISREG(st.st_mode) or not os.access(path, os.R_OK):
-                unreadable.append(path)
-        if gone:
-            # Print the command, whole. Two earlier cuts of this message were
-            # not merely unhelpful but actively wrong, and the second was worse
-            # than the first:
-            #
-            #   "run `poma-memory index`"          -- the run that would fix a
-            #       row is the run that just skipped it.
-            #   "run `index <dir> --prune`"        -- `index` deliberately will
-            #       not prune from a directory it cannot see, AND the default
-            #       database lives inside that directory, so the command
-            #       RECREATED the directory the user had deleted, left an empty
-            #       database in it, printed "Indexed 0 files", and the refusal
-            #       repeated unchanged.
-            #
-            # `forget` is the command that works, and it only works with the
-            # right database, which after a `mv` is not where the row's path
-            # says. Both halves or neither.
-            db = f" --db {self.db_path}" if self.db_path else ""
-            if len(self.roots) == 1:
-                each = f"`poma-memory forget {self.roots[0]}{db}`"
-            elif self.roots:
-                each = (f"`poma-memory forget <dir>{db}` for each of "
-                        + ", ".join(self.roots[:3]))
-            else:
-                each = f"`poma-memory forget <dir>{db}`"
-            remedy = (f" {len(gone)} of them no longer exist (e.g. {gone[0]}); "
-                      "no glob and no re-read can reach a deleted file, and "
-                      "`index --prune` will not remove rows for a directory it "
-                      f"cannot see. Run {each} to drop them.")
-        elif unreadable:
-            remedy = (f" {len(unreadable)} of them cannot be read "
-                      f"(e.g. {unreadable[0]}); fix the permissions, then "
-                      "re-run `poma-memory index` — the run cannot resolve a "
-                      "file it cannot open.")
-        else:
-            remedy = (" Run `poma-memory index` over the directory each one "
-                      "came from (it re-reads metadata only; no re-chunking or "
-                      "re-embedding).")
         super().__init__(
             f"{count} indexed file(s){where} still hold metadata resolved "
             f"against an earlier rule set{detail}, so a metadata filter would "
-            "answer from rules that are no longer in effect." + remedy
+            "answer from rules that are no longer in effect."
+            + _stuck_remedy(self.examples, self.roots, self.db_path)
         )
 
 

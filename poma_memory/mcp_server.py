@@ -1,4 +1,4 @@
-"""MCP server for poma-memory. Exposes index, search, and status tools.
+"""MCP server for poma-memory. Exposes index, search, forget and status tools.
 
 Install with: pip install poma-memory[mcp]
 Run with: poma-memory-mcp
@@ -156,12 +156,17 @@ def poma_forget(path: str, db_path: str | None = None) -> str:
             because the default database lives inside it -- the refusal
             message names the database to pass here.
     """
+    import sqlite3
+
     from poma_memory.api import forget
 
     try:
         result = forget(path, db_path=db_path)
-    except OSError as e:
-        return f"Forget failed: {e}"
+    except (OSError, sqlite3.DatabaseError) as e:
+        # `sqlite3.DatabaseError` too: a `db_path` that is not a database
+        # reached the agent as a transport error rather than a sentence, which
+        # is the defect fixed one function above for `poma_index`.
+        return f"Forget failed: {db_path or path}: {e}"
     n = len(result["forgotten"])
     if not n:
         return f"Nothing indexed under {result['root']} in {result['db_path']}."

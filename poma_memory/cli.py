@@ -182,6 +182,7 @@ _REFUSAL_CODES = frozenset({"bad_rules"})
 def _cmd_search(args: argparse.Namespace) -> None:
     """Search command: search indexed content."""
     import os
+    import sqlite3
 
     from poma_memory.metadata import MetadataIncomplete, normalize_where
 
@@ -267,6 +268,11 @@ def _cmd_search(args: argparse.Namespace) -> None:
             # corrupt chunk_ids blob and report it as a metadata problem.
             print(f"poma-memory: {e}", file=sys.stderr)
             raise SystemExit(2)
+        except sqlite3.DatabaseError as e:
+            # A `--db` that is not a database, which the refusal messages now
+            # invite people to type by hand.
+            print(f"poma-memory: {args.db}: {e}", file=sys.stderr)
+            raise SystemExit(2)
 
     if args.as_json:
         print(json.dumps(results, indent=2))
@@ -288,12 +294,20 @@ def _cmd_search(args: argparse.Namespace) -> None:
 
 def _cmd_forget(args: argparse.Namespace) -> None:
     """Forget command: drop every row under a directory."""
+    import sqlite3
+
     from poma_memory.api import forget
 
     try:
         result = forget(args.path, db_path=args.db)
-    except OSError as e:
-        print(f"poma-memory: {e}", file=sys.stderr)
+    except (OSError, sqlite3.DatabaseError) as e:
+        # `sqlite3.DatabaseError` as well as `OSError`. This is the command
+        # whose whole point is that the user types `--db` by hand, copied out
+        # of an error message, so pointing it at the wrong file is the expected
+        # mistake -- and it tracebacked out of `main` with exit 1 instead of
+        # naming the path. `--db <a directory>` raises OperationalError,
+        # `--db <any other file>` raises DatabaseError; neither is an OSError.
+        print(f"poma-memory: {args.db or args.path}: {e}", file=sys.stderr)
         raise SystemExit(2)
     n = len(result["forgotten"])
     if not n:
@@ -304,9 +318,17 @@ def _cmd_forget(args: argparse.Namespace) -> None:
 
 def _cmd_status(args: argparse.Namespace) -> None:
     """Status command: show index status."""
+    import sqlite3
+
     from poma_memory.api import status
 
-    info = status(path=args.path, db_path=args.db)
+    try:
+        info = status(path=args.path, db_path=args.db)
+    except sqlite3.DatabaseError as e:
+        # Same user-typed `--db` as the two commands above. Pre-existing rather
+        # than new, but it is the same one-line hole on the same surface.
+        print(f"poma-memory: {args.db}: {e}", file=sys.stderr)
+        raise SystemExit(2)
 
     if not info["files"]:
         print("No indexed files. Run: poma-memory index")

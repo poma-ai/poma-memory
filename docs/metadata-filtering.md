@@ -255,8 +255,9 @@ delete B); the disk state is re-checked immediately before each delete, because
 it was sampled for every row before any were removed; and a run will not remove
 MOST of an index without being asked.
 
-None of them has an override; `--prune` overrides only the proportional one
-(see below). That last one is not a guess about intent, because there is no
+`--prune` overrides the two hold-backs below — the proportional one and a
+vanished subdirectory — and neither of the two gates above them, which have no
+override at all. That last one is not a guess about intent, because there is no
 guess to be made: a mountpoint nested inside a present root reports ENOENT for everything
 under it, exactly as a deleted directory does, and no filesystem call
 distinguishes them. So it refuses the outcome rather than trying to classify
@@ -267,8 +268,9 @@ the explicit no, so a genuinely deleted subtree is never stuck in the index —
 and the refusal a stale held-back row produces names `--prune` rather than a
 glob or a `chmod`, because neither of those can reach a file that is gone.
 
-**None of the other three gates has an override, `--prune` included** — and
-round nine spent a cut finding out why, by granting one. The state it was
+**Neither of the first two gates has an override, `--prune` included** (it
+clears the two hold-backs, which is a different question) — and round nine
+spent a cut finding out why, by granting one. The state it was
 trying to escape is real: two roots, one database, B's directory deleted. B's
 rows then read stale forever (`load_rules` on a missing directory returns no
 rules, whose hash is not the one on the row), so every filtered search over A
@@ -825,11 +827,18 @@ correctly today. Not worth a silent break for a purity gain.
 
 - Concurrent `index()` runs on one database raise
   `sqlite3.OperationalError: database is locked` (end state stays consistent).
-- `server.py` keys the per-index lock on the unresolved `db_path or path`, so
-  two clients naming one index differently take different locks over a shared
-  `Store`.
+  Predates c2de15e and is still open.
+- `HybridSearch.__init__` raises `ValueError: max() iterable argument is empty`
+  when every chunkset in an index tokenizes to nothing — a corpus of pure
+  stopwords. It is `bm25s.BM25.index` refusing an empty vocabulary, so it takes
+  out `search` and the daemon alike, filtered or not. Predates c2de15e; fixed
+  on this branch in a commit of its own because it is one line and sits in the
+  file round nine rewrote, not because it belongs here.
 - `_incremental_update` offsets a per-file `local_index` by a global chunkset
   count that `delete_file_data` can decrease. Predated c2de15e, but pruning
   made it reachable, so it was fixed here rather than left — see §7.
-
-The first two predate c2de15e and are still open.
+- `server.py` keying the per-index lock on the unresolved `db_path or path`
+  was listed here and is NOT still open: round nine fixed it (`_lock_key`,
+  §8), along with the eviction race behind it. Left in place as a record of
+  what this section got wrong — it said "still open" for two commits after the
+  fix landed.

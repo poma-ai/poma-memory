@@ -87,13 +87,38 @@ def index(
     if db_path is None:
         db_path = path / ".poma-memory.db"
 
+    # Recorded on every row this run writes, so a later search re-reads THIS
+    # directory's rules for these files however the database is addressed.
+    root_key = os.path.realpath(path)
+
+    # A RUN MUST NOT CREATE THE DIRECTORY IT WAS ASKED TO INDEX. `Store` makes
+    # its database's parent, and the default database sits inside `path`, so
+    # `poma-memory index R` with R gone recreated R and left an empty database
+    # in it. That is not a cosmetic wart: R's absence is what the root-present
+    # gate below reads, so the next run saw a present root, found three rows
+    # whose files were gone, and — under the floor, with the parent directory
+    # now existing so the missing-directory rule did not apply either — deleted
+    # every one of them. Two ordinary commands, no flags, no prompt:
+    #
+    #     poma-memory index R                 # R and a stray db appear
+    #     poma-memory index R --db shared.db  # rows 3 -> 0
+    #
+    # Reproduced end to end. `search` and `forget` already refuse to open a
+    # database that is not there; this is the same rule for the third surface.
+    # An EXISTING database outside the root is untouched by this and still runs
+    # (it reports and skips pruning, below), because opening it creates nothing.
+    if _disk_state(root_key) != "present" and not Path(db_path).exists():
+        print(f"poma-memory: {root_key} is not present and there is no index "
+              f"at {db_path}; nothing to do. Nothing was created.",
+              file=sys.stderr)
+        return {"files_indexed": 0, "chunks_created": 0, "chunksets_created": 0,
+                "metadata_refreshed": False, "unreadable": [], "stale_rules": [],
+                "pruned": [], "prune_held_back": []}
+
     store = Store(db_path)
     try:
         rules, _ = load_rules(path)
         new_hash = rules_hash(rules)
-        # Recorded on every row this run writes, so a later search re-reads THIS
-        # directory's rules for these files however the database is addressed.
-        root_key = os.path.realpath(path)
         path_meta = resolve_paths(path, rules)
 
         total_chunks = 0

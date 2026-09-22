@@ -259,6 +259,65 @@ def test_a_degenerate_query_under_a_filter_behaves_like_one_without(query):
             plain = hybrid.search(query, top_k=3)
             filtered = hybrid.search(query, top_k=3, where={"kind": "a"})
             assert len(filtered) == len(plain)
+            # Every document returned is one the predicate admits. The SET is
+            # deliberately not asserted here: this corpus is symmetric, so all
+            # five documents score exactly the same on any query, and which
+            # three of five come back is an arbitrary choice among exact ties
+            # that the two paths make differently (`retrieve` takes the highest
+            # corpus indices, `argsort` the lowest). Scores are identical;
+            # only the tie-break differs. Matching it would mean depending on
+            # an undocumented ordering inside bm25s. The set equality that IS
+            # meaningful — a corpus where scores actually differ — is asserted
+            # in `test_ties_aside_the_filtered_set_is_the_unfiltered_set`.
+            assert _names(filtered) <= {f"f{i}.md" for i in range(5)}
+        finally:
+            store.close()
+
+
+def test_ties_aside_the_filtered_set_is_the_unfiltered_set():
+    """With a predicate that admits everything and scores that actually
+    separate, the filtered path must return exactly what the unfiltered one
+    does. The degenerate-query test above cannot assert this, because its
+    corpus ties on every query; this one is built so it does not."""
+    from poma_memory.search import HybridSearch
+    from poma_memory.store import Store
+    from poma_memory.incremental import update_file
+    from poma_memory.metadata import rules_hash
+
+    bodies = [
+        "sqlite sqlite sqlite storage storage rollback",
+        "sqlite storage deploy",
+        "sqlite rollback",
+        "deploy only",
+        "nothing relevant here",
+        "storage storage storage sqlite",
+    ]
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        rh = rules_hash([])
+        store = Store(root / ".poma-memory.db")
+        try:
+            for i, body in enumerate(bodies):
+                f = root / f"f{i}.md"
+                f.write_text(f"# F{i}\n\n{body}\n")
+                update_file(store, str(f), path_metadata={"kind": "a"},
+                            rules_hash=rh, rules_root=str(root))
+            hybrid = HybridSearch(store, enable_semantic=False)
+            for query in ("sqlite storage", "rollback", "deploy"):
+                for k in (1, 2, 3):
+                    plain = hybrid.search(query, top_k=k)
+                    filtered = hybrid.search(query, top_k=k, where={"kind": "a"})
+                    assert len(filtered) == len(plain), (query, k)
+                    # Compare the documents the query actually matches. Once
+                    # `k` reaches past them the two paths are choosing among
+                    # documents that all score exactly 0, where there is no
+                    # right answer to agree on -- that is the tie-break, not a
+                    # ranking difference, and it is what the degenerate-query
+                    # test above documents.
+                    def scored(hits):
+                        return [(Path(h["file_path"]).name, round(h["score"], 9))
+                                for h in hits if h["score"] > 0]
+                    assert scored(filtered) == scored(plain), (query, k)
         finally:
             store.close()
 

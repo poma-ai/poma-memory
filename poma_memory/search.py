@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from poma_memory.bm25_search import BM25Search
 from poma_memory.metadata import (
-    MetadataIncomplete, MetadataNotIndexed, MetadataStale, matches,
+    MetadataNotIndexed, MetadataStale, MetadataUnreadable, matches,
     normalize_where, stale_by_root,
 )
 from poma_primecut_nano import expand_chunk_ids, assemble_context
@@ -222,7 +222,8 @@ class HybridSearch:
                                 roots=sorted(by_root))
 
         keep_files = set()
-        for file_path, meta, _, _ in rows:
+        bad: list[tuple[str, str]] = []
+        for file_path, meta, root, _ in rows:
             try:
                 value = json.loads(meta)
             except (ValueError, TypeError):
@@ -231,17 +232,20 @@ class HybridSearch:
                 # The row passed the completeness check above -- it is not ''
                 # -- so this is a blob that was written and has since become
                 # unreadable. Skipping it dropped that document out of every
-                # filtered result silently, which is the one outcome this
-                # whole mechanism exists to refuse: an answer the caller
-                # cannot tell from a correct one.
-                raise MetadataIncomplete(
-                    f"{file_path} has metadata recorded that is not a JSON "
-                    f"object ({meta[:40]!r}), so a metadata filter cannot be "
-                    "answered honestly. Re-run `poma-memory index` over the "
-                    "directory it came from to rewrite the row."
-                )
+                # filtered result silently, which is the one outcome this whole
+                # mechanism exists to refuse: an answer the caller cannot tell
+                # from a correct one. Collected rather than raised on the first
+                # one, so the refusal can name the directories they came from
+                # and pick the remedy that actually works for them.
+                bad.append((file_path, root))
+                continue
             if matches(value, where):
                 keep_files.add(file_path)
+        if bad:
+            raise MetadataUnreadable(
+                len(bad), self._store.db_path, [fp for fp, _ in bad][:3],
+                roots=sorted({r for _, r in bad}),
+            )
         # Resolved in SQL rather than by scanning every chunkset in Python: the
         # whole-table version cost 22 ms regardless of how narrow the predicate
         # was, against 0.12 ms here for a 1%% filter.

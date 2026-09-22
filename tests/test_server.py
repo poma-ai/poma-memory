@@ -401,3 +401,51 @@ def test_the_lock_key_is_the_resolved_database():
     # Nothing resolvable (ping, stats, a relative path) shares the empty key.
     assert _lock_key({"op": "ping"}) == ""
     assert _lock_key({"op": "search", "path": "relative/.agent"}) == ""
+
+
+@pytest.mark.parametrize("ndb,limit", [(9, 8), (12, 8)])
+def test_evicting_one_index_does_not_close_another_mid_search(ndb, limit):
+    """`_evict` crosses databases by construction — building an entry for db A
+    is what evicts db B — so the per-index lock cannot make it safe, and
+    closing the Store there closed a connection another thread was querying.
+
+    With `MAX_CACHED_INDEXES = 8`, nine databases queried concurrently was
+    enough: "Cannot operate on a closed database", then on a re-run a
+    **SIGSEGV**. Ten databases against a limit of twenty was clean, which is
+    what identified eviction rather than the lock key. Runs in-process, so a
+    regression here fails this test rather than taking the suite's interpreter
+    down with it — which is what it did.
+    """
+    import tempfile as _tf
+    from poma_memory.api import index as api_index
+    from poma_memory.server import _IndexCache, _LockTable
+
+    with _tf.TemporaryDirectory() as td:
+        dbs = []
+        for i in range(ndb):
+            r = Path(td) / f"r{i}"
+            r.mkdir()
+            for j in range(3):
+                (r / f"f{j}.md").write_text(f"# R{i}F{j}\n\nsqlite storage {j}\n")
+            api_index(r)
+            dbs.append(r / ".poma-memory.db")
+
+        cache = _IndexCache(limit=limit)
+        locks = _LockTable()
+        errors: list[str] = []
+
+        def worker(db):
+            for _ in range(25):
+                try:
+                    with locks.for_key(str(db)):
+                        cache.get(db).search("sqlite storage", top_k=3)
+                except Exception as e:                       # noqa: BLE001
+                    errors.append(f"{type(e).__name__}: {e}")
+
+        threads = [threading.Thread(target=worker, args=(d,)) for d in dbs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=180)
+        cache.close_all()
+        assert errors == [], f"{len(errors)} failures, e.g. {errors[0]}"

@@ -114,8 +114,12 @@ class BM25Search:
                 all_scores = self._retriever.get_scores(str_tokens[0])
             subset = all_scores[allowed_idx]
             k = min(top_k, allowed_idx.size)
-            # `-subset` so ties break toward the lower corpus index, matching
-            # `retrieve`'s own order for equal scores.
+            # Ties break toward the lower corpus index. That is NOT the order
+            # `retrieve` picks for equal scores -- measured over 80
+            # query/corpus pairs with every document allowed, 13 differed and
+            # every one was an exact tie, 3 of them at the top-k boundary, so
+            # the returned SET can differ by a tied document. Non-tie
+            # divergence: 0. Deterministic and correct; simply not identical.
             top = np.argsort(-subset, kind="stable")[:k]
             ranked = [(int(allowed_idx[t]), float(subset[t])) for t in top]
 

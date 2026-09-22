@@ -10,7 +10,8 @@ from pathlib import Path
 from poma_memory.store import Store
 from poma_memory.incremental import update_file
 from poma_memory.metadata import (
-    RULES_FILENAME, MetadataRulesError, load_rules, resolve_paths, rules_hash,
+    RULES_FILENAME, MetadataIncomplete, MetadataRulesError, load_rules,
+    resolve_paths, rules_hash,
     stale_files,
 )
 from poma_memory.search import HybridSearch
@@ -167,7 +168,18 @@ def index(
     # file it could not read. Their metadata is whatever an earlier rule set
     # produced. Per-file hashes mean the next run that reaches them fixes it,
     # but nothing would otherwise say the rule set is only partly applied.
-    stale = stale_files(store.scanned_rows_rules())
+    #
+    # Advisory, and it re-reads OTHER roots' rules files: rows in a shared
+    # database point wherever they came from. A corrupt rules file over there
+    # must not take down an indexing run over here, which has already done its
+    # work and committed it — so this reports and continues rather than
+    # raising past `store.close()`.
+    stale: list[str] = []
+    try:
+        stale = stale_files(store.scanned_rows_rules())
+    except MetadataIncomplete as e:
+        print(f"poma-memory: could not check whether other indexed files are "
+              f"on the current rule set ({e})", file=sys.stderr)
     if stale:
         shown = ", ".join(stale[:3]) + (", ..." if len(stale) > 3 else "")
         print(f"poma-memory: {len(stale)} file(s) still hold metadata from an "

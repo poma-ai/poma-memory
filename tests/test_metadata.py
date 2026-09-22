@@ -1329,3 +1329,154 @@ def test_stale_files_checks_every_root_not_just_the_first():
             (str(rb / "b.md"), str(rb), "0" * 64),       # stale, listed second
         ]
         assert stale_files(rows) == [str(rb / "b.md")]
+
+
+def test_a_corrupt_rules_file_in_another_root_does_not_abort_this_index_run():
+    """The end-of-run staleness warning re-reads OTHER roots' rules files,
+    because rows in a shared database point wherever they came from. It used to
+    raise past `store.close()` AFTER every file had been indexed and committed,
+    so a corrupt file over there took down an unrelated run over here."""
+    with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b, \
+            tempfile.TemporaryDirectory() as c:
+        ra, rb, db = Path(a), Path(b), Path(c) / "shared.sqlite"
+        _two_kinds(ra)
+        (rb / "OTHER.md").write_text("# Other\n\nsqlite elsewhere.\n")
+        _write_rules(ra, _V1)
+        _write_rules(rb, [{"glob": "*.md", "metadata": {"kind": "other"}}])
+        api.index(ra, db_path=db)
+        api.index(rb, db_path=db)
+
+        (rb / ".poma-metadata.json").write_text("{not json")
+        result = api.index(ra, db_path=db)          # must not raise
+        assert result["files_indexed"] >= 0
+        assert result["stale_rules"] == []
+
+        # The run completed and closed its store, so the database is usable.
+        store = Store(db)
+        assert store.all_file_paths()
+        store.close()
+
+
+def test_the_id_lookup_batches_correctly_across_the_parameter_limit():
+    """`IN (?, ?, …)` is capped by SQLITE_MAX_VARIABLE_NUMBER, so the lookup
+    batches. Driving the batch size down to 2 exercises the boundary on a small
+    corpus instead of needing a thousand files."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        for i in range(5):
+            (root / f"f{i}.md").write_text(f"# F{i}\n\nsqlite content {i}\n")
+        _write_rules(root, [{"glob": "*.md", "metadata": {"kind": "note"}}])
+        api.index(root)
+        store = Store(root / ".poma-memory.db")
+        try:
+            keep = set(store.get_file_metadata_map())
+            assert len(keep) == 5
+            whole = {cs for cs, _ in store.get_chunkset_files()}
+            store._IN_BATCH = 2          # forces three batches
+            assert store.chunkset_ids_for_files(keep) == whole
+            assert store.chunkset_ids_for_files(set()) == set()
+            one = next(iter(keep))
+            assert store.chunkset_ids_for_files({one}) == {
+                cs for cs, fp in store.get_chunkset_files() if fp == one}
+        finally:
+            store.close()
+
+
+def test_the_id_lookup_matches_the_whole_table_scan_it_replaced():
+    """Equivalence with the version that pulled every chunkset and filtered in
+    Python -- the behaviour must be identical, only the cost different."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _two_kinds(root)
+        _write_rules(root, _V1)
+        api.index(root)
+        store = Store(root / ".poma-memory.db")
+        try:
+            for meta in ({"kind": "decision"}, {"kind": "event"},
+                         {"kind": "nothing-matches"}):
+                keep = {p for p, m in store.get_file_metadata_map().items()
+                        if matches(m, meta)}
+                assert store.chunkset_ids_for_files(keep) == {
+                    cs for cs, fp in store.get_chunkset_files() if fp in keep}
+        finally:
+            store.close()
+
+
+def test_metadata_rows_answers_every_question_from_one_read():
+    """Completeness, staleness and the predicate map all came from separate
+    queries that could straddle a concurrent write and describe three different
+    moments."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _two_kinds(root)
+        _write_rules(root, _V1)
+        api.index(root)
+        store = Store(root / ".poma-memory.db")
+        try:
+            rows = store.metadata_rows()
+            assert len(rows) == len(store.all_file_paths())
+            assert [r[0] for r in rows] == sorted(r[0] for r in rows)
+            # Same answers as the single-purpose queries it replaces.
+            assert len([r for r in rows if not r[1]]) == \
+                store.count_files_without_metadata()
+            assert [(r[0], r[2], r[3]) for r in rows if r[1]] == \
+                store.scanned_rows_rules()
+        finally:
+            store.close()
+
+
+def test_the_id_lookup_really_issues_one_query_per_batch():
+    """`_IN_BATCH` has to be honoured, not merely present: a version that put
+    every path in one statement passed the behavioural test, because a corpus
+    small enough to test by hand never reaches SQLITE_MAX_VARIABLE_NUMBER.
+    Counting the statements is what pins it."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        for i in range(5):
+            (root / f"f{i}.md").write_text(f"# F{i}\n\nsqlite content {i}\n")
+        _write_rules(root, [{"glob": "*.md", "metadata": {"kind": "note"}}])
+        api.index(root)
+        store = Store(root / ".poma-memory.db")
+        try:
+            keep = set(store.get_file_metadata_map())
+            assert len(keep) == 5
+            seen: list[str] = []
+            store._conn.set_trace_callback(
+                lambda sql: seen.append(sql) if "IN (" in sql else None)
+            store._IN_BATCH = 2          # 5 paths -> 3 statements
+            store.chunkset_ids_for_files(keep)
+            store._conn.set_trace_callback(None)
+            assert len(seen) == 3, seen
+            # And each carries no more placeholders than the batch allows.
+            assert all(sql.count("?") <= 2 for sql in seen), seen
+        finally:
+            store.close()
+
+
+def test_a_row_whose_metadata_is_not_an_object_matches_nothing():
+    """`metadata` is opaque JSON, and nothing stops a hand-edited row or a
+    third-party writer putting a list there. `matches()` would raise on it, so
+    the guard has to exclude rather than admit."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _two_kinds(root)
+        _write_rules(root, _V1)
+        api.index(root)
+        target = os.path.realpath(root / "DECISIONS.md")
+        store = Store(root / ".poma-memory.db")
+        record = store.get_file_record(target)
+        store.set_file_metadata(target, "[1, 2]", False,
+                                record["rules_hash"], record["rules_root"])
+        store.close()
+        # No raise, and the malformed row is simply not a match.
+        hits = api.search("sqlite", path=root, where={"kind": "decision"})
+        assert [Path(h["file_path"]).name for h in hits] == []
+        assert api.search("sqlite", path=root, where={"kind": "event"})
+
+
+def test_the_batch_size_stays_under_the_oldest_parameter_limit():
+    """SQLITE_MAX_VARIABLE_NUMBER is 32766 on current builds but 999 on older
+    ones, and the failure is a hard `OperationalError` on exactly the corpora
+    big enough to need batching. Raising this constant is safe only against the
+    SQLite you happen to have."""
+    assert Store._IN_BATCH <= 999

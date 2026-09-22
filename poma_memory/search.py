@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from typing import TYPE_CHECKING
 
@@ -197,26 +198,36 @@ class HybridSearch:
         if where is None:
             return None
 
-        missing = self._store.count_files_without_metadata()
+        # ONE read answering all three questions, so they describe the same
+        # moment. As three separate queries this was both slower and able to
+        # straddle a concurrent write.
+        rows = self._store.metadata_rows()
+
+        missing = [fp for fp, meta, _, _ in rows if not meta]
         if missing:
             # An empty result here would be indistinguishable from an honest
             # "nothing matches", so refuse instead of guessing.
-            raise MetadataNotIndexed(missing, self._store.db_path,
-                                     self._store.files_without_metadata())
+            raise MetadataNotIndexed(len(missing), self._store.db_path,
+                                     missing[:3])
+
         # Each row names the directory its rules came from, so this re-reads
         # those rules now rather than trusting anything cached or inferred.
-        stale = stale_files(self._store.scanned_rows_rules())
+        stale = stale_files([(fp, root, h) for fp, _, root, h in rows])
         if stale:
             raise MetadataStale(len(stale), self._store.db_path, stale[:3])
 
-        file_meta = self._store.get_file_metadata_map()
-        keep_files = {
-            path for path, meta in file_meta.items() if matches(meta, where)
-        }
-        return {
-            cs_id for cs_id, file_path in self._store.get_chunkset_files()
-            if file_path in keep_files
-        }
+        keep_files = set()
+        for file_path, meta, _, _ in rows:
+            try:
+                value = json.loads(meta)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(value, dict) and matches(value, where):
+                keep_files.add(file_path)
+        # Resolved in SQL rather than by scanning every chunkset in Python: the
+        # whole-table version cost 22 ms regardless of how narrow the predicate
+        # was, against 0.12 ms here for a 1%% filter.
+        return self._store.chunkset_ids_for_files(keep_files)
 
     def _resolve_empty_gate(self, empty_gate: float | None) -> float:
         """Precedence: explicit param > POMA_MEMORY_EMPTY_GATE env >

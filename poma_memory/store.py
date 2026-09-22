@@ -216,17 +216,20 @@ class Store:
             "SELECT COUNT(*) AS c FROM files WHERE metadata = ''"
         ).fetchone()["c"]
 
-    def files_without_metadata(self, limit: int = 3) -> list[str]:
-        """A few paths that have never been scanned, to name in the refusal.
+    def metadata_rows(self) -> list[tuple[str, str, str, str]]:
+        """(file_path, metadata, rules_root, rules_hash) for EVERY file row.
 
-        A bare count does not tell you which file to cover, and the usual way
-        to get stuck is a file no `index` run's glob reaches.
+        One scan answering all three questions a filtered search asks --
+        is anything unscanned, is anything on superseded rules, and what does
+        each file carry. Three separate queries were not only slower but could
+        straddle a concurrent write and describe three different moments.
         """
         rows = self._conn.execute(
-            "SELECT file_path FROM files WHERE metadata = '' "
-            "ORDER BY file_path LIMIT ?", (limit,),
+            "SELECT file_path, metadata, rules_root, rules_hash FROM files "
+            "ORDER BY file_path"
         ).fetchall()
-        return [r["file_path"] for r in rows]
+        return [(r["file_path"], r["metadata"], r["rules_root"], r["rules_hash"])
+                for r in rows]
 
     def scanned_rows_rules(self) -> list[tuple[str, str, str]]:
         """(file_path, rules_root, rules_hash) for every row that was scanned.
@@ -341,8 +344,42 @@ class Store:
         ).fetchone()
         return float(row["m"]) if row and row["m"] is not None else 0.0
 
+    # SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999 on older builds, so an
+    # `IN (?, ?, …)` over every matching file has to be batched. 900 leaves room
+    # for the handful of other parameters a query might carry.
+    _IN_BATCH = 900
+
+    def chunkset_ids_for_files(self, file_paths: set[str]) -> set[int]:
+        """Chunkset ids belonging to these files, resolved in SQL.
+
+        The obvious version -- pull every (chunkset_id, file_path) pair and
+        filter in Python -- costs the whole table on every filtered query, which
+        measured 23 ms of a 39 ms search on a 48k-chunkset corpus. This touches
+        only the matching rows, and the `UNIQUE(file_path, local_index)`
+        constraint already provides an index whose leftmost column is
+        `file_path`, so no extra index is needed (verified with EXPLAIN QUERY
+        PLAN: `SEARCH chunksets USING COVERING INDEX`).
+        """
+        paths = list(file_paths)
+        out: set[int] = set()
+        for i in range(0, len(paths), self._IN_BATCH):
+            batch = paths[i:i + self._IN_BATCH]
+            placeholders = ",".join("?" * len(batch))
+            rows = self._conn.execute(
+                f"SELECT chunkset_id FROM chunksets WHERE file_path IN ({placeholders})",
+                batch,
+            ).fetchall()
+            out.update(r["chunkset_id"] for r in rows)
+        return out
+
     def get_chunkset_files(self) -> list[tuple[int, str]]:
         """(chunkset_id, file_path) for every chunkset.
+
+        No longer on the search path -- `chunkset_ids_for_files` replaced it,
+        because materialising the whole table cost 22 ms per filtered query
+        however narrow the predicate was. Kept as the independent oracle the
+        equivalence test compares that query against; if that test goes, so
+        does this.
 
         Two columns rather than `get_all_chunksets`, which carries every
         chunkset's full text: resolving a metadata predicate needs only the

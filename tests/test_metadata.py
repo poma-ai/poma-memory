@@ -270,7 +270,11 @@ def test_legacy_rows_are_healed_by_a_plain_index_run():
         store.close()
 
 
-def test_a_row_whose_file_vanished_is_recorded_rather_than_left_unscanned():
+def test_a_row_whose_file_vanished_is_pruned_not_left_unscanned():
+    """A deleted file's row cannot be refreshed by any later run -- no glob
+    matches a file that does not exist -- so whatever is left on it is
+    permanent. It is removed entirely instead, which also stops the deleted
+    document answering searches."""
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         _corpus(root)
@@ -284,21 +288,23 @@ def test_a_row_whose_file_vanished_is_recorded_rather_than_left_unscanned():
         store._conn.execute("UPDATE files SET metadata = ''")
         store._conn.commit()
         store.close()
+        gone = os.path.realpath(root / "DECISIONS.md")
         (root / "DECISIONS.md").unlink()
 
-        api.index(path=root)
+        result = api.index(path=root)
+        assert result["pruned"] == [gone]
         store = Store(db)
-        # Left at '', every filtered search would refuse forever over a file
-        # nobody can fix.
-        assert store.count_files_without_metadata() == 0
-        # The surviving file must have been resolved properly, not swept into
-        # the same "{}" as the deleted one -- which is what made the earlier
-        # version of this test pass against a bug.
-        by_name = {Path(p_).name: m
-                   for p_, m in store.get_file_metadata_map().items()}
-        assert by_name["e1.md"] == {"kind": "event"}
-        assert by_name["DECISIONS.md"] == {}
-        store.close()
+        try:
+            assert store.count_files_without_metadata() == 0
+            assert "DECISIONS.md" not in {
+                Path(p_).name for p_ in store.all_file_paths()}
+            by_name = {Path(p_).name: m
+                       for p_, m in store.get_file_metadata_map().items()}
+            assert by_name["e1.md"] == {"kind": "event"}
+            assert not [fp for _, fp in store.get_chunkset_files()
+                        if Path(fp).name == "DECISIONS.md"]
+        finally:
+            store.close()
 
 
 def test_single_file_indexing_still_applies_path_rules():
@@ -897,34 +903,26 @@ def test_index_survives_a_file_that_is_not_utf8():
         assert [Path(f).name for f in api.status(root)["files"]] == ["a_good.md"]
 
 
-def test_a_vanished_unscanned_row_is_recorded_against_the_current_rules():
-    """The orphan branch fires only for a row that was never scanned AND whose
-    file is gone. Stamping it without the current rules hash left it differing
-    from every real hash forever, so every filtered search refused permanently
-    and no glob could clear it -- the file is deleted."""
+def test_a_deleted_document_stops_answering_filtered_searches():
+    """The point of pruning rather than stamping: a caller narrowing to
+    `kind=decision` reads the result as the current decision set, and a deleted
+    document has no business in it."""
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         _two_kinds(root)
         _write_rules(root, _V1)
         api.index(root)
+        assert [Path(h["file_path"]).name for h in
+                api.search("sqlite", path=root, where={"kind": "decision"})] \
+            == ["DECISIONS.md"]
 
-        # A row that predates metadata indexing (0.5.0), whose file then goes.
-        gone = os.path.realpath(root / "events" / "e1.md")
-        store = Store(root / ".poma-memory.db")
-        store.set_file_metadata(gone, "")
-        store.close()
-        os.remove(root / "events" / "e1.md")
-
+        (root / "DECISIONS.md").unlink()
         api.index(root)
-        store = Store(root / ".poma-memory.db")
-        record = store.get_file_record(gone)
-        store.close()
-        assert record["metadata"] == "{}"
-        assert record["rules_hash"] == rules_hash(_V1)
-        assert record["rules_root"] == os.path.realpath(root)
 
-        assert api.index(root)["stale_rules"] == []
-        api.search("sqlite", path=root, where={"kind": "decision"})
+        assert api.search("sqlite", path=root, where={"kind": "decision"}) == []
+        assert not [h for h in api.search("sqlite", path=root)
+                    if Path(h["file_path"]).name == "DECISIONS.md"]
+        assert api.status(root)["stale_rules"] == []
 
 
 @pytest.mark.parametrize("falsy", [[], "", 0, ()])
@@ -1480,3 +1478,93 @@ def test_the_batch_size_stays_under_the_oldest_parameter_limit():
     big enough to need batching. Raising this constant is safe only against the
     SQLite you happen to have."""
     assert Store._IN_BATCH <= 999
+
+
+def test_an_edit_that_preserves_mtime_is_still_noticed():
+    """Archive and sync tools that preserve timestamps carry a CHANGED file
+    across with its old mtime. The row then keeps metadata the document no
+    longer says, while `status` reports the index complete. A recorded size
+    costs nothing -- the stat already happened -- and catches it."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "a.md").write_text("# A\n\nsqlite notes.\n")
+        _write_rules(root, [{"glob": "*.md", "metadata": {"kind": "note"}}])
+        api.index(root)
+        assert [Path(h["file_path"]).name for h in
+                api.search("sqlite", path=root, where={"kind": "note"})] == ["a.md"]
+
+        before = os.stat(root / "a.md")
+        (root / "a.md").write_text(
+            "---\nkind: superseded\n---\n\n# A\n\nsqlite notes, revised.\n")
+        os.utime(root / "a.md", (before.st_atime, before.st_mtime))
+        assert os.stat(root / "a.md").st_mtime == before.st_mtime
+
+        api.index(root)
+        assert api.search("sqlite", path=root, where={"kind": "note"}) == []
+        assert [Path(h["file_path"]).name for h in
+                api.search("sqlite", path=root, where={"kind": "superseded"})] \
+            == ["a.md"]
+
+
+def test_a_legacy_row_with_no_recorded_size_is_healed_without_re_chunking():
+    """A row from before the column records 0, so it reads as changed and is
+    re-read once. It must NOT re-chunk or re-embed: the content hash still
+    matches on the append path, so the file comes back "unchanged" and the
+    size is recorded for good."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "a.md").write_text("# A\n\nsqlite notes.\n")
+        _write_rules(root, [{"glob": "*.md", "metadata": {"kind": "note"}}])
+        api.index(root)
+
+        target = os.path.realpath(root / "a.md")
+        store = Store(root / ".poma-memory.db")
+        store._conn.execute("UPDATE files SET size_bytes = 0")
+        store._conn.commit()
+        before = store.get_file_record(target)
+        store.close()
+
+        result = api.index(root)
+        assert result["files_indexed"] == 0, "must not re-chunk a legacy row"
+        store = Store(root / ".poma-memory.db")
+        after = store.get_file_record(target)
+        store.close()
+        assert after["content_hash"] == before["content_hash"]
+        # Healed: the size is recorded now, so the check applies from here on.
+        assert after["size_bytes"] == os.stat(root / "a.md").st_size
+
+
+def test_the_size_check_does_not_re_chunk_an_unchanged_file():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "a.md").write_text("# A\n\nsqlite notes.\n")
+        _write_rules(root, [{"glob": "*.md", "metadata": {"kind": "note"}}])
+        api.index(root)
+        for _ in range(3):
+            assert api.index(root)["files_indexed"] == 0
+
+
+def test_an_unmounted_or_unreadable_parent_never_prunes():
+    """Pruning keys on FileNotFoundError alone. `_disk_state` answers "unknown"
+    for a permission error or a dead mount, and deleting a corpus because a
+    disk was not mounted is not a recoverable mistake."""
+    from poma_memory.api import _disk_state
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        sub = root / "sub"
+        sub.mkdir()
+        (sub / "a.md").write_text("# A\n\nsqlite notes.\n")
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        api.index(root)
+        target = os.path.realpath(sub / "a.md")
+
+        os.chmod(sub, 0o000)
+        try:
+            assert _disk_state(target) == "unknown"
+            result = api.index(root)
+            assert result["pruned"] == []
+        finally:
+            os.chmod(sub, 0o755)
+        store = Store(root / ".poma-memory.db")
+        assert target in store.all_file_paths()
+        store.close()

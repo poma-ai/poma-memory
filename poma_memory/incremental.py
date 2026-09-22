@@ -52,12 +52,28 @@ def _resolve_metadata(
     return json.dumps(meta_mod.merge(path_metadata, fm), sort_keys=True), not ok
 
 
+def _size_agrees(record: dict, stat: os.stat_result) -> bool:
+    """Whether the recorded byte size still matches the file on disk.
+
+    A row written before this column existed records 0, which will not match a
+    real file, so it reads as changed and is re-read once. That is deliberate:
+    the alternative -- trusting mtime alone when the size is unknown -- leaves
+    every legacy row permanently unprotected, because the short-circuit it then
+    takes is also the path that never records a size. One extra read per file,
+    once, buys the check for good. It costs no re-chunking and no re-embedding
+    either: an unchanged file still matches its content hash on the append path
+    and returns "unchanged".
+    """
+    return record.get("size_bytes") == stat.st_size
+
+
 def update_file(
     store: Store,
     file_path: str,
     path_metadata: dict | None = None,
     rules_hash: str = "",
     rules_root: str = "",
+    size_bytes: int = 0,
 ) -> dict:
     """Incrementally update index for a single file.
 
@@ -79,8 +95,18 @@ def update_file(
     stat = os.stat(file_path)
     record = store.get_file_record(file_path)
 
-    # Check if file is unchanged
-    if record and record["mtime"] == stat.st_mtime:
+    # Check if file is unchanged. mtime alone is not enough: `cp -p`, `rsync`
+    # with times preserved, archive extraction and restore tooling all carry a
+    # CHANGED file across with its old mtime, and the row then keeps metadata
+    # the document no longer says while `status` reports the index complete.
+    # A recorded size costs nothing -- the stat already happened -- and catches
+    # every such edit that changes the file's length.
+    #
+    # Size 0 means the row predates this column, not that the file is empty in
+    # any meaningful sense: falling back to mtime there keeps a first run after
+    # upgrading from re-chunking and re-embedding the whole corpus. Those rows
+    # gain the check the next time their content actually changes.
+    if record and record["mtime"] == stat.st_mtime and _size_agrees(record, stat):
         # Content is untouched, but metadata may not be: a legacy row has never
         # had any, and a rule edit changes what this file resolves to without
         # touching the file. Both are an in-place UPDATE — no re-chunk, no
@@ -126,17 +152,19 @@ def update_file(
                     file_path, len(full_text),
                     prefix_hash, stat.st_mtime,
                     meta_json, fm_unparsed, rules_hash, rules_root,
+                    stat.st_size,
                 )
                 return {"status": "unchanged"}
 
             return _incremental_update(
                 store, file_path, full_text, new_text, stat.st_mtime,
-                meta_json, fm_unparsed, rules_hash, rules_root,
+                meta_json, fm_unparsed, rules_hash, rules_root, stat.st_size,
             )
 
     # Full reindex (first time or prefix was modified)
     return _full_reindex(store, file_path, full_text, stat.st_mtime,
-                         meta_json, fm_unparsed, rules_hash, rules_root)
+                         meta_json, fm_unparsed, rules_hash, rules_root,
+                         stat.st_size)
 
 
 def _incremental_update(
@@ -149,6 +177,7 @@ def _incremental_update(
     fm_unparsed: bool = False,
     rules_hash: str = "",
     rules_root: str = "",
+    size_bytes: int = 0,
 ) -> dict:
     """Process only the appended portion of a file."""
     # Get heading context from existing chunks for proper depth assignment
@@ -175,7 +204,8 @@ def _incremental_update(
     if not new_chunks:
         store.upsert_file_record(
             file_path, len(full_text),
-            _hash(full_text), mtime, meta_json, fm_unparsed, rules_hash, rules_root,
+            _hash(full_text), mtime, meta_json, fm_unparsed, rules_hash,
+            rules_root, size_bytes,
         )
         return {"status": "updated", "new_chunks": 0, "new_chunksets": 0}
 
@@ -200,7 +230,8 @@ def _incremental_update(
 
     store.upsert_file_record(
         file_path, len(full_text),
-        _hash(full_text), mtime, meta_json, fm_unparsed, rules_hash, rules_root,
+        _hash(full_text), mtime, meta_json, fm_unparsed, rules_hash,
+        rules_root, size_bytes,
     )
 
     return {
@@ -214,6 +245,7 @@ def _full_reindex(
     store: Store, file_path: str, full_text: str, mtime: float,
     meta_json: str = "{}", fm_unparsed: bool = False, rules_hash: str = "",
     rules_root: str = "",
+    size_bytes: int = 0,
 ) -> dict:
     """Full reindex: delete existing data and re-chunk entire file."""
     store.delete_file_data(file_path)
@@ -225,7 +257,8 @@ def _full_reindex(
     if not chunks:
         store.upsert_file_record(file_path, len(full_text),
                                   _hash(full_text), mtime,
-                                  meta_json, fm_unparsed, rules_hash, rules_root)
+                                  meta_json, fm_unparsed, rules_hash,
+                                  rules_root, size_bytes)
         return {"status": "reindexed", "new_chunks": 0, "new_chunksets": 0}
 
     store.insert_chunks(file_path, chunks)
@@ -235,7 +268,8 @@ def _full_reindex(
 
     store.upsert_file_record(
         file_path, len(full_text),
-        _hash(full_text), mtime, meta_json, fm_unparsed, rules_hash, rules_root,
+        _hash(full_text), mtime, meta_json, fm_unparsed, rules_hash,
+        rules_root, size_bytes,
     )
 
     return {

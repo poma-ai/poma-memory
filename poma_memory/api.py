@@ -136,33 +136,30 @@ def index(
             total_chunks += result.get("new_chunks", 0)
             total_chunksets += result.get("new_chunksets", 0)
 
-    # Rows whose file is gone from disk. Their indexed content demonstrably has
-    # no metadata to find, and leaving them at '' would make the index
-    # permanently incomplete — every filtered search would refuse forever.
+    # Rows whose file is gone from disk are PRUNED — chunks, chunksets and the
+    # row itself. Keeping their content meant a deleted or renamed document went
+    # on answering searches, including filtered ones, where a caller narrowing to
+    # `kind=decision` reasonably reads the result as the current decision set.
     #
     # `fp not in seen` is NOT enough to call a row orphaned: this run may have
     # been given a narrower `glob` than the one that indexed it, and a file that
-    # still exists has simply not been scanned yet. Recording it as scanned-and-
-    # empty would be a lie that no later run corrects, because '{}' looks done.
-    # Leaving it at '' is honest — a filtered search refuses until a run whose
-    # glob covers it fills it in.
-    scanned = store.get_file_metadata_map()
-    # Re-read: the loop above may have added rows.
+    # still exists has simply not been scanned yet. `_disk_state` answers the
+    # actual question, and only "gone" — FileNotFoundError — prunes. A
+    # permission error or an unmounted volume reads as "unknown" and is left
+    # entirely alone, because deleting a corpus because a disk was not mounted
+    # is not a recoverable mistake.
+    #
+    # Pruning also removes the whole class of problem that stamping these rows
+    # created: a row that no glob can reach, because the file does not exist,
+    # cannot be refreshed, so any metadata left on it is permanent. There is
+    # nothing left to be stale.
     states = {fp: _disk_state(fp) for fp in store.all_file_paths()
               if fp not in seen}
     gone = [fp for fp, st in states.items() if st == "gone"]
     for fp in gone:
-        # EVERY gone row, not only the never-scanned ones. A row scanned under
-        # an earlier rule set whose file is then deleted or renamed can be
-        # reached by no glob — the file does not exist — so leaving its hash
-        # behind made every later filtered search refuse permanently, with
-        # remediation text that could not be followed. Its content demonstrably
-        # has no metadata to find, so recording it against the current rules is
-        # both true and terminal.
-        store.set_file_metadata(fp, "{}", False, new_hash, root_key)
-        if fp not in scanned:
-            print(f"poma-memory: {fp} is indexed but no longer on disk; "
-                  "recorded as having no metadata", file=sys.stderr)
+        store.delete_file_data(fp)
+        print(f"poma-memory: {fp} is no longer on disk; removed from the index",
+              file=sys.stderr)
 
     # Rows this run did not reach — a narrower glob, a name `index()` skips, a
     # file it could not read. Their metadata is whatever an earlier rule set
@@ -194,6 +191,7 @@ def index(
         "metadata_refreshed": refreshed,
         "unreadable": unreadable,
         "stale_rules": stale,
+        "pruned": gone,
     }
 
 

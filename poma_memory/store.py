@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS files (
     metadata     TEXT NOT NULL DEFAULT '',
     fm_unparsed  INTEGER NOT NULL DEFAULT 0,
     rules_hash   TEXT NOT NULL DEFAULT '',
-    rules_root   TEXT NOT NULL DEFAULT ''
+    rules_root   TEXT NOT NULL DEFAULT '',
+    size_bytes   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -141,6 +142,12 @@ class Store:
             # live anywhere (`--db`), and two roots can share one, so location
             # answers "which rules govern this row" only by accident.
             ("rules_root", "ALTER TABLE files ADD COLUMN rules_root TEXT NOT NULL DEFAULT ''"),
+            # The file's size in bytes as `os.stat` reports it, so an edit that
+            # preserves mtime is still noticed. 0 means "not recorded" -- a row
+            # written before this column existed -- and falls back to the mtime
+            # check alone rather than forcing a re-chunk and re-embed of every
+            # legacy file on the first run after upgrading.
+            ("size_bytes", "ALTER TABLE files ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0"),
         ):
             try:
                 self._conn.execute(ddl)
@@ -163,6 +170,7 @@ class Store:
         self, file_path: str, byte_offset: int, content_hash: str, mtime: float,
         metadata: str | None = None, fm_unparsed: bool | None = None,
         rules_hash: str | None = None, rules_root: str | None = None,
+        size_bytes: int | None = None,
     ) -> None:
         """Write a file row. `metadata=None` leaves any existing value alone.
 
@@ -173,9 +181,10 @@ class Store:
         flag = None if fm_unparsed is None else int(fm_unparsed)
         self._conn.execute(
             """INSERT INTO files (file_path, byte_offset, content_hash, mtime,
-                                  metadata, fm_unparsed, rules_hash, rules_root)
+                                  metadata, fm_unparsed, rules_hash, rules_root,
+                                  size_bytes)
                VALUES (?, ?, ?, ?, COALESCE(?, ''), COALESCE(?, 0),
-                       COALESCE(?, ''), COALESCE(?, ''))
+                       COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, 0))
                ON CONFLICT(file_path) DO UPDATE SET
                    byte_offset=excluded.byte_offset,
                    content_hash=excluded.content_hash,
@@ -183,10 +192,11 @@ class Store:
                    metadata=COALESCE(?, files.metadata),
                    fm_unparsed=COALESCE(?, files.fm_unparsed),
                    rules_hash=COALESCE(?, files.rules_hash),
-                   rules_root=COALESCE(?, files.rules_root)""",
+                   rules_root=COALESCE(?, files.rules_root),
+                   size_bytes=COALESCE(?, files.size_bytes)""",
             (file_path, byte_offset, content_hash, mtime, metadata, flag,
-             rules_hash, rules_root,
-             metadata, flag, rules_hash, rules_root),
+             rules_hash, rules_root, size_bytes,
+             metadata, flag, rules_hash, rules_root, size_bytes),
         )
         self._conn.commit()
 

@@ -144,6 +144,9 @@ directories sharing one database. A run given a narrower `--glob` reaches only
 part of the corpus and leaves the rest on the old rules; re-run over each
 directory to clear it.
 
+Why the filter runs before ranking rather than after, and what the refusals are
+protecting against: **[`docs/metadata-filtering.md`](docs/metadata-filtering.md)**.
+
 ---
 
 ## How it works

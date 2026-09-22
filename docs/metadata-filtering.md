@@ -377,6 +377,13 @@ the timestamp was restored — see `incremental._stat_agrees`.
    — raises `IndexError` where `retrieve` did not; an empty query scores every
    document zero, which is what the unfiltered path returns.
 
+Both pieces the replacement uses were verified against the **pin floor**, not
+merely the installed 0.3.11, the same way `weight_mask` was in round one: the
+bm25s 0.3.0 wheel was pulled from PyPI and parsed with `ast`. It carries
+`BM25.get_scores(query_tokens_single, weight_mask)` with the same
+string-or-ids branch, `get_tokens_ids`, and `tokenize(..., return_ids=...)`.
+`bm25s>=0.3,<1` stands: no dependency change, no floor bump.
+
 **What this does and does not buy.** Every in-scope document is rankable and no
 other document is returned, at any corpus size. The result *set* is not
 identical to an index built from the matching files alone: BM25 scores against

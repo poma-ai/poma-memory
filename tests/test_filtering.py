@@ -226,6 +226,43 @@ def test_filtered_mixed_corpus_matches_a_corpus_built_from_the_subset(
             assert filtered == []
 
 
+@pytest.mark.parametrize("query", [
+    "zzzqqq wibblefrotz",   # real tokens, none of them in the index
+    "the and of",           # everything removed as a stopword
+    "!!!",                  # nothing survives tokenization
+    "",                     # nothing to tokenize at all
+])
+def test_a_degenerate_query_under_a_filter_behaves_like_one_without(query):
+    """The filtered path no longer goes through `retrieve`, so it meets these
+    on its own. `get_scores` indexes `[0]` unconditionally -- an empty token
+    list raises IndexError where `retrieve` did not -- and `get_tokens_ids`
+    drops out-of-vocabulary tokens, so a query of real-but-unknown words
+    reaches `get_scores_from_ids` with nothing in it. Neither shape had any
+    coverage, and both are ordinary: searching for a word the corpus does not
+    contain is the normal way to get no answer."""
+    from poma_memory.search import HybridSearch
+    from poma_memory.store import Store
+    from poma_memory.incremental import update_file
+    from poma_memory.metadata import rules_hash
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        rh = rules_hash([])
+        store = Store(root / ".poma-memory.db")
+        try:
+            for i in range(5):
+                f = root / f"f{i}.md"
+                f.write_text(f"# F{i}\n\nsqlite storage notes {i}\n")
+                update_file(store, str(f), path_metadata={"kind": "a"},
+                            rules_hash=rh, rules_root=str(root))
+            hybrid = HybridSearch(store, enable_semantic=False)
+            plain = hybrid.search(query, top_k=3)
+            filtered = hybrid.search(query, top_k=3, where={"kind": "a"})
+            assert len(filtered) == len(plain)
+        finally:
+            store.close()
+
+
 @pytest.mark.parametrize("semantic", [True, False])
 def test_no_out_of_scope_document_survives_a_larger_corpus(semantic):
     """The part of the invariant that holds at any size, plus the one that did

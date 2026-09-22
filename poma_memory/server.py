@@ -318,15 +318,7 @@ def _handle(req: dict, cache: _IndexCache) -> dict:
         db = _resolve_db(req.get("path"), req.get("db_path"))
     except _RelativePath as e:
         return {"ok": False, "error": str(e)}
-    if not db.exists():
-        # Not an error: a root without an index is simply skipped by callers.
-        return {"ok": True, "results": [], "db": str(db), "indexed": False}
 
-    # `x or default` silently rewrites a valid 0: `--top 0` would come back as 5
-    # and the daemon would disagree with the in-process path. Only None means
-    # "not supplied".
-    top_k = req.get("top_k")
-    min_score = req.get("min_score")
     # Validate the predicate on its own, before any search work. Wrapping the
     # whole call in `except ValueError` labelled unrelated failures — a corrupt
     # `chunk_ids` blob raises json.JSONDecodeError, which IS a ValueError — as
@@ -336,6 +328,23 @@ def _handle(req: dict, cache: _IndexCache) -> dict:
         where = normalize_where(req.get("where"))
     except ValueError as e:
         return {"ok": False, "code": "bad_where", "error": str(e)}
+
+    # Every ok response ECHOES the predicate it applied. A daemon that predates
+    # `where` ignores the key and returns the whole corpus as `ok: true`, and
+    # the client then prints it as a filtered answer -- reproduced with a 0.6
+    # CLI against a 0.5 daemon still running from before an upgrade: 4 results
+    # where the same query in-process gave 1. The echo is what lets the client
+    # tell "filtered" from "a daemon that never heard of filtering".
+    if not db.exists():
+        # Not an error: a root without an index is simply skipped by callers.
+        return {"ok": True, "results": [], "db": str(db), "indexed": False,
+                "where": where}
+
+    # `x or default` silently rewrites a valid 0: `--top 0` would come back as 5
+    # and the daemon would disagree with the in-process path. Only None means
+    # "not supplied".
+    top_k = req.get("top_k")
+    min_score = req.get("min_score")
     search = cache.get(db)
     try:
         results = search.search(
@@ -360,7 +369,8 @@ def _handle(req: dict, cache: _IndexCache) -> dict:
             # Kept for clients written against the original shape.
             resp["files_without_metadata"] = e.count
         return resp
-    return {"ok": True, "results": results, "db": str(db), "indexed": True}
+    return {"ok": True, "results": results, "db": str(db), "indexed": True,
+            "where": where}
 
 
 def request(payload: dict, socket_path: str | Path | None = None,

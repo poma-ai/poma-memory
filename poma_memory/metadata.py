@@ -48,7 +48,7 @@ class MetadataNotIndexed(MetadataIncomplete):
     def __init__(self, count: int, db_path: str | os.PathLike | None = None,
                  examples: list[str] | None = None):
         self.count = count
-        self.db_path = str(db_path) if db_path is not None else None
+        self.db_path = os.path.abspath(str(db_path)) if db_path is not None else None
         self.examples = list(examples or [])
         where = f" in {self.db_path}" if self.db_path else ""
         # Name a few of them: the usual way to get stuck here is a file that no
@@ -214,7 +214,7 @@ class MetadataUnreadable(MetadataIncomplete):
                  db_path: str | os.PathLike | None = None):
         self.items = list(items)
         self.count = len(self.items)
-        self.db_path = str(db_path) if db_path is not None else None
+        self.db_path = os.path.abspath(str(db_path)) if db_path is not None else None
         self.examples = [fp for fp, _ in self.items]
         self.roots = sorted({r for _, r in self.items if r})
         super().__init__(
@@ -243,7 +243,7 @@ class MetadataStale(MetadataIncomplete):
         # the user runs it in the directory they are already in.
         self.items = list(items)
         self.count = len(self.items)
-        self.db_path = str(db_path) if db_path is not None else None
+        self.db_path = os.path.abspath(str(db_path)) if db_path is not None else None
         self.examples = [fp for fp, _ in self.items]
         self.roots = sorted({r for _, r in self.items if r})
         super().__init__(

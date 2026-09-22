@@ -787,3 +787,101 @@ def test_an_index_of_pure_stopwords_can_still_be_opened():
             assert hybrid.search("anything", top_k=3) == []
         finally:
             store.close()
+
+
+def test_an_ok_daemon_response_echoes_the_predicate_it_applied(mixed_dir):
+    """A daemon from before `where` existed ignores the key and returns the
+    whole corpus as `ok: true`. The echo is the only thing that lets a client
+    tell that answer from a filtered one, so every ok response carries it --
+    including the "no index here" one, or the client falls through to an
+    in-process search for nothing.
+    """
+    cache = _IndexCache()
+    resp = _handle({"op": "search", "query": "cosine similarity embeddings",
+                    "path": str(mixed_dir), "where": {"kind": "in"}}, cache)
+    assert resp["ok"]
+    assert resp["where"] == {"kind": "in"}
+
+    resp = _handle({"op": "search", "query": "cosine similarity embeddings",
+                    "path": str(mixed_dir)}, cache)
+    assert resp["ok"]
+    assert resp["where"] is None
+
+    with tempfile.TemporaryDirectory() as empty:
+        resp = _handle({"op": "search", "query": "anything",
+                        "path": empty, "where": {"kind": "in"}}, cache)
+    assert resp["ok"] and resp["indexed"] is False
+    assert resp["where"] == {"kind": "in"}
+
+
+def test_the_cli_searches_in_process_when_the_daemon_does_not_echo_the_predicate(capsys):
+    """Reproduced against a 0.5.0 daemon: `--where kind=lesson` printed four
+    files where the same query in-process printed one. The response looked
+    exactly like a filtered answer, so the CLI has to key on the echo.
+    """
+    import argparse
+
+    import poma_memory.api as api_mod
+    import poma_memory.server as server_mod
+
+    called = []
+    real_request = server_mod.request
+    real_search = api_mod.search
+
+    def old_daemon(payload, sock=None, timeout=10.0):
+        # What a pre-`where` daemon returns: the key ignored, the corpus whole.
+        return {"ok": True, "results": [{"file_path": "a.md", "score": 1.0,
+                                         "context": "", "chunk_ids": []}],
+                "db": "x", "indexed": True}
+
+    def in_process(*a, **kw):
+        called.append(kw)
+        return []
+
+    server_mod.request = old_daemon
+    api_mod.search = in_process
+    try:
+        from poma_memory.cli import _cmd_search
+        args = argparse.Namespace(
+            query="storage", path=".", db=None, top=5, min_score=0.0,
+            empty_gate=None, socket="/tmp/does-not-matter.sock",
+            as_json=True, where=["kind=lesson"])
+        _cmd_search(args)
+    finally:
+        server_mod.request = real_request
+        api_mod.search = real_search
+    assert len(called) == 1 and called[0]["where"] == {"kind": "lesson"}
+    assert json.loads(capsys.readouterr().out) == []
+
+    # Without a predicate the old daemon's answer IS the answer: no fall-through.
+    called.clear()
+    server_mod.request = old_daemon
+    api_mod.search = in_process
+    try:
+        from poma_memory.cli import _cmd_search
+        args = argparse.Namespace(
+            query="storage", path=".", db=None, top=5, min_score=0.0,
+            empty_gate=None, socket="/tmp/does-not-matter.sock",
+            as_json=True, where=None)
+        _cmd_search(args)
+    finally:
+        server_mod.request = real_request
+        api_mod.search = real_search
+    assert called == []
+    assert [r["file_path"] for r in json.loads(capsys.readouterr().out)] == ["a.md"]
+
+
+def test_a_refusal_names_the_database_by_an_absolute_path():
+    """`--db .agent/.poma-memory.db` was echoed as given, next to an absolute
+    directory. Run from another cwd, the printed `index ... --db` command
+    creates a fresh `.agent/` and an empty database there and the refusal
+    stays. The message must not depend on where it is read.
+    """
+    from poma_memory.metadata import MetadataStale, MetadataUnreadable
+
+    for exc in (MetadataNotIndexed(1, ".agent/.poma-memory.db", ["x.md"]),
+                MetadataStale([("x.md", "/r")], ".agent/.poma-memory.db"),
+                MetadataUnreadable([("x.md", "/r")], ".agent/.poma-memory.db")):
+        assert exc.db_path == os.path.abspath(".agent/.poma-memory.db")
+        assert " in .agent/" not in str(exc)
+        assert f" in {os.getcwd()}/.agent/.poma-memory.db" in str(exc)

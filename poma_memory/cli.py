@@ -246,7 +246,17 @@ def _cmd_search(args: argparse.Namespace) -> None:
                 "where": where,
             }, sock)
             if resp.get("ok"):
-                results = resp.get("results", [])
+                if where is not None and "where" not in resp:
+                    # A daemon from before `where` existed: it ignored the key
+                    # and answered for the WHOLE corpus, `ok: true`. The
+                    # session-start hook restarts a daemon whose version does
+                    # not match the installed one, but between a `pip install
+                    # -U` and the next session start the old one is still
+                    # serving. Not an answer to this question, so treat it as
+                    # no daemon and search in-process.
+                    results = None
+                else:
+                    results = resp.get("results", [])
             elif str(resp.get("code", "")) in _REFUSAL_CODES or str(
                     resp.get("code", "")).startswith("metadata_"):
                 # A real answer, not a daemon problem. Falling through to the

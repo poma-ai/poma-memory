@@ -29,6 +29,17 @@ class BM25Search:
         corpus = [cs["contents"] for cs in self._chunksets]
         corpus_tokens = bm25s.tokenize(corpus, stopwords="en", show_progress=False)
 
+        # An index whose every chunkset tokenizes to nothing -- a corpus of
+        # pure stopwords -- gives bm25s an empty vocabulary, and `BM25.index`
+        # raises `ValueError: max() iterable argument is empty`. That happens
+        # in `HybridSearch.__init__`, so it took out `search` and the daemon
+        # alike, filtered or not, on a corpus that is odd but perfectly legal.
+        # Leaving `_retriever` as None is what `search` already does for an
+        # empty index: BM25 contributes nothing, and the semantic side, which
+        # has no vocabulary, still answers.
+        if not getattr(corpus_tokens, "vocab", None):
+            return
+
         self._retriever = bm25s.BM25()
         self._retriever.index(corpus_tokens, show_progress=False)
 

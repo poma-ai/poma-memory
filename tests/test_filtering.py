@@ -763,3 +763,27 @@ def test_daemon_sees_a_rules_edit_although_its_cached_index_is_not_rebuilt():
         # And it recovers once the rules are applied.
         api.index(root)
         assert _handle({**req, "where": {"kind": "architecture"}}, cache)["ok"] is True
+
+
+def test_an_index_of_pure_stopwords_can_still_be_opened():
+    """Pre-existing, and not this branch's: `bm25s.BM25.index` raises
+    `ValueError: max() iterable argument is empty` on an empty vocabulary, and
+    it does so inside `HybridSearch.__init__`, so `search` and the daemon both
+    tracebacked on a corpus that is odd but legal. BM25 contributes nothing
+    here, which is what it already does for an empty index."""
+    from poma_memory.search import HybridSearch
+    from poma_memory.store import Store
+    from poma_memory.incremental import update_file
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        store = Store(root / ".poma-memory.db")
+        try:
+            for i in range(3):
+                f = root / f"f{i}.md"
+                f.write_text("the and of\n")
+                update_file(store, str(f))
+            hybrid = HybridSearch(store, enable_semantic=False)
+            assert hybrid.search("anything", top_k=3) == []
+        finally:
+            store.close()

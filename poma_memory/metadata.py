@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import stat as stat_module
 from pathlib import Path, PurePosixPath
 
 RULES_FILENAME = ".poma-metadata.json"
@@ -97,21 +98,40 @@ class MetadataStale(MetadataIncomplete):
         if shown and count > len(self.examples[:3]):
             shown += ", ..."
         detail = f" (e.g. {shown})" if shown else ""
-        # Naming `index` is useless when the reason a row is stuck is that the
-        # file cannot be READ: the run that would fix it is the run that just
-        # skipped it, and the remedy is on the filesystem, not in this tool.
-        unreadable = []
+        # Naming `index` is useless when the run that would fix a row is the
+        # run that just skipped it, so the remedy depends on WHY it is stuck --
+        # and the three cases need three different answers. A deleted file can
+        # be reached by no glob and no re-read: only `--prune` clears it, and
+        # telling that user to fix permissions (as the first cut did, because
+        # it caught bare OSError) points at a file that is not there.
+        #
+        # `os.stat` and `os.access`, never `open`: this runs inside an exception
+        # constructor on the search path, and opening a FIFO blocks forever
+        # waiting for a writer. Measured: >6 s and counting. A dead network
+        # mount does the same. `os.access` can disagree with real openability
+        # under ACLs or as root, which is acceptable in a diagnostic string and
+        # a hang is not.
+        gone, unreadable = [], []
         for path in self.examples:
             try:
-                with open(path, "rb"):
-                    pass
+                st = os.stat(path)
+            except FileNotFoundError:
+                gone.append(path)
+                continue
             except OSError:
                 unreadable.append(path)
-        if unreadable:
+                continue
+            if not stat_module.S_ISREG(st.st_mode) or not os.access(path, os.R_OK):
+                unreadable.append(path)
+        if gone:
+            remedy = (f" {len(gone)} of them no longer exist (e.g. {gone[0]}); "
+                      "no glob can reach a deleted file, so run `poma-memory "
+                      "index --prune` to remove them from the index.")
+        elif unreadable:
             remedy = (f" {len(unreadable)} of them cannot be read "
-                      f"(e.g. {unreadable[0]}); fix the permissions or remove "
-                      "the file, then re-run `poma-memory index` — the run "
-                      "cannot resolve a file it cannot open.")
+                      f"(e.g. {unreadable[0]}); fix the permissions, then "
+                      "re-run `poma-memory index` — the run cannot resolve a "
+                      "file it cannot open.")
         else:
             remedy = (" Run `poma-memory index` over the directory each one "
                       "came from (it re-reads metadata only; no re-chunking or "

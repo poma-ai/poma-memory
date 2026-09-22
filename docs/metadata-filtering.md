@@ -260,7 +260,20 @@ distinguishes them. So it refuses the outcome rather than trying to classify
 the cause — losing most of an index in one run is worth blocking whatever
 produced it, while deleting a handful of documents stays automatic.
 `prune=True` (`--prune`) is the explicit yes and `prune=False` (`--no-prune`)
-the explicit no, so a genuinely deleted subtree is never stuck in the index. `size_bytes` and `ctime` are what let an edit be noticed at all when
+the explicit no, so a genuinely deleted subtree is never stuck in the index —
+and the refusal a stale held-back row produces names `--prune` rather than a
+glob or a `chmod`, because neither of those can reach a file that is gone.
+
+Two details the first cut got wrong, both reproduced. The denominator counts
+only rows that existed BEFORE the run: counting everything the run scanned let
+files it was creating vouch for the ones it was about to delete, so eight new
+documents elsewhere in the tree pruned a vanished subtree silently. And a
+missing DIRECTORY is held whatever the proportion, because a purely
+proportional guard erodes — a subtree held back today is a minority of the
+index once the corpus grows, and would be pruned later with no warning at all.
+
+Below five missing files a run prunes regardless, so ordinary deletions in a
+small corpus are not a standing question. `size_bytes` and `ctime` are what let an edit be noticed at all when
 the timestamp was restored — see `incremental._stat_agrees`.
 
 ### 3.6 The pre-filter mechanism

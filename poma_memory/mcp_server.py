@@ -74,7 +74,8 @@ def poma_search(
 
 
 @mcp.tool()
-def poma_index(path: str = ".agent/", file: str | None = None, glob: str = "**/*.md") -> str:
+def poma_index(path: str = ".agent/", file: str | None = None,
+               glob: str = "**/*.md", prune: bool | None = None) -> str:
     """Index or re-index markdown files for semantic search.
 
     Supports incremental updates: only processes new content appended
@@ -84,6 +85,9 @@ def poma_index(path: str = ".agent/", file: str | None = None, glob: str = "**/*
         path: Directory to index (default: .agent/)
         file: Optional single file to index (for incremental updates)
         glob: File pattern to match (default: **/*.md)
+        prune: Remove indexed files that are gone from disk. None (default)
+            removes them unless that looks like a directory that failed to
+            mount rather than a deletion; True always removes; False never.
     """
     if file:
         from poma_memory.api import index_file
@@ -101,7 +105,7 @@ def poma_index(path: str = ".agent/", file: str | None = None, glob: str = "**/*
 
     from poma_memory.api import index as api_index
 
-    result = api_index(path=path, glob=glob)
+    result = api_index(path=path, glob=glob, prune=prune)
     summary = (
         f"Indexed {result['files_indexed']} files:"
         f" {result['chunks_created']} chunks,"
@@ -117,9 +121,9 @@ def poma_index(path: str = ".agent/", file: str | None = None, glob: str = "**/*
         # Deliberately loud: the index is missing most of its files and nothing
         # was deleted, which the agent has to know to interpret later searches.
         summary += (f" ({len(result['prune_held_back'])} indexed files are"
-                    " missing and were NOT removed — that is most of this"
-                    " index, so it looks like an unmounted directory rather"
-                    " than a deletion)")
+                    " missing and were NOT removed — it looks like a directory"
+                    " that failed to mount rather than a deletion. Call again"
+                    " with prune=True if they really are gone.)")
     return summary
 
 

@@ -1955,3 +1955,318 @@ def test_the_surfaces_say_when_removals_were_held_back():
             assert len(store.all_file_paths()) == 1
         finally:
             store.close()
+
+
+def test_new_files_do_not_vouch_for_the_rows_being_deleted():
+    """The threshold's denominator counted every file the run scanned,
+    including ones it was creating. Eight new documents elsewhere in the tree
+    raised it enough to prune an entire vanished subtree silently -- the exact
+    event the guard exists to stop."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        events = _many(root, 8, sub="events")
+        api.index(root)
+        shutil.rmtree(events)
+        _many(root, 8, sub="notes")          # the same run also finds these
+
+        result = api.index(root)
+        assert result["pruned"] == []
+        assert len(result["prune_held_back"]) == 8
+
+
+def test_a_held_back_subtree_does_not_erode_as_the_corpus_grows():
+    """A proportional guard alone lets a subtree held back today become a
+    minority of the index tomorrow and get pruned silently, with no warning at
+    all. A missing DIRECTORY is held whatever the proportion."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        events = _many(root, 6, sub="events")
+        api.index(root)
+        shutil.rmtree(events)
+        assert api.index(root)["pruned"] == []
+
+        _many(root, 60, sub="notes")         # corpus grows well past the ratio
+        result = api.index(root)
+        assert result["pruned"] == [], "the vanished directory must stay held"
+        assert len(result["prune_held_back"]) == 6
+        # And the escape still works.
+        assert len(api.index(root, prune=True)["pruned"]) == 6
+
+
+def test_the_refusal_names_prune_when_the_files_are_gone_not_unreadable():
+    """`MetadataStale` caught bare OSError, so a DELETED file read as
+    "unreadable" and the message told the user to fix permissions on a file
+    that is not there. No glob and no re-read can reach it; only --prune can."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _write_rules(root, _V1)
+        _two_kinds(root)
+        events = _many(root, 6, sub="gone")
+        api.index(root)
+        shutil.rmtree(events)
+        api.index(root)                       # held back, correctly
+        _write_rules(root, _V2)
+        api.index(root)
+
+        with pytest.raises(MetadataStale) as e:
+            api.search("sqlite", path=root, where={"kind": "architecture"})
+        assert "no longer exist" in str(e.value)
+        assert "--prune" in str(e.value)
+        assert "permissions" not in str(e.value)
+
+        api.index(root, prune=True)
+        api.search("sqlite", path=root, where={"kind": "architecture"})
+
+
+def test_the_stale_warning_names_prune_for_vanished_rows():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _write_rules(root, _V1)
+        _two_kinds(root)
+        gone = _many(root, 6, sub="gone")
+        api.index(root)
+        shutil.rmtree(gone)
+        api.index(root)
+        _write_rules(root, _V2)
+        result = api.index(root)
+        assert len(result["stale_rules"]) == 6
+
+
+def test_a_document_resolving_outside_the_root_is_not_indexed():
+    """A symlink out of the tree lands a row keyed on a path the prune scope
+    excludes, so it can never be removed or refreshed -- and a later rules edit
+    refuses every filtered search with no way out. `index_file` already refuses
+    this; the directory walk did not."""
+    with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as out:
+        root, outside = Path(td), Path(out)
+        (outside / "o0.md").write_text("# O\n\nsqlite outside\n")
+        (root / "a.md").write_text("# A\n\nsqlite inside\n")
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        os.symlink(outside / "o0.md", root / "linked.md")
+
+        api.index(root)
+        store = Store(root / ".poma-memory.db")
+        try:
+            names = {Path(p).name for p in store.all_file_paths()}
+        finally:
+            store.close()
+        assert names == {"a.md"}
+
+
+def test_the_exception_constructor_never_opens_a_file():
+    """It runs on the search path, and `open` on a FIFO blocks forever waiting
+    for a writer -- a hang inside an exception constructor. A dead network
+    mount does the same."""
+    import threading
+    with tempfile.TemporaryDirectory() as td:
+        fifo = Path(td) / "pipe.md"
+        os.mkfifo(fifo)
+        done = threading.Event()
+
+        def build():
+            str(MetadataStale(1, "/db", [str(fifo)]))
+            done.set()
+
+        threading.Thread(target=build, daemon=True).start()
+        assert done.wait(5), "MetadataStale blocked on a FIFO"
+        # A directory is not a readable document either, but must not be
+        # reported as missing.
+        d = Path(td) / "adir.md"
+        d.mkdir()
+        assert "cannot be read" in str(MetadataStale(1, "/db", [str(d)]))
+
+
+@pytest.mark.parametrize("prune", [True, False, None])
+def test_prune_never_overrides_the_root_and_scope_gates(prune):
+    """`prune=True` may only override the threshold. Both other gates are the
+    two reproduced data-loss paths, and no test covered them with the flag."""
+    with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as c:
+        ra, db = Path(a) / "A", Path(c) / "shared.sqlite"
+        ra.mkdir()
+        _many(ra, 3)
+        _write_rules(ra, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        api.index(ra, db_path=db)
+
+        with tempfile.TemporaryDirectory() as b:
+            rb = Path(b) / "B"
+            rb.mkdir()
+            _many(rb, 3)
+            _write_rules(rb, [{"glob": "**/*.md", "metadata": {"kind": "o"}}])
+            api.index(rb, db_path=db)
+        # B's whole tree is gone now; a run over A must not touch its rows.
+        assert api.index(ra, db_path=db, prune=prune)["pruned"] == []
+
+        shutil.rmtree(ra)                     # and an absent root prunes nothing
+        assert api.index(ra, db_path=db, prune=prune)["pruned"] == []
+        store = Store(db)
+        try:
+            assert len(store.all_file_paths()) == 6
+        finally:
+            store.close()
+
+
+def test_a_sibling_directory_with_a_shared_prefix_is_not_in_scope():
+    """The scope test is `commonpath`, not `startswith`: `/x/.agent` must not
+    take `/x/.agent-backup` rows as prune candidates."""
+    with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as c:
+        base, db = Path(td), Path(c) / "shared.sqlite"
+        main, sibling = base / "agent", base / "agent-backup"
+        for d in (main, sibling):
+            d.mkdir()
+            _many(d, 2)
+            _write_rules(d, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        api.index(main, db_path=db)
+        api.index(sibling, db_path=db)
+        shutil.rmtree(sibling)
+        assert api.index(main, db_path=db, prune=True)["pruned"] == []
+
+
+def test_ctime_is_recorded_so_the_re_read_is_a_one_off():
+    """Not recording it makes every run re-read every file forever."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "a.md").write_text("# A\n\nsqlite notes.\n")
+        _write_rules(root, [{"glob": "*.md", "metadata": {"kind": "note"}}])
+        api.index(root)
+        target = os.path.realpath(root / "a.md")
+        store = Store(root / ".poma-memory.db")
+        try:
+            assert store.get_file_record(target)["ctime"] == os.stat(target).st_ctime
+        finally:
+            store.close()
+
+        os.chmod(root / "a.md", 0o600)        # metadata-only: ctime moves
+        assert api.index(root)["files_indexed"] == 0
+        store = Store(root / ".poma-memory.db")
+        try:
+            assert store.get_file_record(target)["ctime"] == os.stat(target).st_ctime
+        finally:
+            store.close()
+        assert api.index(root)["files_indexed"] == 0     # and settles
+
+
+def test_the_legacy_backfill_reports_that_it_refreshed_metadata():
+    """The upgrade case is the one `metadata_refreshed` exists to report."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "a.md").write_text("# A\n\nsqlite notes.\n")
+        _write_rules(root, [{"glob": "*.md", "metadata": {"kind": "note"}}])
+        api.index(root)
+        store = Store(root / ".poma-memory.db")
+        store._conn.execute(
+            "UPDATE files SET metadata = '', size_bytes = 0, ctime = 0")
+        store._conn.commit()
+        store.close()
+        assert api.index(root)["metadata_refreshed"] is True
+
+
+def _prune_shape(pre: int, delete: int, add: int) -> dict:
+    """Index `pre` files in a subdirectory that SURVIVES, delete some, add some
+    new ones elsewhere, and return the second run's result.
+
+    The directory is deliberately left in place so that only the threshold
+    arithmetic decides — the missing-directory rule would otherwise hold
+    everything and hide which number is doing the work.
+    """
+    td = tempfile.mkdtemp()
+    root = Path(td)
+    _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+    docs = root / "docs"
+    docs.mkdir()
+    for i in range(pre):
+        (docs / f"f{i:03d}.md").write_text(f"# F{i}\n\nsqlite {i}\n")
+    api.index(root)
+    for i in range(delete):
+        os.remove(docs / f"f{i:03d}.md")
+    for i in range(add):
+        (root / f"new{i}.md").write_text(f"# N{i}\n\nsqlite new {i}\n")
+    try:
+        return api.index(root)
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def test_files_created_by_this_run_do_not_raise_the_threshold():
+    """The denominator counts rows that existed BEFORE the run. Counting
+    everything scanned let eight new documents disarm the guard protecting the
+    eight it was deleting."""
+    result = _prune_shape(pre=10, delete=8, add=8)
+    assert result["pruned"] == []
+    assert len(result["prune_held_back"]) == 8
+
+
+def test_a_minority_of_deletions_is_pruned_without_asking():
+    """The guard has to stay a safeguard rather than a standing question, so
+    losing a few documents out of many is automatic. Pins the denominator
+    against dropping either of its two terms."""
+    assert len(_prune_shape(pre=14, delete=6, add=0)["pruned"]) == 6
+    assert len(_prune_shape(pre=100, delete=6, add=0)["pruned"]) == 6
+
+
+def test_exactly_half_missing_is_not_most_of_the_index():
+    """Pins the boundary: the test is `>`, not `>=`."""
+    result = _prune_shape(pre=12, delete=6, add=0)
+    assert len(result["pruned"]) == 6
+    assert result["prune_held_back"] == []
+
+
+def test_most_of_the_index_missing_is_held_even_with_the_directory_intact():
+    result = _prune_shape(pre=10, delete=8, add=0)
+    assert result["pruned"] == []
+    assert len(result["prune_held_back"]) == 8
+
+
+def test_a_missing_directory_is_held_even_as_a_small_fraction():
+    """Isolates the missing-directory rule from the proportional one: six files
+    out of two hundred is far below the threshold, so only the directory check
+    can hold them. Without it the guard erodes as a corpus grows."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        _many(root, 200)
+        vanishing = _many(root, 6, sub="events")
+        api.index(root)
+        shutil.rmtree(vanishing)
+
+        result = api.index(root)
+        assert result["pruned"] == [], "a vanished directory must be held"
+        assert len(result["prune_held_back"]) == 6
+        assert len(api.index(root, prune=True)["pruned"]) == 6
+
+
+def test_the_stale_warning_names_prune_rather_than_a_glob_for_gone_rows():
+    """`index`'s own warning said "re-run with a glob that matches them" for
+    rows whose file is deleted, which no glob can reach."""
+    import io, contextlib
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _write_rules(root, _V1)
+        _two_kinds(root)
+        gone = _many(root, 6, sub="gone")
+        api.index(root)
+        shutil.rmtree(gone)
+        api.index(root)
+        _write_rules(root, _V2)
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            api.index(root)
+        assert "--prune" in buf.getvalue(), buf.getvalue()
+        assert "glob that matches them" not in buf.getvalue()
+
+
+def test_the_mcp_tool_can_actually_prune():
+    """It reports held-back removals; without a parameter the agent it is
+    telling cannot act on that."""
+    from poma_memory import mcp_server
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        vanishing = _many(root, 8, sub="events")
+        _many(root, 1)
+        api.index(root)
+        shutil.rmtree(vanishing)
+        assert "NOT removed" in mcp_server.poma_index(path=str(root))
+        out = mcp_server.poma_index(path=str(root), prune=True)
+        assert "8 removed" in out, out

@@ -114,6 +114,20 @@ def index(
                 # work. Skipping only unindexed ones keeps the default behaviour and
                 # removes the trap.
                 continue
+            try:
+                inside = os.path.commonpath([key, root_key]) == root_key
+            except ValueError:
+                inside = False
+            if not inside:
+                # `index_file` refuses exactly this below, for the same reason:
+                # `path` supplies the rules and is recorded as their source. A
+                # symlink pointing out of the tree lands a row that gate 2 then
+                # excludes from pruning forever, so it can never be removed or
+                # refreshed -- and a later rules edit refuses every filtered
+                # search with no way out.
+                print(f"poma-memory: {md_file} resolves to {key}, outside "
+                      f"{root_key}; skipped", file=sys.stderr)
+                continue
             seen.add(key)
             try:
                 result = update_file(
@@ -210,18 +224,30 @@ def index(
         # removes anything.
         held_back: list[str] = []
         if gone and prune is None:
-            tracked_here = len(candidates) + len(seen)
-            if len(gone) > max(_PRUNE_FLOOR, tracked_here // 2):
+            # PRE-EXISTING rows only. Counting `seen` whole let files this
+            # run created vouch for the ones it was about to delete: eight new
+            # documents elsewhere in the tree raised the denominator enough to
+            # prune an entire vanished subtree silently, which is the exact
+            # event this guard exists to stop.
+            tracked_here = len(candidates) + len(seen & tracked_set)
+            # A vanished DIRECTORY is held whatever the proportion. Otherwise
+            # the guard erodes: a subtree held back today becomes a minority of
+            # the index as the corpus grows and is pruned silently on some later
+            # run, with no warning at all. `--prune` still clears it.
+            lost_dirs = {os.path.dirname(fp) for fp in gone
+                         if _disk_state(os.path.dirname(fp)) != "present"}
+            if lost_dirs or len(gone) > max(_PRUNE_FLOOR, tracked_here // 2):
                 held_back, gone = gone, []
                 shown = ", ".join(held_back[:3]) + (
                     ", ..." if len(held_back) > 3 else "")
+                why = ("their directory is missing too" if lost_dirs
+                       else "that is most of this index")
                 print(
                     f"poma-memory: {len(held_back)} of {tracked_here} indexed "
-                    f"file(s) under {root_key} are missing ({shown}). That is "
-                    "most of this index, which is more like a directory that "
-                    "did not mount than a deletion, so nothing was removed. "
-                    "Re-run with --prune to remove them, or --no-prune to stop "
-                    "asking.", file=sys.stderr)
+                    f"file(s) under {root_key} are missing ({shown}) and "
+                    f"{why}, which looks more like a directory that did not "
+                    "mount than a deletion, so nothing was removed. Re-run "
+                    "with --prune to remove them.", file=sys.stderr)
         elif prune is False:
             held_back, gone = gone, []
 
@@ -254,9 +280,15 @@ def index(
                   f"on the current rule set ({e})", file=sys.stderr)
         if stale:
             shown = ", ".join(stale[:3]) + (", ..." if len(stale) > 3 else "")
-            print(f"poma-memory: {len(stale)} file(s) still hold metadata from an "
-                  f"earlier rule set and were not reached by this run ({shown}). "
-                  "Re-run with a glob that matches them.", file=sys.stderr)
+            # A row whose file is GONE cannot be reached by any glob, so telling
+            # the user to widen one sends them nowhere. `--prune` is the only
+            # thing that clears those.
+            vanished = [fp for fp in stale if _disk_state(fp) == "gone"]
+            how = ("Re-run with --prune to remove them."
+                   if vanished else "Re-run with a glob that matches them.")
+            print(f"poma-memory: {len(stale)} file(s) still hold metadata from "
+                  f"an earlier rule set and were not reached by this run "
+                  f"({shown}). " + how, file=sys.stderr)
 
         return {
             "files_indexed": files_indexed,
@@ -266,7 +298,7 @@ def index(
             "unreadable": unreadable,
             "stale_rules": stale,
             "pruned": pruned,
-        "prune_held_back": held_back,
+            "prune_held_back": held_back,
         }
     finally:
         store.close()

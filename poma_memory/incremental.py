@@ -167,7 +167,13 @@ def update_file(
                     meta_json, fm_unparsed, rules_hash, rules_root,
                     stat.st_size, stat.st_ctime,
                 )
-                return {"status": "unchanged"}
+                # A legacy row reaches this branch on the upgrade path -- no
+                # content change, but metadata written for the first time.
+                # Reporting False there hid the one case the flag exists for.
+                return {"status": "unchanged",
+                        "metadata_refreshed": not record
+                        or not record.get("metadata")
+                        or record.get("rules_hash") != rules_hash}
 
             return _incremental_update(
                 store, file_path, full_text, new_text, stat.st_mtime,

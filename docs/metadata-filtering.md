@@ -5,7 +5,7 @@ before ranking, how per-file metadata is resolved and kept honest, and what six
 rounds of review changed about it.
 
 Status: implemented on `feat/metadata-filtering` (PR #3). Written 2026-09-21
-against 0.5.0 (c2de15e); rev 7.
+against 0.5.0 (c2de15e); rev 8.
 
 It is kept because §2 and §8 are the parts that do not fit in code comments:
 §2 is the argument for the whole mechanism, and §8 is a record of five
@@ -17,7 +17,10 @@ Revision history: rev 4 recorded two corrections found while building it (§2,
 findings; rev 6 replaced the storage design after round five (`files.rules_root`,
 §3.1) and corrected §3.6/§3.7, which had described a cache that round five
 deleted; rev 7 moved this file out of the (gitignored) `.agent/PLANS/` into the
-repo, where the PR that cites it can actually reach it.
+repo, where the PR that cites it can actually reach it; rev 8 records round
+seven, which found this document already contradicting the code on the one
+behaviour that deletes data, two commits after rev 7 corrected it for the same
+reason.
 
 Revs 1-2 were built around a runbook repo as the driving consumer; the user has
 since said that repo may not use poma-memory at all and that megavibe is the
@@ -108,6 +111,8 @@ masking is for recall.
     ALTER TABLE files ADD COLUMN fm_unparsed INTEGER NOT NULL DEFAULT 0
     ALTER TABLE files ADD COLUMN rules_hash TEXT NOT NULL DEFAULT ''
     ALTER TABLE files ADD COLUMN rules_root TEXT NOT NULL DEFAULT ''
+    ALTER TABLE files ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0
+    ALTER TABLE files ADD COLUMN ctime REAL NOT NULL DEFAULT 0
 
 `files` is the natural home: metadata is per-file, and unlike
 `chunks`/`chunksets` it has no FTS5 external-content triggers hanging off it.
@@ -128,7 +133,7 @@ four inferred that from the database's location — rules live beside the
 database — which left every `--db` caller unchecked and made two roots sharing
 one database refuse forever, since neither run could restamp the other's rows.
 The row records the directory its rules came from, so the answer is carried
-rather than deduced, and the database's location stops being evidence. All four
+rather than deduced, and the database's location stops being evidence. All six
 columns migrate through `_migrate()`.
 
 **Deviation from rev 3, which said one new column.** `fm_unparsed` is a second.
@@ -234,8 +239,20 @@ re-chunk and re-embed, which is real money on the OpenAI backend.
 That makes both the upgrade path and the rule-edit path the same command
 callers already run: `poma-memory index`. No `--backfill-metadata` flag.
 
-A row whose file no longer exists on disk gets `'{}'` plus a warning line:
-leaving `''` would make completeness permanently unreachable.
+**A row whose file no longer exists on disk is PRUNED** — chunks, chunksets
+and the row. Earlier revisions stamped it `'{}'`; that left a deleted document
+answering searches, and a row no glob can reach can never be corrected, so
+whatever was stamped on it was permanent.
+
+Pruning is the only destructive operation in the package and is gated three
+ways, each of which was a reproduced way to delete live data: the run's own
+root must be present (an unmounted volume yields ENOENT, not "some other
+OSError", so every row under it read as deleted and a whole corpus went); only
+rows under that root are candidates (two roots may share one database, and a
+run given A must not delete B); and the disk state is re-checked immediately
+before each delete, because it was sampled for every row before any were
+removed. `size_bytes` and `ctime` are what let an edit be noticed at all when
+the timestamp was restored — see `incremental._stat_agrees`.
 
 ### 3.6 The pre-filter mechanism
 
@@ -444,18 +461,19 @@ are changes to the megavibe repo, not this one.
 - values that look like booleans or numbers stay strings.
 - front-matter overrides a path rule on the same key.
 
-## 7. Reported, not fixed
+## 7. Reported, then fixed here
 
-`incremental.py:_incremental_update` sets
-`existing_chunksets = len(store.get_all_chunksets())` — a **global** count —
-and offsets `chunkset_index` by it. That becomes the per-file `local_index`
-under `UNIQUE(file_path, local_index)`. `delete_file_data` removes rows, so the
-global count can decrease and later revisit a value a given file already used,
-raising an uncaught `sqlite3.IntegrityError`.
+**Superseded.** This section recorded `_incremental_update`'s global-count
+offset as latent, narrow and unreproduced, to be handled in a separate PR. It
+was none of those once pruning landed: removing a deleted file's chunksets is
+exactly what makes the global count fall, so the append path started reusing
+`local_index` values the file already held. Reproduced to a hard
+`sqlite3.IntegrityError` in six steps and fixed on this branch with the
+per-file `MAX(local_index) + 1` this section proposed.
 
-Reachability is narrow: the count must land on exactly a value that same file
-previously consumed. Not reproduced. The fix looks like one line — a per-file
-`MAX(local_index) + 1`, mirroring `get_max_local_index` for chunks. Separate PR.
+Worth keeping as written rather than deleting: "narrow, unreproduced" was a
+judgement about reachability made before a later change altered it, and the
+lesson is that such judgements expire.
 
 
 ## 8. Review rounds
@@ -576,7 +594,8 @@ complete and `index --file` crashed on the vanished path.
 
 The answer was to replace the mechanism rather than patch it a fifth time:
 `files.rules_root` (§3.1), which closes both at once and deletes the fallback
-and its "which side is current" hedging. Gone rows are stamped unconditionally.
+and its "which side is current" hedging. Gone rows were stamped
+unconditionally at that point; round seven replaced that with pruning (§3.5).
 
 That fix had the same shape of bug inside it too: `rules_root` was left out of
 `update_file`'s refresh test, so a row with metadata and a matching hash but no
@@ -653,7 +672,7 @@ membership drop catches it regardless. Commented at the call site.
   two clients naming one index differently take different locks over a shared
   `Store`.
 - `_incremental_update` offsets a per-file `local_index` by a global chunkset
-  count that `delete_file_data` can decrease — a latent
-  `UNIQUE(file_path, local_index)` violation. Narrow, unreproduced.
+  count that `delete_file_data` can decrease. Predated c2de15e, but pruning
+  made it reachable, so it was fixed here rather than left — see §7.
 
-All three predate c2de15e.
+The first two predate c2de15e and are still open.

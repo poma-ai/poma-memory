@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -1662,5 +1663,189 @@ def test_the_chunkset_index_sentinel_matches_the_chunk_one():
             assert store.get_max_local_index("/no/such/file.md") == -1
             assert store.get_max_chunkset_local_index(target) == 0
             assert _chunkset_indices(root)["a.md"][0] == 0
+        finally:
+            store.close()
+
+
+def test_an_absent_root_prunes_nothing():
+    """The unmounted-volume case. `_disk_state` maps FileNotFoundError to
+    "gone", and an unmounted volume is NOT "some other OSError" -- its contents
+    are ENOENT -- so every row under it read "gone" and the whole corpus was
+    deleted by an `index` run against a drive that was not mounted. The guard
+    this replaces only ever covered EACCES, which was never the risk."""
+    with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as td2:
+        root, db = Path(td) / "corpus", Path(td2) / "x.sqlite"
+        root.mkdir()
+        for i in range(3):
+            (root / f"f{i}.md").write_text(f"# F{i}\n\nsqlite {i}\n")
+        _write_rules(root, [{"glob": "*.md", "metadata": {"kind": "note"}}])
+        api.index(root, db_path=db)
+        store = Store(db)
+        before = len(store.all_file_paths())
+        store.close()
+        assert before == 3
+
+        shutil.rmtree(root)                 # the mountpoint is gone
+        result = api.index(root, db_path=db)
+        assert result["pruned"] == []
+        store = Store(db)
+        try:
+            assert len(store.all_file_paths()) == before
+        finally:
+            store.close()
+
+
+def test_the_errno_that_actually_prunes_is_the_one_under_test():
+    """Guards the test above against the mistake it exists to correct: an
+    earlier version asserted `chmod 000` (EACCES) and passed, while the
+    dangerous path was ENOENT."""
+    from poma_memory.api import _disk_state
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        sub = root / "noperm"
+        sub.mkdir()
+        (sub / "secret.md").write_text("x")
+        os.chmod(sub, 0o000)
+        try:
+            assert _disk_state(str(sub / "secret.md")) == "unknown"     # EACCES
+        finally:
+            os.chmod(sub, 0o755)
+        assert _disk_state(str(root / "never" / "existed.md")) == "gone"  # ENOENT
+
+
+def test_a_run_over_one_root_never_prunes_another_roots_rows():
+    """Two roots sharing a database is a configuration the README advertises.
+    A run given root A has no rules for root B, cannot see it, and must not
+    delete it -- renaming B's directory made an `index` of A destroy B's
+    index entirely."""
+    with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b, \
+            tempfile.TemporaryDirectory() as c:
+        ra, rb, db = Path(a) / "A", Path(b) / "B", Path(c) / "shared.sqlite"
+        for r in (ra, rb):
+            r.mkdir()
+            (r / "doc.md").write_text(f"# {r.name}\n\nsqlite in {r.name}\n")
+            _write_rules(r, [{"glob": "*.md", "metadata": {"kind": "note"}}])
+        api.index(ra, db_path=db)
+        api.index(rb, db_path=db)
+
+        os.rename(rb, Path(str(rb) + "-renamed"))
+        result = api.index(ra, db_path=db)
+        assert result["pruned"] == []
+        store = Store(db)
+        try:
+            assert len(store.all_file_paths()) == 2
+        finally:
+            store.close()
+
+
+def test_an_equal_length_edit_with_the_timestamp_restored_is_noticed():
+    """mtime and size together miss an in-place substitution of the same
+    length -- `sed -i` on a status token, then a restore. ctime moves on any
+    write, and `utime` itself bumps it, so it catches what the other two
+    cannot. (On Windows `st_ctime` is creation time and this degrades to the
+    mtime/size pair.)"""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        target = root / "a.md"
+        target.write_text("# A\n\nthe rollback is manual\n")
+        api.index(root)
+        before = os.stat(target)
+        replaced = target.read_text().replace("manual", "AUTOMA")
+        assert len(replaced) == len(target.read_text())
+        target.write_text(replaced)
+        os.utime(target, (before.st_atime, before.st_mtime))
+        assert os.stat(target).st_mtime == before.st_mtime
+        assert os.stat(target).st_size == before.st_size
+
+        api.index(root)
+        assert api.search("AUTOMA", path=root)
+        assert api.search("manual", path=root) == []
+
+
+def test_a_whitespace_only_append_does_not_cost_a_full_reindex_later():
+    """The fast path advanced byte_offset to the whole file but recorded the
+    OLD prefix's hash, breaking the invariant that content_hash describes the
+    span byte_offset names. The next real append then failed its prefix check
+    and re-chunked and re-embedded the entire file."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        log = root / "log.md"
+        log.write_text("# Log\n\n## E1\n\nfirst entry sqlite\n")
+        api.index(root)
+        with open(log, "a") as f:
+            f.write("\n\n   \n")
+        api.index(root)
+        with open(log, "a") as f:
+            f.write("\n## E2\n\nsecond entry sqlite\n")
+        result = api.index(root)
+        # The append path adds only the new chunks; a full reindex re-adds all.
+        assert result["chunks_created"] == 2, result
+
+
+def test_the_cli_and_mcp_say_when_documents_were_removed():
+    """Pruning is the one destructive thing `index` does, and it reported only
+    on stderr -- invisible to an MCP client's model, which sees the return
+    value alone."""
+    from poma_memory import cli, mcp_server
+    import io, contextlib
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        for n in ("keep.md", "drop.md"):
+            (root / n).write_text(f"# {n}\n\nsqlite {n}\n")
+        api.index(root)
+        os.remove(root / "drop.md")
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli._cmd_index(argparse.Namespace(
+                path=str(root), db=None, glob="**/*.md", file=None))
+        assert "1 removed" in buf.getvalue(), buf.getvalue()
+
+        # And the MCP surface, which is the one that matters most: its return
+        # value is all the calling model ever sees, and the prune lines go to
+        # stderr, which on a stdio server reaches the client's log instead.
+        (root / "second.md").write_text("# Second\n\nsqlite second\n")
+        api.index(root)
+        os.remove(root / "second.md")
+        out = mcp_server.poma_index(path=str(root))
+        assert "1 removed" in out, out
+
+
+def test_a_file_that_returns_before_its_turn_is_not_pruned(monkeypatch):
+    """Disk state is sampled for every candidate before any row is deleted, so
+    a file can come back between the sample and its own delete -- an editor
+    saving by unlink-and-rewrite during a long run. The re-check immediately
+    before the delete is what makes that survivable; without it the row goes
+    while the file exists."""
+    from poma_memory import api as api_mod
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        for n in ("a.md", "b.md"):
+            (root / n).write_text(f"# {n}\n\nsqlite {n}\n")
+        _write_rules(root, [{"glob": "*.md", "metadata": {"kind": "note"}}])
+        api.index(root)
+        target = os.path.realpath(root / "b.md")
+
+        real = api_mod._disk_state
+        calls: dict[str, int] = {}
+
+        def flaky(path: str) -> str:
+            if path == target:
+                calls[path] = calls.get(path, 0) + 1
+                # "gone" when sampled, back by the time we would delete it.
+                return "gone" if calls[path] == 1 else "present"
+            return real(path)
+
+        monkeypatch.setattr(api_mod, "_disk_state", flaky)
+        # A narrow glob, so b.md is not scanned this run and therefore reaches
+        # the prune candidates at all -- which is the situation the guard is
+        # for: a row this run did not touch.
+        result = api.index(root, glob="a.md")
+
+        assert calls[target] >= 2, "the delete must re-check, not trust the sample"
+        assert result["pruned"] == []
+        store = Store(root / ".poma-memory.db")
+        try:
+            assert target in store.all_file_paths()
         finally:
             store.close()

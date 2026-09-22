@@ -102,11 +102,18 @@ def poma_index(path: str = ".agent/", file: str | None = None, glob: str = "**/*
     from poma_memory.api import index as api_index
 
     result = api_index(path=path, glob=glob)
-    return (
+    summary = (
         f"Indexed {result['files_indexed']} files:"
         f" {result['chunks_created']} chunks,"
         f" {result['chunksets_created']} chunksets"
     )
+    # The agent calling this tool sees only what is returned; `index` writes the
+    # prune lines to stderr, which on a stdio MCP server reaches the client's
+    # log and not the model. Removing documents from the index is not something
+    # a caller should have to read a logfile to discover.
+    if result.get("pruned"):
+        summary += (f" ({len(result['pruned'])} removed: no longer on disk)")
+    return summary
 
 
 @mcp.tool()

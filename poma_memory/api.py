@@ -74,125 +74,162 @@ def index(
         db_path = path / ".poma-memory.db"
 
     store = Store(db_path)
-    rules, _ = load_rules(path)
-    new_hash = rules_hash(rules)
-    # Recorded on every row this run writes, so a later search re-reads THIS
-    # directory's rules for these files however the database is addressed.
-    root_key = os.path.realpath(path)
-    path_meta = resolve_paths(path, rules)
-
-    total_chunks = 0
-    total_chunksets = 0
-    files_indexed = 0
-    refreshed = False
-    seen: set[str] = set()
-    unreadable: list[str] = []
-
-    # Taken before the loop, so the dot-prefix rule below asks whether a row
-    # already existed rather than whether this run just made one.
-    tracked_set = set(store.all_file_paths())
-
-    for md_file in sorted(path.glob(glob)):
-        key = os.path.realpath(md_file)
-        if md_file.name.startswith(".") and key not in tracked_set:
-            # Dot-prefixed names are not indexed by this command. But once a row
-            # exists -- `index --file` puts one there -- refusing to revisit it
-            # leaves metadata that NO glob can ever backfill, so a filtered
-            # search refuses permanently and the remediation it prints cannot
-            # work. Skipping only unindexed ones keeps the default behaviour and
-            # removes the trap.
-            continue
-        seen.add(key)
-        try:
-            result = update_file(
-                store, str(md_file),
-                path_metadata=path_meta.get(key),
-                rules_hash=new_hash,
-                rules_root=root_key,
-            )
-        except (OSError, UnicodeDecodeError) as e:
-            # A dangling symlink or an unreadable file used to abort the whole
-            # run with an uncaught exception, skipping store.close(). One bad
-            # file should cost that file, not the index.
-            #
-            # UnicodeDecodeError is a ValueError, not an OSError, so catching
-            # OSError alone still let one Latin-1 byte in one document kill the
-            # run and lose every file already indexed. It also has no `strerror`.
-            unreadable.append(key)
-            seen.discard(key)
-            print(f"poma-memory: {md_file}: "
-                  f"{getattr(e, 'strerror', None) or e}; skipped",
-                  file=sys.stderr)
-            continue
-        if result["status"] == "unreadable":
-            unreadable.append(key)
-            seen.discard(key)
-            print(f"poma-memory: {md_file}: could not be read; metadata left "
-                  "unresolved", file=sys.stderr)
-            continue
-        refreshed = refreshed or result.get("metadata_refreshed", False)
-        if result["status"] in ("updated", "reindexed"):
-            files_indexed += 1
-            total_chunks += result.get("new_chunks", 0)
-            total_chunksets += result.get("new_chunksets", 0)
-
-    # Rows whose file is gone from disk are PRUNED — chunks, chunksets and the
-    # row itself. Keeping their content meant a deleted or renamed document went
-    # on answering searches, including filtered ones, where a caller narrowing to
-    # `kind=decision` reasonably reads the result as the current decision set.
-    #
-    # `fp not in seen` is NOT enough to call a row orphaned: this run may have
-    # been given a narrower `glob` than the one that indexed it, and a file that
-    # still exists has simply not been scanned yet. `_disk_state` answers the
-    # actual question, and only "gone" — FileNotFoundError — prunes. A
-    # permission error or an unmounted volume reads as "unknown" and is left
-    # entirely alone, because deleting a corpus because a disk was not mounted
-    # is not a recoverable mistake.
-    #
-    # Pruning also removes the whole class of problem that stamping these rows
-    # created: a row that no glob can reach, because the file does not exist,
-    # cannot be refreshed, so any metadata left on it is permanent. There is
-    # nothing left to be stale.
-    states = {fp: _disk_state(fp) for fp in store.all_file_paths()
-              if fp not in seen}
-    gone = [fp for fp, st in states.items() if st == "gone"]
-    for fp in gone:
-        store.delete_file_data(fp)
-        print(f"poma-memory: {fp} is no longer on disk; removed from the index",
-              file=sys.stderr)
-
-    # Rows this run did not reach — a narrower glob, a name `index()` skips, a
-    # file it could not read. Their metadata is whatever an earlier rule set
-    # produced. Per-file hashes mean the next run that reaches them fixes it,
-    # but nothing would otherwise say the rule set is only partly applied.
-    #
-    # Advisory, and it re-reads OTHER roots' rules files: rows in a shared
-    # database point wherever they came from. A corrupt rules file over there
-    # must not take down an indexing run over here, which has already done its
-    # work and committed it — so this reports and continues rather than
-    # raising past `store.close()`.
-    stale: list[str] = []
     try:
-        stale = stale_files(store.scanned_rows_rules())
-    except MetadataIncomplete as e:
-        print(f"poma-memory: could not check whether other indexed files are "
-              f"on the current rule set ({e})", file=sys.stderr)
-    if stale:
-        shown = ", ".join(stale[:3]) + (", ..." if len(stale) > 3 else "")
-        print(f"poma-memory: {len(stale)} file(s) still hold metadata from an "
-              f"earlier rule set and were not reached by this run ({shown}). "
-              "Re-run with a glob that matches them.", file=sys.stderr)
+        rules, _ = load_rules(path)
+        new_hash = rules_hash(rules)
+        # Recorded on every row this run writes, so a later search re-reads THIS
+        # directory's rules for these files however the database is addressed.
+        root_key = os.path.realpath(path)
+        path_meta = resolve_paths(path, rules)
 
-    store.close()
-    return {
-        "files_indexed": files_indexed,
-        "chunks_created": total_chunks,
-        "chunksets_created": total_chunksets,
-        "metadata_refreshed": refreshed,
-        "unreadable": unreadable,
-        "stale_rules": stale,
-        "pruned": gone,
-    }
+        total_chunks = 0
+        total_chunksets = 0
+        files_indexed = 0
+        refreshed = False
+        seen: set[str] = set()
+        unreadable: list[str] = []
+
+        # Taken before the loop, so the dot-prefix rule below asks whether a row
+        # already existed rather than whether this run just made one.
+        tracked_set = set(store.all_file_paths())
+
+        for md_file in sorted(path.glob(glob)):
+            key = os.path.realpath(md_file)
+            if md_file.name.startswith(".") and key not in tracked_set:
+                # Dot-prefixed names are not indexed by this command. But once a row
+                # exists -- `index --file` puts one there -- refusing to revisit it
+                # leaves metadata that NO glob can ever backfill, so a filtered
+                # search refuses permanently and the remediation it prints cannot
+                # work. Skipping only unindexed ones keeps the default behaviour and
+                # removes the trap.
+                continue
+            seen.add(key)
+            try:
+                result = update_file(
+                    store, str(md_file),
+                    path_metadata=path_meta.get(key),
+                    rules_hash=new_hash,
+                    rules_root=root_key,
+                )
+            except (OSError, UnicodeDecodeError) as e:
+                # A dangling symlink or an unreadable file used to abort the whole
+                # run with an uncaught exception, skipping store.close(). One bad
+                # file should cost that file, not the index.
+                #
+                # UnicodeDecodeError is a ValueError, not an OSError, so catching
+                # OSError alone still let one Latin-1 byte in one document kill the
+                # run and lose every file already indexed. It also has no `strerror`.
+                unreadable.append(key)
+                seen.discard(key)
+                print(f"poma-memory: {md_file}: "
+                      f"{getattr(e, 'strerror', None) or e}; skipped",
+                      file=sys.stderr)
+                continue
+            if result["status"] == "unreadable":
+                unreadable.append(key)
+                seen.discard(key)
+                print(f"poma-memory: {md_file}: could not be read; metadata left "
+                      "unresolved", file=sys.stderr)
+                continue
+            refreshed = refreshed or result.get("metadata_refreshed", False)
+            if result["status"] in ("updated", "reindexed"):
+                files_indexed += 1
+                total_chunks += result.get("new_chunks", 0)
+                total_chunksets += result.get("new_chunksets", 0)
+
+        # Rows whose file is gone from disk are PRUNED — chunks, chunksets and the
+        # row itself. Keeping their content meant a deleted or renamed document went
+        # on answering searches, including filtered ones, where a caller narrowing to
+        # `kind=decision` reasonably reads the result as the current decision set.
+        #
+        # This is the only destructive operation in the package, and losing a row
+        # costs a re-chunk AND a re-embed of it — real money on a paid embedder, and
+        # more than that, because a single NULL embedding makes the semantic index
+        # re-embed every chunkset it holds. So it is gated three ways, each of which
+        # was a reproduced way to delete live data:
+        #
+        # 1. THE ROOT MUST BE PRESENT. `_disk_state` maps FileNotFoundError to
+        #    "gone", and an unmounted volume is not "some other OSError" — its
+        #    contents are ENOENT, so every row under it read "gone" and the whole
+        #    corpus was deleted by an `index` run against a drive that was not
+        #    mounted. The earlier guard only ever covered EACCES, which was never
+        #    the dangerous errno.
+        # 2. ONLY ROWS UNDER THIS RUN'S ROOT. `all_file_paths()` is the whole
+        #    database, and two roots may share one (`--db`, and the README
+        #    advertises it). A run given root A has no rules for root B, cannot see
+        #    it, and must not delete it — renaming B's directory made an `index` of
+        #    A destroy B's index entirely.
+        # 3. RE-CHECKED IMMEDIATELY BEFORE THE DELETE, because the state was
+        #    sampled for every row before any of them were deleted, and an editor
+        #    saving atomically inside that window would lose a file that exists.
+        #
+        # `fp not in seen` alone is NOT authority to delete: this run may have been
+        # given a narrower `glob`, and a file that still exists has simply not been
+        # scanned. `_disk_state` answers the real question.
+        root_present = _disk_state(root_key) == "present"
+        candidates = []
+        if root_present:
+            for fp in store.all_file_paths():
+                if fp in seen:
+                    continue
+                try:
+                    under_root = os.path.commonpath([fp, root_key]) == root_key
+                except ValueError:
+                    under_root = False      # different drives on Windows
+                if under_root:
+                    candidates.append(fp)
+        elif store.all_file_paths():
+            print(f"poma-memory: {root_key} is not present; skipping the check for "
+                  "indexed files that have been deleted", file=sys.stderr)
+
+        # Sampled for every candidate first, so the set being deleted is decided
+        # from one consistent view...
+        gone = [fp for fp in candidates if _disk_state(fp) == "gone"]
+
+        pruned: list[str] = []
+        for fp in gone:
+            # ...then re-checked here, because deleting the first row takes time and
+            # the file may have come back before this one's turn.
+            if _disk_state(fp) != "gone":
+                continue
+            store.delete_file_data(fp)
+            pruned.append(fp)
+            print(f"poma-memory: {fp} is no longer on disk; removed from the index",
+                  file=sys.stderr)
+
+        # Rows this run did not reach — a narrower glob, a name `index()` skips, a
+        # file it could not read. Their metadata is whatever an earlier rule set
+        # produced. Per-file hashes mean the next run that reaches them fixes it,
+        # but nothing would otherwise say the rule set is only partly applied.
+        #
+        # Advisory, and it re-reads OTHER roots' rules files: rows in a shared
+        # database point wherever they came from. A corrupt rules file over there
+        # must not take down an indexing run over here, which has already done its
+        # work and committed it — so this reports and continues rather than
+        # raising past `store.close()`.
+        stale: list[str] = []
+        try:
+            stale = stale_files(store.scanned_rows_rules())
+        except MetadataIncomplete as e:
+            print(f"poma-memory: could not check whether other indexed files are "
+                  f"on the current rule set ({e})", file=sys.stderr)
+        if stale:
+            shown = ", ".join(stale[:3]) + (", ..." if len(stale) > 3 else "")
+            print(f"poma-memory: {len(stale)} file(s) still hold metadata from an "
+                  f"earlier rule set and were not reached by this run ({shown}). "
+                  "Re-run with a glob that matches them.", file=sys.stderr)
+
+        return {
+            "files_indexed": files_indexed,
+            "chunks_created": total_chunks,
+            "chunksets_created": total_chunksets,
+            "metadata_refreshed": refreshed,
+            "unreadable": unreadable,
+            "stale_rules": stale,
+            "pruned": pruned,
+        }
+    finally:
+        store.close()
 
 
 def index_file(
@@ -233,23 +270,25 @@ def index_file(
         )
 
     store = Store(db_path)
-    rules, _ = load_rules(path)
-    path_meta = resolve_paths(path, rules)
-    if Path(file).name.startswith("."):
-        # `index()` does not pick dot-prefixed names up on its own, so this
-        # command is what puts the row there. Once it exists `index` does
-        # revisit it, which is what keeps a rule edit from stranding it.
-        print(f"poma-memory: {file} starts with '.'; `poma-memory index` "
-              "will not discover it on its own, but will keep this row "
-              "up to date now that it exists", file=sys.stderr)
-    result = update_file(
-        store, str(file),
-        path_metadata=path_meta.get(file_real),
-        rules_hash=rules_hash(rules),
-        rules_root=os.path.realpath(path),
-    )
-    store.close()
-    return result
+    try:
+        rules, _ = load_rules(path)
+        path_meta = resolve_paths(path, rules)
+        if Path(file).name.startswith("."):
+            # `index()` does not pick dot-prefixed names up on its own, so this
+            # command is what puts the row there. Once it exists `index` does
+            # revisit it, which is what keeps a rule edit from stranding it.
+            print(f"poma-memory: {file} starts with '.'; `poma-memory index` "
+                  "will not discover it on its own, but will keep this row "
+                  "up to date now that it exists", file=sys.stderr)
+        result = update_file(
+            store, str(file),
+            path_metadata=path_meta.get(file_real),
+            rules_hash=rules_hash(rules),
+            rules_root=os.path.realpath(path),
+        )
+        return result
+    finally:
+        store.close()
 
 
 def search(
@@ -321,13 +360,17 @@ def status(
                 "unparsed_frontmatter": [], "stale_rules": []}
 
     store = Store(db_path)
-    info = store.status()
     try:
-        info["stale_rules"] = stale_files(store.scanned_rows_rules())
-    except MetadataRulesError as e:
-        # `status` reports; it does not fail. An unreadable rules file is
-        # itself the thing worth showing.
-        info["stale_rules"] = []
-        info["rules_error"] = str(e)
-    store.close()
-    return info
+        info = store.status()
+        try:
+            info["stale_rules"] = stale_files(store.scanned_rows_rules())
+        except MetadataRulesError as e:
+            # `status` reports; it does not fail. An unreadable rules file is
+            # itself the thing worth showing.
+            info["stale_rules"] = []
+            info["rules_error"] = str(e)
+        return info
+    finally:
+        store.close()
+
+

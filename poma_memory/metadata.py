@@ -97,12 +97,29 @@ class MetadataStale(MetadataIncomplete):
         if shown and count > len(self.examples[:3]):
             shown += ", ..."
         detail = f" (e.g. {shown})" if shown else ""
+        # Naming `index` is useless when the reason a row is stuck is that the
+        # file cannot be READ: the run that would fix it is the run that just
+        # skipped it, and the remedy is on the filesystem, not in this tool.
+        unreadable = []
+        for path in self.examples:
+            try:
+                with open(path, "rb"):
+                    pass
+            except OSError:
+                unreadable.append(path)
+        if unreadable:
+            remedy = (f" {len(unreadable)} of them cannot be read "
+                      f"(e.g. {unreadable[0]}); fix the permissions or remove "
+                      "the file, then re-run `poma-memory index` — the run "
+                      "cannot resolve a file it cannot open.")
+        else:
+            remedy = (" Run `poma-memory index` over the directory each one "
+                      "came from (it re-reads metadata only; no re-chunking or "
+                      "re-embedding).")
         super().__init__(
             f"{count} indexed file(s){where} still hold metadata resolved "
             f"against an earlier rule set{detail}, so a metadata filter would "
-            "answer from rules that are no longer in effect. Run `poma-memory "
-            "index` over the directory each one came from (it re-reads metadata "
-            "only; no re-chunking or re-embedding)."
+            "answer from rules that are no longer in effect." + remedy
         )
 
 

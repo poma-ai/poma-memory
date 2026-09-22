@@ -110,9 +110,15 @@ def _cmd_index(args: argparse.Namespace) -> None:
         except MetadataRulesError as e:
             print(f"poma-memory: {e}", file=sys.stderr)
             raise SystemExit(2)
-        print(f"Indexed {result['files_indexed']} files:"
-              f" {result['chunks_created']} chunks,"
-              f" {result['chunksets_created']} chunksets")
+        summary = (f"Indexed {result['files_indexed']} files:"
+                   f" {result['chunks_created']} chunks,"
+                   f" {result['chunksets_created']} chunksets")
+        # Pruning is the one thing this command does that destroys data. On
+        # stderr alone it is invisible to anything reading stdout.
+        if result.get("pruned"):
+            summary += (f" ({len(result['pruned'])} removed:"
+                        " no longer on disk)")
+        print(summary)
 
 
 def _parse_where(pairs: list[str] | None) -> dict | None:

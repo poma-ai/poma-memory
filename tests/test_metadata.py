@@ -1568,3 +1568,99 @@ def test_an_unmounted_or_unreadable_parent_never_prunes():
         store = Store(root / ".poma-memory.db")
         assert target in store.all_file_paths()
         store.close()
+
+
+def _chunkset_indices(root: Path) -> dict:
+    store = Store(root / ".poma-memory.db")
+    try:
+        rows = store._conn.execute(
+            "SELECT file_path, local_index FROM chunksets "
+            "ORDER BY file_path, local_index").fetchall()
+    finally:
+        store.close()
+    out: dict = {}
+    for r in rows:
+        out.setdefault(Path(r["file_path"]).name, []).append(r["local_index"])
+    return out
+
+
+def test_appending_after_a_prune_does_not_collide_on_local_index():
+    """`local_index` is UNIQUE per file, but the append path offset it by the
+    GLOBAL chunkset count. While the corpus only grew that produced gaps; once
+    pruning removes chunksets the count falls, later appends reuse indices the
+    file already holds, and the insert dies mid-run with an IntegrityError."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "a.md").write_text("# A\n\nalpha one\n\n## S2\n\nalpha two\n")
+        (root / "b.md").write_text(
+            "# B\n\nbeta one\n\n## S2\n\nbeta two\n\n## S3\n\nbeta three\n")
+        api.index(root)
+        with open(root / "a.md", "a") as f:
+            f.write("\n## S3\n\nalpha three\n")
+        api.index(root)
+
+        os.remove(root / "b.md")
+        api.index(root)                      # prunes b.md, count drops
+
+        for n, sec in enumerate(["S4", "S5", "S6", "S7"], start=4):
+            with open(root / "a.md", "a") as f:
+                f.write(f"\n## {sec}\n\nalpha {n}\n")
+            api.index(root)                  # raised IntegrityError at S6
+
+        got = _chunkset_indices(root)["a.md"]
+        assert got == list(range(len(got))), got
+        assert api.search("alpha", path=root)
+
+
+def test_each_file_keeps_its_own_chunkset_sequence():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        for name in ("a.md", "b.md"):
+            (root / name).write_text(f"# {name}\n\n{name} one\n")
+        api.index(root)
+        for name in ("a.md", "b.md", "a.md"):
+            with open(root / name, "a") as f:
+                f.write(f"\n## More\n\n{name} again\n")
+            api.index(root)
+        got = _chunkset_indices(root)
+        for name, indices in got.items():
+            assert indices == list(range(len(indices))), (name, indices)
+
+
+def test_a_database_with_gapped_indices_heals_instead_of_colliding():
+    """`max + 1` is correct over a sequence that already has holes, so an
+    index written by the old code continues rather than needing a migration."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "a.md").write_text("# A\n\nalpha one\n\n## S2\n\nalpha two\n")
+        api.index(root)
+        store = Store(root / ".poma-memory.db")
+        store._conn.execute(
+            "UPDATE chunksets SET local_index = 99 WHERE local_index = 1")
+        store._conn.commit()
+        store.close()
+        assert _chunkset_indices(root)["a.md"] == [0, 99]
+
+        with open(root / "a.md", "a") as f:
+            f.write("\n## S3\n\nalpha three\n")
+        api.index(root)
+        assert _chunkset_indices(root)["a.md"] == [0, 99, 100]
+
+
+def test_the_chunkset_index_sentinel_matches_the_chunk_one():
+    """-1 for a file with no chunksets, so the first one it gets is 0. Mirrors
+    `get_max_local_index`; a 0 sentinel would start the sequence at 1 and leave
+    a permanent hole at the front."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "a.md").write_text("# A\n\nalpha one\n")
+        api.index(root)
+        store = Store(root / ".poma-memory.db")
+        try:
+            target = os.path.realpath(root / "a.md")
+            assert store.get_max_chunkset_local_index("/no/such/file.md") == -1
+            assert store.get_max_local_index("/no/such/file.md") == -1
+            assert store.get_max_chunkset_local_index(target) == 0
+            assert _chunkset_indices(root)["a.md"][0] == 0
+        finally:
+            store.close()

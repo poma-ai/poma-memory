@@ -306,6 +306,18 @@ class Store:
         ).fetchone()
         return row["m"] if row and row["m"] is not None else -1
 
+    def get_max_chunkset_local_index(self, file_path: str) -> int:
+        """Highest chunkset `local_index` for one file, or -1 if it has none.
+
+        The per-file counterpart of `get_max_local_index`. `local_index` is
+        unique per file, so an append has to continue THIS file's sequence.
+        """
+        row = self._conn.execute(
+            "SELECT MAX(local_index) as m FROM chunksets WHERE file_path = ?",
+            (file_path,),
+        ).fetchone()
+        return row["m"] if row and row["m"] is not None else -1
+
     def get_last_heading_chunk(self, file_path: str) -> dict | None:
         """Get the last chunk that looks like a heading (depth <= 1)."""
         row = self._conn.execute(

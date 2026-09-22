@@ -220,12 +220,24 @@ def _incremental_update(
     # Store new chunks
     store.insert_chunks(file_path, new_chunks)
 
-    # Build chunksets for new chunks only
+    # Build chunksets for new chunks only, continuing THIS file's sequence.
+    #
+    # It used to offset by the global chunkset count, against a column that is
+    # `UNIQUE(file_path, local_index)` — per file. While the corpus only grew
+    # that produced gaps and out-of-order indices but no error; once anything
+    # removes chunksets the count goes down, later appends reuse indices this
+    # file already holds, and the insert dies with an IntegrityError mid-run.
+    # Deleting a file now prunes its chunksets, so the count really does fall.
+    # Reproduced: a.md at [0, 1, 5] after a delete, then appends landing on
+    # 3, 4, and finally 5 again.
+    #
+    # `max + 1` is what the chunk path above already does, and it is correct
+    # over gapped sequences too, so existing databases heal rather than needing
+    # a migration.
     new_chunksets = chunks_to_chunksets(new_chunks)
-    # Offset chunkset indices
-    existing_chunksets = len(store.get_all_chunksets())
+    max_cs = store.get_max_chunkset_local_index(file_path)
     for cs in new_chunksets:
-        cs["chunkset_index"] = existing_chunksets + cs["chunkset_index"]
+        cs["chunkset_index"] = max_cs + 1 + cs["chunkset_index"]
     store.insert_chunksets(file_path, new_chunksets)
 
     store.upsert_file_record(

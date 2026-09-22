@@ -89,10 +89,15 @@ class MetadataStale(MetadataIncomplete):
     """
 
     def __init__(self, count: int, db_path: str | os.PathLike | None = None,
-                 examples: list[str] | None = None):
+                 examples: list[str] | None = None,
+                 roots: list[str] | None = None):
         self.count = count
         self.db_path = str(db_path) if db_path is not None else None
         self.examples = list(examples or [])
+        # The directories the stale rows were indexed FROM. Without them the
+        # remedy can only name a flag, and the user runs it in the directory
+        # they are already in, where the scope gate makes it a no-op.
+        self.roots = [r for r in (roots or []) if r]
         where = f" in {self.db_path}" if self.db_path else ""
         shown = ", ".join(self.examples[:3])
         if shown and count > len(self.examples[:3]):
@@ -124,9 +129,34 @@ class MetadataStale(MetadataIncomplete):
             if not stat_module.S_ISREG(st.st_mode) or not os.access(path, os.R_OK):
                 unreadable.append(path)
         if gone:
+            # Print the command, whole. Two earlier cuts of this message were
+            # not merely unhelpful but actively wrong, and the second was worse
+            # than the first:
+            #
+            #   "run `poma-memory index`"          -- the run that would fix a
+            #       row is the run that just skipped it.
+            #   "run `index <dir> --prune`"        -- `index` deliberately will
+            #       not prune from a directory it cannot see, AND the default
+            #       database lives inside that directory, so the command
+            #       RECREATED the directory the user had deleted, left an empty
+            #       database in it, printed "Indexed 0 files", and the refusal
+            #       repeated unchanged.
+            #
+            # `forget` is the command that works, and it only works with the
+            # right database, which after a `mv` is not where the row's path
+            # says. Both halves or neither.
+            db = f" --db {self.db_path}" if self.db_path else ""
+            if len(self.roots) == 1:
+                each = f"`poma-memory forget {self.roots[0]}{db}`"
+            elif self.roots:
+                each = (f"`poma-memory forget <dir>{db}` for each of "
+                        + ", ".join(self.roots[:3]))
+            else:
+                each = f"`poma-memory forget <dir>{db}`"
             remedy = (f" {len(gone)} of them no longer exist (e.g. {gone[0]}); "
-                      "no glob can reach a deleted file, so run `poma-memory "
-                      "index --prune` to remove them from the index.")
+                      "no glob and no re-read can reach a deleted file, and "
+                      "`index --prune` will not remove rows for a directory it "
+                      f"cannot see. Run {each} to drop them.")
         elif unreadable:
             remedy = (f" {len(unreadable)} of them cannot be read "
                       f"(e.g. {unreadable[0]}); fix the permissions, then "
@@ -247,6 +277,31 @@ def rules_hash(rules: list[dict]) -> str:
     return hashlib.sha256(
         json.dumps(rules, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def stale_by_root(rows: list[tuple[str, str, str]]) -> dict[str, list[str]]:
+    """`stale_files`, grouped by the directory whose rules produced each row.
+
+    The remedy for a stale row depends on WHERE it came from, so the caller
+    needs the root and not only the path: a row from a directory that no longer
+    exists is cleared by `forget <that directory> --db <this database>`, and
+    naming either half without the other sends the user somewhere that does
+    nothing. A row with no recorded root groups under ''.
+    """
+    by_root: dict[str, list[tuple[str, str]]] = {}
+    for file_path, root, stored in rows:
+        by_root.setdefault(root, []).append((file_path, stored))
+
+    out: dict[str, list[str]] = {}
+    for root, items in by_root.items():
+        if not root:
+            out.setdefault("", []).extend(fp for fp, _ in items)
+            continue
+        current = rules_hash(load_rules(root)[0])
+        bad = sorted(fp for fp, stored in items if stored != current)
+        if bad:
+            out[root] = bad
+    return {k: v for k, v in out.items() if v}
 
 
 def stale_files(rows: list[tuple[str, str, str]]) -> list[str]:

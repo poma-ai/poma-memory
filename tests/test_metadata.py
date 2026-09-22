@@ -14,7 +14,8 @@ import pytest
 from poma_memory import api
 from poma_memory.frontmatter import parse
 from poma_memory.metadata import (
-    MetadataNotIndexed, MetadataStale,
+    RULES_FILENAME,
+    MetadataIncomplete, MetadataNotIndexed, MetadataStale,
     stale_files,
     MetadataRulesError, load_rules, merge, matches, normalize_where,
     resolve_paths, rules_hash,
@@ -1452,10 +1453,18 @@ def test_the_id_lookup_really_issues_one_query_per_batch():
             store.close()
 
 
-def test_a_row_whose_metadata_is_not_an_object_matches_nothing():
+@pytest.mark.parametrize("blob", ["[1, 2]", "not json at all", '"a string"'])
+def test_a_row_whose_metadata_is_not_an_object_is_refused(blob):
     """`metadata` is opaque JSON, and nothing stops a hand-edited row or a
     third-party writer putting a list there. `matches()` would raise on it, so
-    the guard has to exclude rather than admit."""
+    it cannot simply be admitted -- but the first cut skipped it instead, and
+    skipping is the failure this feature exists to remove: the row passed the
+    completeness check, so the document silently left every filtered result and
+    the caller got an answer indistinguishable from a correct one.
+
+    Refusing is what every other untrustworthy-metadata state here does, and
+    `MetadataNotIndexed` already stops the whole index's filtered searches for
+    one unscanned row. The remedy is the same re-index."""
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         _two_kinds(root)
@@ -1464,13 +1473,17 @@ def test_a_row_whose_metadata_is_not_an_object_matches_nothing():
         target = os.path.realpath(root / "DECISIONS.md")
         store = Store(root / ".poma-memory.db")
         record = store.get_file_record(target)
-        store.set_file_metadata(target, "[1, 2]", False,
+        store.set_file_metadata(target, blob, False,
                                 record["rules_hash"], record["rules_root"])
         store.close()
-        # No raise, and the malformed row is simply not a match.
-        hits = api.search("sqlite", path=root, where={"kind": "decision"})
-        assert [Path(h["file_path"]).name for h in hits] == []
-        assert api.search("sqlite", path=root, where={"kind": "event"})
+        with pytest.raises(MetadataIncomplete) as e:
+            api.search("sqlite", path=root, where={"kind": "decision"})
+        assert "DECISIONS.md" in str(e.value)
+        # An unfiltered search is unaffected: it reads no metadata at all.
+        assert api.search("sqlite", path=root)
+        # And `index` rewrites the row, so the refusal is not a dead end.
+        api.index(root)
+        assert api.search("sqlite", path=root, where={"kind": "decision"})
 
 
 def test_the_batch_size_stays_under_the_oldest_parameter_limit():
@@ -1667,12 +1680,27 @@ def test_the_chunkset_index_sentinel_matches_the_chunk_one():
             store.close()
 
 
-def test_an_absent_root_prunes_nothing():
+@pytest.mark.parametrize("prune", [True, False, None])
+def test_an_absent_root_prunes_nothing(prune, capsys):
     """The unmounted-volume case. `_disk_state` maps FileNotFoundError to
     "gone", and an unmounted volume is NOT "some other OSError" -- its contents
     are ENOENT -- so every row under it read "gone" and the whole corpus was
     deleted by an `index` run against a drive that was not mounted. The guard
-    this replaces only ever covered EACCES, which was never the risk."""
+    this replaces only ever covered EACCES, which was never the risk.
+
+    `--prune` does NOT override this one. It is a statement about the
+    threshold, made with the directory present and inspectable; here the user
+    cannot tell "deleted" from "not mounted", which is the whole reason the
+    gate exists. Measured with the override in place: 12 rows and 12 chunksets
+    to zero. `forget` is the route out, and the message says so.
+
+    Checked by what the gate itself does, not only by "nothing was removed":
+    with the root gone, every candidate's DIRECTORY is gone too, so the
+    missing-directory rule would hold the same rows back anyway, and a test
+    asserting only `pruned == []` passes with this gate deleted. (It did; the
+    mutant survived.) The gate decides EARLIER -- there are no candidates at
+    all, so nothing is reported held back either.
+    """
     with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as td2:
         root, db = Path(td) / "corpus", Path(td2) / "x.sqlite"
         root.mkdir()
@@ -1685,9 +1713,13 @@ def test_an_absent_root_prunes_nothing():
         store.close()
         assert before == 3
 
+        capsys.readouterr()
         shutil.rmtree(root)                 # the mountpoint is gone
-        result = api.index(root, db_path=db)
+        result = api.index(root, db_path=db, prune=prune)
         assert result["pruned"] == []
+        assert result["prune_held_back"] == []
+        err = capsys.readouterr().err
+        assert "is not present" in err and "forget" in err
         store = Store(db)
         try:
             assert len(store.all_file_paths()) == before
@@ -2079,9 +2111,10 @@ def test_the_exception_constructor_never_opens_a_file():
 
 
 @pytest.mark.parametrize("prune", [True, False, None])
-def test_prune_never_overrides_the_root_and_scope_gates(prune):
-    """`prune=True` may only override the threshold. Both other gates are the
-    two reproduced data-loss paths, and no test covered them with the flag."""
+def test_the_scope_gate_holds_whatever_prune_says(prune):
+    """A run over one root must never delete another root's rows, with or
+    without the flag. This is the gate that has no override: `--prune` is the
+    user speaking about the directory they NAMED, and nothing else."""
     with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as c:
         ra, db = Path(a) / "A", Path(c) / "shared.sqlite"
         ra.mkdir()
@@ -2097,14 +2130,163 @@ def test_prune_never_overrides_the_root_and_scope_gates(prune):
             api.index(rb, db_path=db)
         # B's whole tree is gone now; a run over A must not touch its rows.
         assert api.index(ra, db_path=db, prune=prune)["pruned"] == []
-
-        shutil.rmtree(ra)                     # and an absent root prunes nothing
-        assert api.index(ra, db_path=db, prune=prune)["pruned"] == []
         store = Store(db)
         try:
             assert len(store.all_file_paths()) == 6
         finally:
             store.close()
+
+
+def test_forget_clears_a_deleted_root_in_a_shared_database():
+    """The route out of a permanent refusal, and it did not exist.
+
+    Two roots, one database (`--db`, which the README advertises). B's
+    directory is deleted. B's rows then read stale forever -- `load_rules` on a
+    missing directory returns no rules, whose hash is not the one on the row --
+    so EVERY filtered search over A refuses with `MetadataStale`, including
+    searches that have nothing to do with B. Every `index` run a user could
+    type left them: `index A` and `index A --prune` are stopped by the scope
+    gate, `index B` and `index B --prune` by the root-present gate. Six rows,
+    four runs, no route out.
+
+    `forget` is that route, and it is deliberately a separate command rather
+    than a flag on `index`: removing rows for a directory nobody can inspect
+    has to be typed on purpose, not reached by the flag used for everyday
+    deletions.
+    """
+    with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as c:
+        ra, db = Path(a) / "A", Path(c) / "shared.sqlite"
+        ra.mkdir()
+        _many(ra, 3)
+        _write_rules(ra, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        api.index(ra, db_path=db)
+
+        with tempfile.TemporaryDirectory() as b:
+            rb = Path(b) / "B"
+            rb.mkdir()
+            _many(rb, 3)
+            _write_rules(rb, [{"glob": "**/*.md", "metadata": {"kind": "o"}}])
+            api.index(rb, db_path=db)
+
+        with pytest.raises(MetadataStale) as excinfo:
+            api.search("sqlite", path=ra, db_path=db, where={"kind": "note"})
+        # The message has to carry BOTH halves of the command that works.
+        assert f"forget {os.path.realpath(rb)}" in str(excinfo.value)
+        assert f"--db {db}" in str(excinfo.value)
+
+        # No `index` run clears them, with or without the flag.
+        for kw in ({}, {"prune": True}):
+            assert api.index(ra, db_path=db, **kw)["pruned"] == []
+            assert api.index(rb, db_path=db, **kw)["pruned"] == []
+
+        result = api.forget(rb, db_path=db)
+        assert len(result["forgotten"]) == 3
+        assert all(str(rb) in f for f in result["forgotten"])
+        store = Store(db)
+        try:
+            assert len(store.all_file_paths()) == 3
+        finally:
+            store.close()
+        # The refusal is gone and the corpus that remains is A's.
+        hits = api.search("sqlite", path=ra, db_path=db, where={"kind": "note"})
+        assert hits and all(str(ra) in h["file_path"] for h in hits)
+
+
+def test_searching_a_directory_that_is_not_indexed_writes_nothing():
+    """`Store.__init__` creates its database's parent, so a `search` against a
+    directory that does not exist recreated it and left an empty database in
+    it -- which the NEXT `index` run then reads as a present root, re-enabling
+    pruning for a directory the user deleted. Nothing to search is not a reason
+    to write anything, and the daemon already answers this shape with an empty
+    result."""
+    with tempfile.TemporaryDirectory() as td:
+        gone = Path(td) / "never-existed"
+        assert api.search("sqlite", path=gone) == []
+        assert not gone.exists(), "search recreated the directory"
+        assert not (gone / ".poma-memory.db").exists()
+
+
+def test_forget_does_not_recreate_the_directory_it_is_clearing():
+    """`Store.__init__` creates the database's parent, and the DEFAULT database
+    lives inside the directory being forgotten. The earlier remedy message sent
+    users to `index <gone-dir> --prune`, which recreated the directory they had
+    deleted, left an empty database in it, printed "Indexed 0 files", and left
+    the refusal unchanged -- worse than useless, because the next run then saw
+    a present root. `forget` refuses instead, and names `--db`."""
+    with tempfile.TemporaryDirectory() as td:
+        gone = Path(td) / "vanished"
+        with pytest.raises(FileNotFoundError) as e:
+            api.forget(gone)
+        assert "--db" in str(e.value)
+        assert not gone.exists(), "forget recreated the directory"
+
+
+def test_a_renamed_directory_is_recoverable_at_the_cli():
+    """The same wedge reached by `mv`, which is an ordinary thing to do, and
+    the database moves with the directory -- so the rows point at a path that
+    no longer exists while the index holding them is the live one. End to end
+    through the CLI, because the remedy is a command a user types."""
+    from poma_memory import cli
+    import io, contextlib
+    with tempfile.TemporaryDirectory() as td:
+        proj = Path(td) / "proj"
+        proj.mkdir()
+        _many(proj, 3)
+        _write_rules(proj, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        api.index(proj)
+        old_real = os.path.realpath(proj)
+
+        renamed = Path(td) / "proj-renamed"
+        proj.rename(renamed)
+        api.index(renamed)
+
+        db = renamed / ".poma-memory.db"
+        with pytest.raises(MetadataStale) as excinfo:
+            api.search("sqlite", path=renamed, where={"kind": "note"})
+        msg = str(excinfo.value)
+        assert f"forget {old_real}" in msg and f"--db {db}" in msg
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cli._cmd_forget(argparse.Namespace(path=old_real, db=str(db)))
+        assert "Forgot 3 file(s)" in out.getvalue()
+        assert not Path(old_real).exists(), "the remedy recreated the old path"
+        assert api.search("sqlite", path=renamed, where={"kind": "note"})
+
+
+def test_the_stale_remedy_prints_a_command_that_works():
+    """Two earlier cuts printed one that did not. `index` sent the user to the
+    run that had just skipped the row; `index <dir> --prune` sent them to a
+    command that will not prune a directory it cannot see AND recreated that
+    directory on the way. Both halves -- the directory and the database -- or
+    the user is sent somewhere that silently does nothing."""
+    with tempfile.TemporaryDirectory() as td:
+        vanished = Path(td) / "vanished"
+        msg = str(MetadataStale(1, "/db/x.sqlite", [str(vanished / "note.md")],
+                                roots=[str(vanished)]))
+        assert f"forget {vanished} --db /db/x.sqlite" in msg
+        assert "--prune" not in msg.split("Run ")[-1]
+
+
+def test_forget_only_reaches_rows_under_the_directory_it_is_given():
+    """It is a blunter instrument than `--prune`, so the scope rule matters
+    more, not less: a sibling with a shared prefix is not underneath."""
+    with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as c:
+        base, db = Path(td), Path(c) / "shared.sqlite"
+        main, sibling = base / "agent", base / "agent-backup"
+        for d in (main, sibling):
+            d.mkdir()
+            _many(d, 2)
+        api.index(main, db_path=db)
+        api.index(sibling, db_path=db)
+        assert len(api.forget(main, db_path=db)["forgotten"]) == 2
+        store = Store(db)
+        try:
+            remaining = store.all_file_paths()
+        finally:
+            store.close()
+        assert len(remaining) == 2
+        assert all("agent-backup" in fp for fp in remaining)
 
 
 def test_a_sibling_directory_with_a_shared_prefix_is_not_in_scope():
@@ -2270,3 +2452,42 @@ def test_the_mcp_tool_can_actually_prune():
         assert "NOT removed" in mcp_server.poma_index(path=str(root))
         out = mcp_server.poma_index(path=str(root), prune=True)
         assert "8 removed" in out, out
+
+
+def test_a_missing_or_unreadable_single_file_is_an_error_not_a_traceback():
+    """`index()` already costs one bad file the file and not the run. The
+    single-file surfaces did not: `--file nope.md` printed a FileNotFoundError
+    stack out of `main`, while the same file carrying one Latin-1 byte printed
+    a clean message -- only because UnicodeDecodeError happens to be a
+    ValueError and was already caught. OSError was not."""
+    from poma_memory import cli, mcp_server
+    import io, contextlib
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "ok.md").write_text("# ok\n\nsqlite notes\n")
+        api.index(root)
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), pytest.raises(SystemExit) as e:
+            cli._cmd_index(argparse.Namespace(
+                path=str(root), db=None, glob="**/*.md",
+                file=str(root / "nope.md"), prune=None))
+        assert e.value.code == 2
+        assert "nope.md" in err.getvalue()
+
+        out = mcp_server.poma_index(path=str(root), file=str(root / "nope.md"))
+        assert out.startswith("Index failed:") and "nope.md" in out
+
+
+def test_the_mcp_directory_branch_reports_unusable_rules():
+    """The `file` branch has always caught this; the directory branch raised
+    out of the tool, so a typo in `.poma-metadata.json` reached the agent as a
+    transport error instead of a sentence naming the file and the typo."""
+    from poma_memory import mcp_server
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "a.md").write_text("# A\n\nsqlite notes\n")
+        (root / ".poma-metadata.json").write_text("{not json")
+        out = mcp_server.poma_index(path=str(root))
+        assert out.startswith("Index failed:")
+        assert "invalid JSON" in out and RULES_FILENAME in out

@@ -8,7 +8,8 @@ from typing import TYPE_CHECKING
 
 from poma_memory.bm25_search import BM25Search
 from poma_memory.metadata import (
-    MetadataNotIndexed, MetadataStale, matches, normalize_where, stale_files,
+    MetadataIncomplete, MetadataNotIndexed, MetadataStale, matches,
+    normalize_where, stale_by_root,
 )
 from poma_primecut_nano import expand_chunk_ids, assemble_context
 
@@ -211,18 +212,35 @@ class HybridSearch:
                                      missing[:3])
 
         # Each row names the directory its rules came from, so this re-reads
-        # those rules now rather than trusting anything cached or inferred.
-        stale = stale_files([(fp, root, h) for fp, _, root, h in rows])
-        if stale:
-            raise MetadataStale(len(stale), self._store.db_path, stale[:3])
+        # those rules now rather than trusting anything cached or inferred --
+        # and keeps the grouping, because the remedy for a stale row is a
+        # command naming ITS directory and this database, not a flag.
+        by_root = stale_by_root([(fp, root, h) for fp, _, root, h in rows])
+        if by_root:
+            stale = sorted(fp for group in by_root.values() for fp in group)
+            raise MetadataStale(len(stale), self._store.db_path, stale[:3],
+                                roots=sorted(by_root))
 
         keep_files = set()
         for file_path, meta, _, _ in rows:
             try:
                 value = json.loads(meta)
             except (ValueError, TypeError):
-                continue
-            if isinstance(value, dict) and matches(value, where):
+                value = None
+            if not isinstance(value, dict):
+                # The row passed the completeness check above -- it is not ''
+                # -- so this is a blob that was written and has since become
+                # unreadable. Skipping it dropped that document out of every
+                # filtered result silently, which is the one outcome this
+                # whole mechanism exists to refuse: an answer the caller
+                # cannot tell from a correct one.
+                raise MetadataIncomplete(
+                    f"{file_path} has metadata recorded that is not a JSON "
+                    f"object ({meta[:40]!r}), so a metadata filter cannot be "
+                    "answered honestly. Re-run `poma-memory index` over the "
+                    "directory it came from to rewrite the row."
+                )
+            if matches(value, where):
                 keep_files.add(file_path)
         # Resolved in SQL rather than by scanning every chunkset in Python: the
         # whole-table version cost 22 ms regardless of how narrow the predicate

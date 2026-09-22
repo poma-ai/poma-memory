@@ -4,6 +4,25 @@ The invariant under test throughout: a filtered search over a mixed corpus must
 behave like an unfiltered search over a corpus containing only the matching
 documents. Anything that ranks first and filters afterwards violates it, and
 every test here is written to fail in that case.
+
+Precisely, because an earlier version of this docstring claimed more than the
+code can deliver and a four-document fixture was small enough to hide it. What
+holds, and is asserted here:
+
+* **No document the caller excluded is ever returned**, at any corpus size.
+* **Every in-scope document can be ranked.** It is scored within the allowed
+  set, so out-of-scope documents cannot occupy the candidate window -- which
+  they did, silently, once the corpus outgrew `top_k * 3`.
+* **The gate decision does not depend on excluded documents**, because a cosine
+  is absolute and the gate reads the narrowed corpus's top-1.
+
+What does NOT hold, and is not asserted: identical result *sets* or *order*.
+BM25 scores a document against corpus-wide IDF and average document length, so
+the excluded documents still move the numbers. Measured over 300 comparisons on
+random 20-80 document corpora: identical order in 178, identical set in 239,
+identical top-1 in 267, mean set overlap 0.928, and zero out-of-scope documents
+returned. Making the sets identical would mean an index per predicate, which is
+the design this one deliberately rejects -- see `docs/metadata-filtering.md`.
 """
 
 from __future__ import annotations
@@ -170,12 +189,15 @@ def _names(results):
 ])
 def test_filtered_mixed_corpus_matches_a_corpus_built_from_the_subset(
         query, expect_hits):
-    """The whole invariant, on the real embedder.
+    """The invariant, on the real embedder, asserted at the strength it holds.
 
-    Membership rather than order: BM25 IDF is computed over whatever corpus is
-    present, so the two runs can rank in-scope documents differently even when
-    they retrieve the same ones. The gate decision and the result set are the
-    parts that must not depend on documents the caller excluded.
+    The set equality below is true for THIS fixture and is not a general
+    property: BM25 IDF and average document length are computed over whatever
+    corpus is present, so on a larger mixed corpus the two runs return
+    overlapping but not identical sets (measured: 239 of 300). It is kept
+    because a regression that broke it on four documents would be a real one,
+    and `test_no_out_of_scope_document_survives_a_larger_corpus` below carries
+    the part that must hold at any size.
     """
     with tempfile.TemporaryDirectory() as td:
         mixed = Path(td) / "mixed"
@@ -202,6 +224,50 @@ def test_filtered_mixed_corpus_matches_a_corpus_built_from_the_subset(
         assert bool(filtered) is bool(reference)
         if not expect_hits:
             assert filtered == []
+
+
+@pytest.mark.parametrize("semantic", [True, False])
+def test_no_out_of_scope_document_survives_a_larger_corpus(semantic):
+    """The part of the invariant that holds at any size, plus the one that did
+    not.
+
+    `retrieve(k=...)` with a `weight_mask` takes the top k over the WHOLE
+    corpus, so masked documents occupied the candidate window. They sit at 0.0
+    after masking and an in-scope document that shares no term with the query
+    scores 0.0 too, so the tie went to corpus order and the in-scope document
+    was never returned at all -- in BM25-only mode, which is what a plain
+    `pip install poma-memory` gives you. Reproduced at 200 out-of-scope
+    documents; the fixture above has four, which is why it passed throughout.
+    """
+    from poma_memory.search import HybridSearch
+    from poma_memory.store import Store
+    from poma_memory.incremental import update_file
+    from poma_memory.metadata import rules_hash
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        rh = rules_hash([])
+        store = Store(root / ".poma-memory.db")
+        try:
+            for i in range(200):
+                f = root / f"out{i}.md"
+                f.write_text(f"# Out {i}\n\nSQLite storage notes {i}.\n")
+                update_file(store, str(f), path_metadata={"kind": "out"},
+                            rules_hash=rh, rules_root=str(root))
+            wanted = root / "in.md"
+            # Deliberately shares no term with the query: BM25 scores it 0.0,
+            # exactly like every masked document.
+            wanted.write_text("# In\n\nzebra xylophone quokka.\n")
+            update_file(store, str(wanted), path_metadata={"kind": "in"},
+                        rules_hash=rh, rules_root=str(root))
+
+            hybrid = HybridSearch(store, enable_semantic=semantic)
+            hits = hybrid.search("sqlite storage", top_k=1,
+                                 empty_gate=0.0, where={"kind": "in"})
+            names = {Path(h["file_path"]).name for h in hits}
+            assert names == {"in.md"}, names
+        finally:
+            store.close()
 
 
 def test_semantic_order_is_preserved_because_cosines_are_absolute():

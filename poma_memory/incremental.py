@@ -52,6 +52,25 @@ def _resolve_metadata(
     return json.dumps(meta_mod.merge(path_metadata, fm), sort_keys=True), not ok
 
 
+def _is_object(blob: str | None) -> bool:
+    """Whether a stored metadata blob is usable, i.e. a JSON object.
+
+    `not record["metadata"]` alone asked only whether the row had been scanned.
+    A row holding a blob that no longer parses -- a hand edit, a third-party
+    writer -- passed that test, so `index` skipped it while `search` refused on
+    it: a refusal whose printed remedy was the command that had just declined
+    to fix it, which is the dead end this whole mechanism exists to avoid.
+    One `json.loads` per unchanged file per run, against a `stat` that already
+    happened and a head read that often follows.
+    """
+    if not blob:
+        return False
+    try:
+        return isinstance(json.loads(blob), dict)
+    except (ValueError, TypeError):
+        return False
+
+
 def _stat_agrees(record: dict, stat: os.stat_result) -> bool:
     """Whether the recorded stat signature still matches the file on disk.
 
@@ -124,7 +143,7 @@ def update_file(
         # is refused by search (an unverifiable row is not trusted) and skipped
         # by this refresh, so `index` could never heal it -- refusing forever,
         # which is the failure this whole mechanism exists to prevent.
-        stale = (not record.get("metadata")
+        stale = (not _is_object(record.get("metadata"))
                  or record.get("rules_hash") != rules_hash
                  or record.get("rules_root") != rules_root)
         resolved = _resolve_metadata(file_path, path_metadata) if stale else None
@@ -172,7 +191,7 @@ def update_file(
                 # Reporting False there hid the one case the flag exists for.
                 return {"status": "unchanged",
                         "metadata_refreshed": not record
-                        or not record.get("metadata")
+                        or not _is_object(record.get("metadata"))
                         or record.get("rules_hash") != rules_hash}
 
             return _incremental_update(

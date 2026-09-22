@@ -72,9 +72,12 @@ def index(
         db_path: SQLite database path (default: {path}/.poma-memory.db)
         glob: File pattern to match (default: **/*.md)
         prune: Remove indexed files that are gone from disk. None (default)
-            removes them unless that would take most of the index in one run,
-            which is more like an unmounted directory than a deletion; True
-            always removes; False never does.
+            removes them unless a directory under `path` has vanished or the
+            removals would be most of the index, both of which look more like
+            something that failed to mount than a deletion. True removes them
+            anyway; False never does. Neither reaches rows outside `path`, and
+            neither removes anything at all when `path` itself is absent — for
+            a directory that is gone for good, see `forget`.
 
     Returns:
         dict with keys: files_indexed, chunks_created, chunksets_created,
@@ -191,6 +194,16 @@ def index(
         # `fp not in seen` alone is NOT authority to delete: this run may have been
         # given a narrower `glob`, and a file that still exists has simply not been
         # scanned. `_disk_state` answers the real question.
+        #
+        # NONE of these three has an override, `--prune` included. `--prune` is
+        # a statement about the threshold — "yes, remove that many" — and the
+        # directory is present and inspectable when a user makes it. Letting it
+        # also override gate 1 would put the destructive answer behind the flag
+        # people type for ordinary deletions, at exactly the moment they cannot
+        # tell "deleted" from "not mounted": measured, `index <root> --prune`
+        # against an absent root took 12 rows and 12 chunksets to zero. The
+        # route out of a root that really is gone is `forget`, which is a
+        # different word for a different question.
         root_present = _disk_state(root_key) == "present"
         candidates = []
         if root_present:
@@ -204,8 +217,10 @@ def index(
                 if under_root:
                     candidates.append(fp)
         elif store.all_file_paths():
-            print(f"poma-memory: {root_key} is not present; skipping the check for "
-                  "indexed files that have been deleted", file=sys.stderr)
+            print(f"poma-memory: {root_key} is not present; skipping the check "
+                  "for indexed files that have been deleted. If it is gone for "
+                  f"good, `poma-memory forget {root_key} --db {db_path}` "
+                  "removes its rows.", file=sys.stderr)
 
         # Sampled for every candidate first, so the set being deleted is decided
         # from one consistent view...
@@ -283,8 +298,15 @@ def index(
             # A row whose file is GONE cannot be reached by any glob, so telling
             # the user to widen one sends them nowhere. `--prune` is the only
             # thing that clears those.
+            # ...and in a shared database they may not belong to this root at
+            # all. A row whose FILE is gone can be reached by no glob and no
+            # re-read, and `index --prune` will not touch a directory it cannot
+            # see -- so the only command that clears it is `forget`, with the
+            # database named, because the default one lives inside the
+            # directory that is missing.
             vanished = [fp for fp in stale if _disk_state(fp) == "gone"]
-            how = ("Re-run with --prune to remove them."
+            how = (f"Run `poma-memory forget <dir> --db {db_path}` for the "
+                   "directory each one was indexed from."
                    if vanished else "Re-run with a glob that matches them.")
             print(f"poma-memory: {len(stale)} file(s) still hold metadata from "
                   f"an earlier rule set and were not reached by this run "
@@ -363,6 +385,66 @@ def index_file(
         store.close()
 
 
+def forget(path: str | Path, db_path: str | Path | None = None) -> dict:
+    """Remove every indexed row under `path`, whether or not it still exists.
+
+    The one thing `index --prune` deliberately cannot do, given its own name.
+    Pruning asks "which of MY documents are gone?" and answers it only from a
+    directory it can see; this asks "forget this directory", which is a
+    statement about the directory rather than about its contents, and is the
+    only honest answer to two states that otherwise have none:
+
+    * **A deleted root in a shared database.** Two roots, one database
+      (`--db`). Delete root B's directory and B's rows read stale forever --
+      `load_rules` on a missing directory returns no rules, whose hash is not
+      the one on the row -- so every filtered search over A refuses, including
+      searches that have nothing to do with B.
+    * **A renamed root.** `mv proj proj-renamed` is the same state reached by
+      an ordinary command, and the database usually moves with the directory,
+      so the rows point at a path that no longer exists while the index that
+      holds them is the live one.
+
+    Deliberately NOT part of `index`: a command that deletes rows for a
+    directory nobody can inspect must be typed on purpose, not reached by the
+    flag used for everyday deletions.
+
+    Raises:
+        FileNotFoundError: no database at `db_path` (or at the default inside
+            `path`, which is the usual case once `path` itself is gone -- the
+            database moved with the directory, and `--db` names where it is).
+    """
+    path = Path(path)
+    if db_path is None:
+        db_path = path / ".poma-memory.db"
+    # Checked BEFORE `Store`, which creates the parent directory: the default
+    # database sits inside `path`, so opening it for a directory the user
+    # deleted recreated that directory, left an empty database in it, and made
+    # the next `index` run see a present root. The remedy must not re-create
+    # what the user removed.
+    if not Path(db_path).exists():
+        raise FileNotFoundError(
+            f"no index at {db_path}. If the database is elsewhere -- which it "
+            f"is whenever {path} moved or was deleted -- name it with `--db`."
+        )
+
+    root_key = os.path.realpath(path)
+    store = Store(db_path)
+    try:
+        removed = []
+        for fp in store.all_file_paths():
+            try:
+                under_root = os.path.commonpath([fp, root_key]) == root_key
+            except ValueError:
+                continue                    # different drives on Windows
+            if under_root:
+                store.delete_file_data(fp)
+                removed.append(fp)
+        return {"forgotten": sorted(removed), "root": root_key,
+                "db_path": str(db_path)}
+    finally:
+        store.close()
+
+
 def search(
     query: str,
     path: str | Path = ".agent/",
@@ -400,6 +482,14 @@ def search(
     path = Path(path)
     if db_path is None:
         db_path = path / ".poma-memory.db"
+
+    if not Path(db_path).exists():
+        # `Store` creates the parent directory, so opening a database that is
+        # not there recreates a root the user deleted and leaves an empty
+        # database in it -- which then reads as a present root to the next
+        # `index` run. Nothing to search is not a reason to write anything.
+        # The daemon already answers this shape with an empty result.
+        return []
 
     store = Store(db_path)
     hybrid = HybridSearch(store)

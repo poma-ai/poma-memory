@@ -346,3 +346,58 @@ def test_env_override_is_not_taken_from_the_daemons_environment(running_daemon,
 
     assert run(str(running_daemon)) == run("off"), \
         "daemon and in-process disagreed under an environment override"
+
+
+def test_one_index_addressed_two_ways_takes_one_lock(running_daemon, indexed_dir):
+    """The lock key must be the RESOLVED database, not the raw request.
+
+    `{"path": "/r/.agent"}` and `{"db_path": "/r/.agent/.poma-memory.db"}` name
+    one index, and the CLI sends the second whenever `--db` is passed. Keyed on
+    the raw request they took two different locks, so two threads entered
+    `_IndexCache.get` for one entry and one closed the Store the other was
+    reading. Measured before the fix on this shape: 13 failures in 320 requests
+    ("Cannot operate on a closed database", "bad parameter or other API
+    misuse", "tuple index out of range") and 4 cache builds instead of 1.
+    """
+    db = str(indexed_dir / ".poma-memory.db")
+    # Warm it first, so `builds` counts only rebuilds caused by the two
+    # spellings fighting over one entry.
+    request({"op": "search", "query": "rollback", "path": str(indexed_dir)},
+            running_daemon, timeout=60)
+    warm = request({"op": "stats"}, running_daemon)["builds"]
+    errors = []
+
+    def hit(use_db):
+        for _ in range(30):
+            try:
+                resp = request({
+                    "op": "search", "query": "rollback",
+                    "path": str(indexed_dir),
+                    "db_path": db if use_db else None, "top_k": 3,
+                }, running_daemon, timeout=30)
+                if not resp.get("ok"):
+                    errors.append(resp)
+            except Exception as e:                      # noqa: BLE001
+                errors.append(f"{type(e).__name__}: {e}")
+
+    threads = [threading.Thread(target=hit, args=(i % 2 == 0,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=120)
+
+    assert errors == [], f"{len(errors)} concurrent failures, e.g. {errors[0]}"
+    assert request({"op": "stats"}, running_daemon)["builds"] == warm, \
+        "the two spellings rebuilt the cache instead of sharing one entry"
+
+
+def test_the_lock_key_is_the_resolved_database():
+    """The unit of the above: both spellings resolve to one key."""
+    from poma_memory.server import _lock_key
+    a = {"op": "search", "path": "/r/.agent"}
+    b = {"op": "search", "path": "/r/.agent",
+         "db_path": "/r/.agent/.poma-memory.db"}
+    assert _lock_key(a) == _lock_key(b) == "/r/.agent/.poma-memory.db"
+    # Nothing resolvable (ping, stats, a relative path) shares the empty key.
+    assert _lock_key({"op": "ping"}) == ""
+    assert _lock_key({"op": "search", "path": "relative/.agent"}) == ""

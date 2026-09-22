@@ -100,6 +100,28 @@ def _resolve_db(path: str | None, db_path: str | None) -> Path:
     return candidate / ".poma-memory.db"
 
 
+def _lock_key(req: dict) -> str:
+    """Which index this request serialises on: the RESOLVED database path.
+
+    The same string `_IndexCache` keys its entries on, and it has to be. Keyed
+    on the raw request instead, two spellings of one index took two different
+    locks -- `{"path": "/r/.agent"}` and
+    `{"db_path": "/r/.agent/.poma-memory.db"}` are the same database, and the
+    CLI sends the second whenever `--db` is passed. Two threads then entered
+    `_IndexCache.get` for one entry, and one closed the Store the other was
+    reading. Measured on 320 mixed requests before the fix: 13 failures
+    ("Cannot operate on a closed database", "bad parameter or other API
+    misuse", "tuple index out of range") and 4 cache builds instead of 1.
+
+    Anything with no resolvable database -- `ping`, `stats`, a relative path
+    `_handle` will refuse anyway -- shares the empty key and touches no index.
+    """
+    try:
+        return str(_resolve_db(req.get("path"), req.get("db_path")))
+    except Exception:
+        return ""
+
+
 class _IndexCache:
     """db path -> warm HybridSearch, invalidated when the db file changes."""
 
@@ -384,8 +406,7 @@ def _serve_conn(conn: socket.socket, cache: _IndexCache, lock: "_LockTable",
                     req = json.loads(buf.decode("utf-8").strip() or "{}")
                     # Cheap ops need no index lock at all; a search takes only
                     # the lock for the index it touches.
-                    key = str(req.get("db_path") or req.get("path") or "")
-                    with lock.for_key(key):
+                    with lock.for_key(_lock_key(req)):
                         resp = _handle(req, cache)
             except Exception as e:
                 # One bad request must never take the daemon down.

@@ -28,7 +28,9 @@ def main(argv: list[str] | None = None) -> None:
     p_prune = p_index.add_mutually_exclusive_group()
     p_prune.add_argument("--prune", dest="prune", action="store_true", default=None,
                          help="Remove indexed files that are gone from disk, "
-                              "even when that is most of the index")
+                              "even when that is most of the index. Never rows "
+                              "outside this directory, and nothing at all when "
+                              "the directory itself is absent (see `forget`)")
     p_prune.add_argument("--no-prune", dest="prune", action="store_false",
                          help="Never remove indexed files that are gone")
 
@@ -53,6 +55,15 @@ def main(argv: list[str] | None = None) -> None:
                                "'off' to force in-process search")
     p_search.add_argument("--json", action="store_true", dest="as_json",
                           help="Output as JSON")
+
+    # forget
+    p_forget = sub.add_parser(
+        "forget",
+        help="Remove every indexed row under a directory, gone or not")
+    p_forget.add_argument("path", help="Directory whose rows to remove")
+    p_forget.add_argument("--db", help="Database path. Required once the "
+                                       "directory itself is gone, since the "
+                                       "default one lives inside it")
 
     # status
     p_status = sub.add_parser("status", help="Show index status")
@@ -84,6 +95,8 @@ def main(argv: list[str] | None = None) -> None:
         _cmd_index(args)
     elif args.command == "search":
         _cmd_search(args)
+    elif args.command == "forget":
+        _cmd_forget(args)
     elif args.command == "status":
         _cmd_status(args)
     elif args.command == "mcp":
@@ -104,8 +117,15 @@ def _cmd_index(args: argparse.Namespace) -> None:
         # "scanned, no metadata" where a rule says otherwise.
         try:
             result = index_file(args.file, path=args.path, db_path=args.db)
-        except (ValueError, MetadataRulesError) as e:
-            print(f"poma-memory: {e}", file=sys.stderr)
+        except (OSError, ValueError, MetadataRulesError) as e:
+            # OSError as well as ValueError. `index()` already treats an
+            # unreadable or missing document as costing that file and not the
+            # run; here the same file tracebacked out of `main` instead --
+            # `poma-memory index --file nope.md` printed a FileNotFoundError
+            # stack, while the same file with one Latin-1 byte printed a clean
+            # message, because UnicodeDecodeError happens to be a ValueError.
+            print(f"poma-memory: {args.file}: "
+                  f"{getattr(e, 'strerror', None) or e}", file=sys.stderr)
             raise SystemExit(2)
         print(f"{args.file}: {result['status']}"
               f" ({result.get('new_chunks', 0)} chunks,"
@@ -264,6 +284,22 @@ def _cmd_search(args: argparse.Namespace) -> None:
         if updated:
             print(f"Updated: {updated}")
         print(r["context"])
+
+
+def _cmd_forget(args: argparse.Namespace) -> None:
+    """Forget command: drop every row under a directory."""
+    from poma_memory.api import forget
+
+    try:
+        result = forget(args.path, db_path=args.db)
+    except OSError as e:
+        print(f"poma-memory: {e}", file=sys.stderr)
+        raise SystemExit(2)
+    n = len(result["forgotten"])
+    if not n:
+        print(f"Nothing indexed under {result['root']} in {result['db_path']}.")
+        return
+    print(f"Forgot {n} file(s) under {result['root']}.")
 
 
 def _cmd_status(args: argparse.Namespace) -> None:

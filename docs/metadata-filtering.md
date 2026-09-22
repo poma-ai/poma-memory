@@ -1,16 +1,16 @@
 # Metadata filtering (0.6.0)
 
 The design document for `where`-filtered search: why the filter has to run
-before ranking, how per-file metadata is resolved and kept honest, and what six
-rounds of review changed about it.
+before ranking, how per-file metadata is resolved and kept honest, and what
+nine rounds of review changed about it.
 
 Status: implemented on `feat/metadata-filtering` (PR #3). Written 2026-09-21
-against 0.5.0 (c2de15e); rev 8.
+against 0.5.0 (c2de15e); rev 9.
 
 It is kept because §2 and §8 are the parts that do not fit in code comments:
-§2 is the argument for the whole mechanism, and §8 is a record of five
-consecutive rounds where a fix created the next blocker, which is the most
-useful thing this change has to teach.
+§2 is the argument for the whole mechanism, and §8 is a record of six of nine
+rounds where a fix created the next blocker, which is the most useful thing
+this change has to teach.
 
 Revision history: rev 4 recorded two corrections found while building it (§2,
 §6); rev 5 narrowed an overclaim in the first and recorded the early review
@@ -20,7 +20,9 @@ deleted; rev 7 moved this file out of the (gitignored) `.agent/PLANS/` into the
 repo, where the PR that cites it can actually reach it; rev 8 records round
 seven, which found this document already contradicting the code on the one
 behaviour that deletes data, two commits after rev 7 corrected it for the same
-reason.
+reason; rev 9 records rounds eight and nine, and corrects §3.6, where this
+document had asserted an equivalence between filtered and subset-only search
+that measurement shows was never true.
 
 Revs 1-2 were built around a runbook repo as the driving consumer; the user has
 since said that repo may not use poma-memory at all and that megavibe is the
@@ -248,13 +250,14 @@ Pruning is the only destructive operation in the package and is gated four
 ways, each of which was a reproduced way to delete live data: the run's own
 root must be present (an unmounted volume yields ENOENT, not "some other
 OSError", so every row under it read as deleted and a whole corpus went); only
-rows under that root are candidates (two roots may share one database, and a
-run given A must not delete B); the disk state is re-checked immediately before
-each delete, because it was sampled for every row before any were removed; and
-a run will not remove MOST of an index without being asked.
+rows under that root are candidates (two roots may share one database, and a run given A must not
+delete B); the disk state is re-checked immediately before each delete, because
+it was sampled for every row before any were removed; and a run will not remove
+MOST of an index without being asked.
 
-That last one is not a guess about intent, because there is no guess to be
-made: a mountpoint nested inside a present root reports ENOENT for everything
+None of them has an override; `--prune` overrides only the proportional one
+(see below). That last one is not a guess about intent, because there is no
+guess to be made: a mountpoint nested inside a present root reports ENOENT for everything
 under it, exactly as a deleted directory does, and no filesystem call
 distinguishes them. So it refuses the outcome rather than trying to classify
 the cause — losing most of an index in one run is worth blocking whatever
@@ -263,6 +266,57 @@ produced it, while deleting a handful of documents stays automatic.
 the explicit no, so a genuinely deleted subtree is never stuck in the index —
 and the refusal a stale held-back row produces names `--prune` rather than a
 glob or a `chmod`, because neither of those can reach a file that is gone.
+
+**None of the other three gates has an override, `--prune` included** — and
+round nine spent a cut finding out why, by granting one. The state it was
+trying to escape is real: two roots, one database, B's directory deleted. B's
+rows then read stale forever (`load_rules` on a missing directory returns no
+rules, whose hash is not the one on the row), so every filtered search over A
+refuses with `MetadataStale`, including searches that have nothing to do with
+B. Every `index` run a user could type left them in place — `index A` and
+`index A --prune` stopped by the scope gate, correctly; `index B` and
+`index B --prune` by the root-present gate. Six rows, four runs, no route out,
+and the remedy the error printed could not work. A `mv` of the indexed
+directory reaches the same state, which makes it an ordinary Tuesday rather
+than a corner.
+
+The first fix let `--prune` override the root-present gate. Independent review
+reproduced what that cost: 12 rows and 12 chunksets to zero from one
+`index <root> --prune` against an absent root, and with `prune=True` skipping
+the proportional guard as well, no guard left at all. It is the wrong trade,
+and the difference is sharper than it looks. `--prune` overriding the
+proportional guard is a judgement made with the directory present and
+inspectable; `--prune` overriding the root-present gate is a judgement made at
+exactly the moment nothing can distinguish "deleted" from "not mounted" — and
+it puts the destructive answer behind the flag people type for ordinary
+deletions.
+
+So the route out is **`forget`**, a separate command:
+
+    poma-memory forget <dir> --db <db>
+
+It drops every row under `<dir>`, existing or not, and reaches nothing outside
+it. Separate on purpose: removing rows for a directory nobody can inspect has
+to be typed deliberately, not reached by habit. It refuses when the database is
+not where it was told — which it will not be, once `<dir>` is gone, since the
+default one lives inside it. That refusal is itself a fix: the previous remedy
+message said `index <dir> --prune`, and `Store.__init__` creates its database's
+parent, so following it RECREATED the directory the user had deleted, left an
+empty database in it, printed "Indexed 0 files", and made the next run see a
+present root.
+
+The refusals now print the whole command, both halves. Naming the flag alone
+sent the user to the directory they were already in, where the scope gate makes
+it a no-op; naming the directory alone sent them at the wrong database.
+
+One note on what the root-present gate is now worth. For the automatic path it
+is belt-and-braces: with the root gone every candidate's parent directory is
+gone too, so the missing-directory rule holds the same rows back, which is why
+deleting the gate outright survived the first tests written for it. It is
+pinned instead by what the gate itself does — it decides earlier, so there are
+no candidates and nothing is reported held back — and it is what makes
+`prune=True` safe at an absent root, where the missing-directory rule does not
+apply.
 
 Two details the first cut got wrong, both reproduced. The denominator counts
 only rows that existed BEFORE the run: counting everything the run scanned let
@@ -296,27 +350,51 @@ the timestamp was restored — see `incremental._stat_agrees`.
    disallowed rows of the cosine vector to `-inf` **before** `np.argsort`.
    `vec_hits[0]` is then the top-1 of the narrowed corpus and the gate in
    `HybridSearch.search` reads that value with its own code unchanged.
-4. **BM25 — recall, not the gate.** Build a `weight_mask` in
-   `BM25Search._chunksets` order (1.0 allowed, 0.0 not) and pass it to
-   `bm25s.BM25.retrieve(..., weight_mask=...)`; bm25s multiplies it into the
-   score vector before top-k, so ranking among in-scope documents is exact.
-   Masked documents can still surface with score 0.0 when fewer than k score
-   positive, so hits are dropped by **id-set membership, never by score** — an
-   in-scope document can legitimately score 0.0.
+4. **BM25 — recall, not the gate.** Score with `bm25s.BM25.get_scores`, take
+   the subset at the allowed positions, and rank inside THAT — the top-k is
+   over the allowed documents, so an out-of-scope document cannot occupy the
+   window. Hits are still dropped by **id-set membership, never by score**,
+   because an in-scope document can legitimately score 0.0.
 
-`weight_mask` verified present in **bm25s 0.3.0**, not merely the installed
-0.3.3: the 0.3.0 wheel was pulled from PyPI and its `bm25s/__init__.py` parsed
-with `ast`, showing the parameter on `retrieve`, `get_scores`,
-`get_scores_from_ids` and `_get_top_k_results`, and `scores *= weight_mask` in
-the body. `bm25s>=0.3,<1` is already the pin: no dependency change, no floor
-bump.
+   This replaces `retrieve(..., weight_mask=...)`, which was wrong and which a
+   four-document fixture hid for nine rounds. `retrieve` takes the top k over
+   the WHOLE corpus and only then applies the mask, so masked documents sit in
+   the window at 0.0 — and an in-scope document sharing no term with the query
+   scores 0.0 too, so the tie went to corpus order and the in-scope document
+   was never returned. Reproduced at 200 out-of-scope documents, `top_k=1`,
+   BM25-only: `[]` filtered, found in a subset-only index. BM25-only is what a
+   plain `pip install poma-memory` gives you, since the `-inf` semantic mask
+   (which has no such tie) needs the `[semantic]` extra.
+
+   One trap in the replacement, caught by measurement rather than by a test:
+   `get_scores` takes token STRINGS or ids in the INDEX's vocabulary, while
+   `bm25s.tokenize` builds a fresh vocabulary per call. Passing the query's own
+   ids scores whichever terms happen to sit at those positions. On five
+   documents the two vocabularies coincided and the check passed; on random
+   20-80 document corpora 292 of 300 comparisons ranked the wrong documents,
+   with scores ~100x too small. It passes strings. `get_scores` also indexes
+   `[0]` unconditionally, so a query that tokenizes to nothing — all stopwords
+   — raises `IndexError` where `retrieve` did not; an empty query scores every
+   document zero, which is what the unfiltered path returns.
+
+**What this does and does not buy.** Every in-scope document is rankable and no
+other document is returned, at any corpus size. The result *set* is not
+identical to an index built from the matching files alone: BM25 scores against
+corpus-wide IDF and average document length, so the excluded documents still
+move the numbers. Measured over 300 comparisons on random 20-80 document
+corpora: identical order 178, identical set 239, identical top-1 267, mean set
+overlap 0.928, out-of-scope documents returned 0. Closing that gap means an
+index per predicate, which §3.7 is the argument against. The semantic side has
+no such gap — a cosine is absolute — which is why the gate, and not the
+ranking, is the thing §2 needed fixed.
 
 ### 3.7 `_IndexCache` interaction — none, by construction
 
-Masking at query time means neither the BM25 index nor the embedding matrix is
-rebuilt per predicate, so `server.py`'s long-lived `HybridSearch` per database
-is untouched. Per-query cost is one O(n_chunksets) numpy array. This is the
-main reason to prefer `weight_mask` over rebuilding a narrowed index.
+Narrowing at query time means neither the BM25 index nor the embedding matrix
+is rebuilt per predicate, so `server.py`'s long-lived `HybridSearch` per
+database is untouched. Per-query cost is one O(n_chunksets) score vector and
+one index array. This is the main reason to prefer narrowing over rebuilding a
+narrowed index.
 
 **Revised in round five: the file→metadata map is not cached at all.** Rev 4
 put it on `HybridSearch`, rebuilt with the cache on a `PRAGMA data_version`
@@ -502,7 +580,10 @@ lesson is that such judgements expire.
 
 Reviewed by the `reviewer` subagent and Gemini (`--as-reviewer --pro`). Codex
 is installed but outside `MEGAVIBE_REVIEWERS` on this machine, so it did not
-run — a setting, not an outage.
+run — a setting, not an outage. Rounds 8 and 9 are recorded at the end of this
+section; round 9 is the one where Gemini returned SHIP with no findings on a
+tree the subagent reproduced three blockers in, which is the measured reason
+Gemini is a fallback reviewer here rather than a peer.
 
 **Round 1 — do-not-ship, 13 findings.** Two substantive.
 
@@ -680,11 +761,58 @@ indexed corpus; `_IndexCache` invalidation versus the then-cached
 `MetadataNotIndexed`; the append path's metadata handling; and the rules-hash
 refresh across edit/narrow/delete/re-add.
 
-One latent caveat recorded rather than fixed: `bm25s.get_scores_from_ids` adds
-its `nonoccurrence_array` *after* `scores *= weight_mask`, so under
-`method="bm25l"` or `"bm25+"` a masked document would carry a non-zero score.
-`bm25s.BM25()` defaults to lucene, where that array is `None`, and the id-set
-membership drop catches it regardless. Commented at the call site.
+That caveat about `nonoccurrence_array` arriving after `scores *= weight_mask`
+is moot as of round nine: nothing is masked any more. The BM25 side ranks
+inside the allowed set, so under `method="bm25l"` or `"bm25+"` the array would
+apply to every candidate alike, which is correct rather than a trap.
+
+**Round 9 — do-not-ship, one reviewer, three blockers, one of them mine.** Run
+because the four commits after round eight had never been through a gate. Two
+were pre-existing and one was introduced by the fix for the first.
+
+A daemon defect first, reproduced by hand: `_serve_conn` keyed its per-index
+lock on the raw request rather than the resolved database, so `{"path": …}` and
+`{"db_path": …}` — the same index, and the CLI sends the second whenever
+`--db` is passed — took different locks. Two threads then entered
+`_IndexCache.get` for one entry and one closed the `Store` the other was
+reading. Measured on 320 mixed requests: 13 failures ("Cannot operate on a
+closed database", "bad parameter or other API misuse") and four cache builds
+instead of one; with the fix reverted the suite does not fail, it segfaults.
+
+Then the wedge in §3.5 above, and the fix for it that review rejected: letting
+`--prune` override the root-present gate. That is written up there. The
+lesson worth keeping separate is the shape of the mistake — a real dead end,
+a fix that removed it, and a safety property quietly weakened to pay for it,
+with the test that had asserted that property rewritten to bless the new
+behaviour. Nothing about the change looked like a regression from inside it.
+The reviewer's counter-proposal (a separate command) was better than both the
+defect and my fix.
+
+And the one that had been wrong since round one: `retrieve(..., weight_mask=…)`
+takes the top-k over the whole corpus, so out-of-scope documents occupied the
+candidate window — §3.6. The four-document fixture was smaller than `top_k * 3`
+in every test, which is why nine rounds of review, including mutation testing
+of the mask itself, could not see it. Fixing it then showed the equivalence
+invariant this document had claimed throughout was never true: measured over
+300 comparisons, identical result sets in 239. What holds is narrower and is
+now stated where it is asserted.
+
+Also round 9: a corrupt metadata blob was skipped rather than refused (the same
+"an answer you cannot tell from a correct one" this feature exists to remove) —
+and refusing on it needed `index` taught to heal it, or the refusal would have
+printed a remedy that declined to work, which is the round-five mistake again;
+`search` against a directory that does not exist created it, because
+`Store.__init__` makes its database's parent; `poma_index` did not catch
+`MetadataRulesError` on the directory branch though the `--file` branch always
+had; and `index --file` on a missing file tracebacked, while the same file with
+one bad byte printed a clean message, because `UnicodeDecodeError` happens to
+be a `ValueError` and `OSError` is not.
+
+Reported, not fixed: two front-matter blocks parse where PyYAML refuses (`k:#c`
+and `k: 'a' 'b'`). Both invent a key rather than alter a value, and the
+tightening that would reject them — requiring whitespace after the colon —
+would also reject `kind:note`, which real corpora write and which parses
+correctly today. Not worth a silent break for a purity gain.
 
 ## 9. Pre-existing, found during review, not this branch's to fix
 

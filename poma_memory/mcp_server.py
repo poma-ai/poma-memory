@@ -87,7 +87,10 @@ def poma_index(path: str = ".agent/", file: str | None = None,
         glob: File pattern to match (default: **/*.md)
         prune: Remove indexed files that are gone from disk. None (default)
             removes them unless that looks like a directory that failed to
-            mount rather than a deletion; True always removes; False never.
+            mount rather than a deletion; True removes them anyway; False
+            never. Neither touches rows outside `path`, and neither removes
+            anything when `path` itself is absent -- use `poma_forget` for a
+            directory that is gone for good.
     """
     if file:
         from poma_memory.api import index_file
@@ -95,8 +98,11 @@ def poma_index(path: str = ".agent/", file: str | None = None,
 
         try:
             result = index_file(file, path=path)
-        except (ValueError, MetadataRulesError) as e:
-            return f"Index failed: {e}"
+        except (OSError, ValueError, MetadataRulesError) as e:
+            # OSError too: a missing or unreadable file raised straight out of
+            # the tool, and the agent got a transport-level error instead of a
+            # sentence it could act on.
+            return f"Index failed: {file}: {getattr(e, 'strerror', None) or e}"
         return (
             f"{file}: {result['status']}"
             f" ({result.get('new_chunks', 0)} chunks,"
@@ -104,8 +110,15 @@ def poma_index(path: str = ".agent/", file: str | None = None,
         )
 
     from poma_memory.api import index as api_index
+    from poma_memory.metadata import MetadataRulesError
 
-    result = api_index(path=path, glob=glob, prune=prune)
+    try:
+        result = api_index(path=path, glob=glob, prune=prune)
+    except (OSError, MetadataRulesError) as e:
+        # The `file` branch above has always caught this; the directory branch
+        # did not, so a `.poma-metadata.json` with a typo in it raised out of
+        # the tool as a traceback rather than naming the file and the typo.
+        return f"Index failed: {e}"
     summary = (
         f"Indexed {result['files_indexed']} files:"
         f" {result['chunks_created']} chunks,"
@@ -125,6 +138,34 @@ def poma_index(path: str = ".agent/", file: str | None = None,
                     " that failed to mount rather than a deletion. Call again"
                     " with prune=True if they really are gone.)")
     return summary
+
+
+@mcp.tool()
+def poma_forget(path: str, db_path: str | None = None) -> str:
+    """Remove every indexed row under a directory, whether or not it still exists.
+
+    Use this when a search refuses with "still hold metadata resolved against
+    an earlier rule set" and names files under a directory that has been
+    deleted or renamed. `poma_index` cannot clear those: it only removes
+    documents under a directory it can still see, deliberately, so that a run
+    over one directory can never delete another's rows.
+
+    Args:
+        path: Directory whose rows to remove (it need not still exist)
+        db_path: Database holding them. Required once `path` itself is gone,
+            because the default database lives inside it -- the refusal
+            message names the database to pass here.
+    """
+    from poma_memory.api import forget
+
+    try:
+        result = forget(path, db_path=db_path)
+    except OSError as e:
+        return f"Forget failed: {e}"
+    n = len(result["forgotten"])
+    if not n:
+        return f"Nothing indexed under {result['root']} in {result['db_path']}."
+    return f"Forgot {n} file(s) under {result['root']}."
 
 
 @mcp.tool()

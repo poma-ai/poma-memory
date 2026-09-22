@@ -60,13 +60,15 @@ Once added, Claude Code can call `poma_search` during planning and exploration t
 ## Python API
 
 ```python
-from poma_memory import index, search, status
+from poma_memory import index, search, status, forget
 
 index(path=".claude/")
 results = search("session context", path=".claude/", top_k=5)
 for r in results:
     print(f"{r['file_path']} (score: {r['score']:.4f})")
     print(r['context'])
+
+forget("old-project/", db_path="shared.db")   # drop a directory's rows
 ```
 
 ---
@@ -140,23 +142,40 @@ shows both.
 
 Each row records which directory's rules produced it, so this holds however the
 database is addressed — including `--db` pointing somewhere else, and two
-directories sharing one database. A run given a narrower `--glob` reaches only
-part of the corpus and leaves the rest on the old rules; re-run over each
-directory to clear it.
+directories sharing one database. Directories sharing a database must be
+**disjoint**: index `/proj/.agent` and `/proj/.agent/events` into one and each
+file belongs to whichever run touched it last, silently, with `status`
+reporting the index complete. A run given a narrower `--glob` reaches only part
+of the corpus and leaves the rest on the old rules; re-run over each directory
+to clear it.
 
 `index` also **removes** documents that are gone from disk, so a deleted or
-renamed file stops appearing in results. It only does this for files under the
-directory it was given, and only when that directory itself is present — a run
-against an unmounted drive removes nothing.
+renamed file stops appearing in results. It only ever does this for files under
+the directory it was given — a run over one directory never removes another's
+rows, even when they share a database and even with `--prune`.
 
-It holds back rather than removing when a whole directory has disappeared, or
-when the removals would be most of the index, since both look more like
-something that failed to mount than a deletion. Held-back documents stay in the
-index and keep appearing in results until you decide: `--prune` removes them,
-`--no-prune` never removes anything. A handful of individual files going
-missing is removed without asking. A change is detected by mtime, size
-or ctime, so an edit restored from a backup with its timestamp intact is still
-picked up.
+It holds back rather than removing when the directory it was given is itself
+absent, when a whole directory under it has disappeared, or when the removals
+would be most of the index, since all three look more like something that
+failed to mount than a deletion. Held-back documents stay in the index and keep
+appearing in results until you decide: `--prune` removes them, `--no-prune`
+never removes anything. A handful of individual files going missing is removed
+without asking. A change is detected by mtime, size or ctime, so an edit
+restored from a backup with its timestamp intact is still picked up.
+
+`--prune` overrides the proportional hold-back, not the other two: a run whose
+directory is absent removes nothing whatever the flag says, because at that
+moment nothing can tell an unmounted drive from a deleted one.
+
+For a directory that is gone for good, **`poma-memory forget <dir> --db <db>`**
+drops its rows — it does not need the directory to exist, and it reaches
+nothing outside it. That is the way out of two states nothing else can clear:
+a directory deleted while it shared a database with another, and a directory
+that was renamed. In both, the old rows hold metadata resolved against rules
+nobody can re-read, so every filtered search refuses — including searches that
+have nothing to do with the directory that moved. Name `--db` explicitly: the
+default database lives *inside* the directory that is missing. A refusal caused
+by this prints the exact command.
 
 Why the filter runs before ranking rather than after, and what the refusals are
 protecting against: **[`docs/metadata-filtering.md`](docs/metadata-filtering.md)**.

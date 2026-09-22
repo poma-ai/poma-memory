@@ -13,7 +13,13 @@ CREATE TABLE IF NOT EXISTS files (
     file_path    TEXT PRIMARY KEY,
     byte_offset  INTEGER NOT NULL DEFAULT 0,
     content_hash TEXT NOT NULL DEFAULT '',
-    mtime        REAL NOT NULL DEFAULT 0
+    mtime        REAL NOT NULL DEFAULT 0,
+    metadata     TEXT NOT NULL DEFAULT '',
+    fm_unparsed  INTEGER NOT NULL DEFAULT 0,
+    rules_hash   TEXT NOT NULL DEFAULT '',
+    rules_root   TEXT NOT NULL DEFAULT '',
+    size_bytes   INTEGER NOT NULL DEFAULT 0,
+    ctime        REAL NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -123,6 +129,34 @@ class Store:
         except sqlite3.OperationalError:
             pass  # column already exists
 
+        # v0.6.0: per-file metadata (path rules + front-matter) as opaque JSON.
+        # Three states matter and '' is one of them: '' means this row predates
+        # metadata indexing, '{}' means it was scanned and has none. Collapsing
+        # them would make a filtered search on a legacy index return [] that is
+        # indistinguishable from "no document matches".
+        for column, ddl in (
+            ("metadata", "ALTER TABLE files ADD COLUMN metadata TEXT NOT NULL DEFAULT ''"),
+            ("fm_unparsed", "ALTER TABLE files ADD COLUMN fm_unparsed INTEGER NOT NULL DEFAULT 0"),
+            ("rules_hash", "ALTER TABLE files ADD COLUMN rules_hash TEXT NOT NULL DEFAULT ''"),
+            # The directory whose `.poma-metadata.json` produced this row. Stored
+            # rather than inferred from the database's location: a database can
+            # live anywhere (`--db`), and two roots can share one, so location
+            # answers "which rules govern this row" only by accident.
+            ("rules_root", "ALTER TABLE files ADD COLUMN rules_root TEXT NOT NULL DEFAULT ''"),
+            # Size and ctime as `os.stat` reports them, so an edit that
+            # preserves mtime is still noticed. 0 means "not recorded" -- a row
+            # written before these columns existed -- and reads as changed, so
+            # the row is re-read once and healed. See `incremental._stat_agrees`
+            # for why that is deliberate and what each field catches.
+            ("size_bytes", "ALTER TABLE files ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0"),
+            ("ctime", "ALTER TABLE files ADD COLUMN ctime REAL NOT NULL DEFAULT 0"),
+        ):
+            try:
+                self._conn.execute(ddl)
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
     def close(self) -> None:
         self._conn.close()
 
@@ -135,18 +169,116 @@ class Store:
         return dict(row) if row else None
 
     def upsert_file_record(
-        self, file_path: str, byte_offset: int, content_hash: str, mtime: float
+        self, file_path: str, byte_offset: int, content_hash: str, mtime: float,
+        metadata: str | None = None, fm_unparsed: bool | None = None,
+        rules_hash: str | None = None, rules_root: str | None = None,
+        size_bytes: int | None = None, ctime: float | None = None,
     ) -> None:
+        """Write a file row. `metadata=None` leaves any existing value alone.
+
+        Callers that are not metadata-aware (and older callers) must not blank
+        the column just by touching the row, so None means "don't change it"
+        rather than "set it to empty".
+        """
+        flag = None if fm_unparsed is None else int(fm_unparsed)
         self._conn.execute(
-            """INSERT INTO files (file_path, byte_offset, content_hash, mtime)
-               VALUES (?, ?, ?, ?)
+            """INSERT INTO files (file_path, byte_offset, content_hash, mtime,
+                                  metadata, fm_unparsed, rules_hash, rules_root,
+                                  size_bytes, ctime)
+               VALUES (?, ?, ?, ?, COALESCE(?, ''), COALESCE(?, 0),
+                       COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, 0),
+                       COALESCE(?, 0))
                ON CONFLICT(file_path) DO UPDATE SET
                    byte_offset=excluded.byte_offset,
                    content_hash=excluded.content_hash,
-                   mtime=excluded.mtime""",
-            (file_path, byte_offset, content_hash, mtime),
+                   mtime=excluded.mtime,
+                   metadata=COALESCE(?, files.metadata),
+                   fm_unparsed=COALESCE(?, files.fm_unparsed),
+                   rules_hash=COALESCE(?, files.rules_hash),
+                   rules_root=COALESCE(?, files.rules_root),
+                   size_bytes=COALESCE(?, files.size_bytes),
+                   ctime=COALESCE(?, files.ctime)""",
+            (file_path, byte_offset, content_hash, mtime, metadata, flag,
+             rules_hash, rules_root, size_bytes, ctime,
+             metadata, flag, rules_hash, rules_root, size_bytes, ctime),
         )
         self._conn.commit()
+
+    def set_file_metadata(self, file_path: str, metadata: str,
+                          fm_unparsed: bool = False,
+                          rules_hash: str = "", rules_root: str = "") -> None:
+        """Update metadata in place, without re-chunking or re-embedding.
+
+        This is the whole backfill mechanism. `_full_reindex` would delete,
+        re-chunk and re-embed the file, which on the OpenAI embedder is real
+        money for a column that can be filled from the file head.
+        """
+        self._conn.execute(
+            "UPDATE files SET metadata = ?, fm_unparsed = ?, rules_hash = ?, "
+            "rules_root = ? WHERE file_path = ?",
+            (metadata, int(fm_unparsed), rules_hash, rules_root, file_path),
+        )
+        self._conn.commit()
+
+    def all_file_paths(self) -> list[str]:
+        rows = self._conn.execute("SELECT file_path FROM files").fetchall()
+        return [r["file_path"] for r in rows]
+
+    def count_files_without_metadata(self) -> int:
+        """Files never scanned for metadata. Non-zero blocks a filtered search."""
+        return self._conn.execute(
+            "SELECT COUNT(*) AS c FROM files WHERE metadata = ''"
+        ).fetchone()["c"]
+
+    def metadata_rows(self) -> list[tuple[str, str, str, str]]:
+        """(file_path, metadata, rules_root, rules_hash) for EVERY file row.
+
+        One scan answering all three questions a filtered search asks --
+        is anything unscanned, is anything on superseded rules, and what does
+        each file carry. Three separate queries were not only slower but could
+        straddle a concurrent write and describe three different moments.
+        """
+        rows = self._conn.execute(
+            "SELECT file_path, metadata, rules_root, rules_hash FROM files "
+            "ORDER BY file_path"
+        ).fetchall()
+        return [(r["file_path"], r["metadata"], r["rules_root"], r["rules_hash"])
+                for r in rows]
+
+    def scanned_rows_rules(self) -> list[tuple[str, str, str]]:
+        """(file_path, rules_root, rules_hash) for every row that was scanned.
+
+        Provenance travels with the row, so deciding whether a row is current
+        needs no guess about which directory owns the database. Unscanned rows
+        are excluded: `MetadataNotIndexed` already covers them, and they have no
+        rules to be stale against.
+        """
+        rows = self._conn.execute(
+            "SELECT file_path, rules_root, rules_hash FROM files "
+            "WHERE metadata != '' ORDER BY file_path"
+        ).fetchall()
+        return [(r["file_path"], r["rules_root"], r["rules_hash"]) for r in rows]
+
+    def get_file_metadata_map(self) -> dict[str, dict]:
+        """file_path -> parsed metadata, skipping rows that have none recorded."""
+        rows = self._conn.execute(
+            "SELECT file_path, metadata FROM files WHERE metadata != ''"
+        ).fetchall()
+        out: dict[str, dict] = {}
+        for r in rows:
+            try:
+                value = json.loads(r["metadata"])
+            except (ValueError, TypeError):
+                continue
+            if isinstance(value, dict):
+                out[r["file_path"]] = value
+        return out
+
+    def unparsed_frontmatter_files(self) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT file_path FROM files WHERE fm_unparsed = 1 ORDER BY file_path"
+        ).fetchall()
+        return [r["file_path"] for r in rows]
 
     # --- Chunks ---
 
@@ -174,6 +306,18 @@ class Store:
     def get_max_local_index(self, file_path: str) -> int:
         row = self._conn.execute(
             "SELECT MAX(local_index) as m FROM chunks WHERE file_path = ?",
+            (file_path,),
+        ).fetchone()
+        return row["m"] if row and row["m"] is not None else -1
+
+    def get_max_chunkset_local_index(self, file_path: str) -> int:
+        """Highest chunkset `local_index` for one file, or -1 if it has none.
+
+        The per-file counterpart of `get_max_local_index`. `local_index` is
+        unique per file, so an append has to continue THIS file's sequence.
+        """
+        row = self._conn.execute(
+            "SELECT MAX(local_index) as m FROM chunksets WHERE file_path = ?",
             (file_path,),
         ).fetchone()
         return row["m"] if row and row["m"] is not None else -1
@@ -225,6 +369,52 @@ class Store:
             list(chunkset_ids),
         ).fetchone()
         return float(row["m"]) if row and row["m"] is not None else 0.0
+
+    # SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999 on older builds, so an
+    # `IN (?, ?, …)` over every matching file has to be batched. 900 leaves room
+    # for the handful of other parameters a query might carry.
+    _IN_BATCH = 900
+
+    def chunkset_ids_for_files(self, file_paths: set[str]) -> set[int]:
+        """Chunkset ids belonging to these files, resolved in SQL.
+
+        The obvious version -- pull every (chunkset_id, file_path) pair and
+        filter in Python -- costs the whole table on every filtered query, which
+        measured 23 ms of a 39 ms search on a 48k-chunkset corpus. This touches
+        only the matching rows, and the `UNIQUE(file_path, local_index)`
+        constraint already provides an index whose leftmost column is
+        `file_path`, so no extra index is needed (verified with EXPLAIN QUERY
+        PLAN: `SEARCH chunksets USING COVERING INDEX`).
+        """
+        paths = list(file_paths)
+        out: set[int] = set()
+        for i in range(0, len(paths), self._IN_BATCH):
+            batch = paths[i:i + self._IN_BATCH]
+            placeholders = ",".join("?" * len(batch))
+            rows = self._conn.execute(
+                f"SELECT chunkset_id FROM chunksets WHERE file_path IN ({placeholders})",
+                batch,
+            ).fetchall()
+            out.update(r["chunkset_id"] for r in rows)
+        return out
+
+    def get_chunkset_files(self) -> list[tuple[int, str]]:
+        """(chunkset_id, file_path) for every chunkset.
+
+        No longer on the search path -- `chunkset_ids_for_files` replaced it,
+        because materialising the whole table cost 22 ms per filtered query
+        however narrow the predicate was. Kept as the independent oracle the
+        equivalence test compares that query against; if that test goes, so
+        does this.
+
+        Two columns rather than `get_all_chunksets`, which carries every
+        chunkset's full text: resolving a metadata predicate needs only the
+        mapping, and the search path already loads the contents once.
+        """
+        rows = self._conn.execute(
+            "SELECT chunkset_id, file_path FROM chunksets"
+        ).fetchall()
+        return [(r["chunkset_id"], r["file_path"]) for r in rows]
 
     def get_all_chunksets(self) -> list[dict]:
         rows = self._conn.execute(
@@ -306,4 +496,6 @@ class Store:
             "total_chunks": chunk_count,
             "total_chunksets": chunkset_count,
             "has_embeddings": has_emb,
+            "files_without_metadata": self.count_files_without_metadata(),
+            "unparsed_frontmatter": self.unparsed_frontmatter_files(),
         }

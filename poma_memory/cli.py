@@ -25,6 +25,14 @@ def main(argv: list[str] | None = None) -> None:
     p_index.add_argument("--file", help="Index a single file")
     p_index.add_argument("--db", help="Database path (default: {path}/.poma-memory.db)")
     p_index.add_argument("--glob", default="**/*.md", help="File pattern")
+    p_prune = p_index.add_mutually_exclusive_group()
+    p_prune.add_argument("--prune", dest="prune", action="store_true", default=None,
+                         help="Remove indexed files that are gone from disk, "
+                              "even when that is most of the index. Never rows "
+                              "outside this directory, and nothing at all when "
+                              "the directory itself is absent (see `forget`)")
+    p_prune.add_argument("--no-prune", dest="prune", action="store_false",
+                         help="Never remove indexed files that are gone")
 
     # search
     p_search = sub.add_parser("search", help="Search indexed content")
@@ -38,11 +46,24 @@ def main(argv: list[str] | None = None) -> None:
     p_search.add_argument("--empty-gate", type=float, default=None, dest="empty_gate",
                           help="Suppress ALL results when the best semantic hit's cosine "
                                "is below this (default: embedder-calibrated; 0 disables)")
+    p_search.add_argument("--where", action="append", default=None, metavar="KEY=VALUE",
+                          help="Metadata filter, repeatable. Repeats of one key are "
+                               "OR'd, different keys are AND'd. Requires an index "
+                               "built with metadata (.poma-metadata.json).")
     p_search.add_argument("--socket", default="auto",
                           help="Daemon socket: 'auto' (default), a path, or "
                                "'off' to force in-process search")
     p_search.add_argument("--json", action="store_true", dest="as_json",
                           help="Output as JSON")
+
+    # forget
+    p_forget = sub.add_parser(
+        "forget",
+        help="Remove every indexed row under a directory, gone or not")
+    p_forget.add_argument("path", help="Directory whose rows to remove")
+    p_forget.add_argument("--db", help="Database path. Required once the "
+                                       "directory itself is gone, since the "
+                                       "default one lives inside it")
 
     # status
     p_status = sub.add_parser("status", help="Show index status")
@@ -74,6 +95,8 @@ def main(argv: list[str] | None = None) -> None:
         _cmd_index(args)
     elif args.command == "search":
         _cmd_search(args)
+    elif args.command == "forget":
+        _cmd_forget(args)
     elif args.command == "status":
         _cmd_status(args)
     elif args.command == "mcp":
@@ -84,31 +107,100 @@ def main(argv: list[str] | None = None) -> None:
 
 def _cmd_index(args: argparse.Namespace) -> None:
     """Index command: index all markdown files in a directory."""
-    from poma_memory.api import index
-    from poma_memory.store import Store
-    from poma_memory.incremental import update_file
-    from pathlib import Path
+    import sqlite3
+
+    from poma_memory.api import index, index_file
+
+    from poma_memory.metadata import MetadataRulesError
 
     if args.file:
-        # Single file mode
-        path = Path(args.path)
-        db_path = args.db or str(path / ".poma-memory.db")
-        store = Store(db_path)
-        result = update_file(store, args.file)
-        store.close()
+        # Single file mode. Goes through index_file so the directory's path
+        # rules still apply — resolving one file without them would record
+        # "scanned, no metadata" where a rule says otherwise.
+        try:
+            result = index_file(args.file, path=args.path, db_path=args.db)
+        except (OSError, ValueError, MetadataRulesError,
+                sqlite3.DatabaseError) as e:
+            # OSError as well as ValueError. `index()` already treats an
+            # unreadable or missing document as costing that file and not the
+            # run; here the same file tracebacked out of `main` instead --
+            # `poma-memory index --file nope.md` printed a FileNotFoundError
+            # stack, while the same file with one Latin-1 byte printed a clean
+            # message, because UnicodeDecodeError happens to be a ValueError.
+            print(f"poma-memory: {args.file}: "
+                  f"{getattr(e, 'strerror', None) or e}", file=sys.stderr)
+            raise SystemExit(2)
         print(f"{args.file}: {result['status']}"
               f" ({result.get('new_chunks', 0)} chunks,"
               f" {result.get('new_chunksets', 0)} chunksets)")
     else:
-        result = index(path=args.path, db_path=args.db, glob=args.glob)
-        print(f"Indexed {result['files_indexed']} files:"
-              f" {result['chunks_created']} chunks,"
-              f" {result['chunksets_created']} chunksets")
+        try:
+            result = index(path=args.path, db_path=args.db, glob=args.glob,
+                           prune=getattr(args, "prune", None))
+        except MetadataRulesError as e:
+            print(f"poma-memory: {e}", file=sys.stderr)
+            raise SystemExit(2)
+        except sqlite3.DatabaseError as e:
+            # `index` is the command the refusal messages teach people to type
+            # `--db` into, and it was the one still tracebacking on a `--db`
+            # that is not a database (or a corrupt default one).
+            print(f"poma-memory: {args.db or args.path}: {e}", file=sys.stderr)
+            raise SystemExit(2)
+        summary = (f"Indexed {result['files_indexed']} files:"
+                   f" {result['chunks_created']} chunks,"
+                   f" {result['chunksets_created']} chunksets")
+        # Pruning is the one thing this command does that destroys data. On
+        # stderr alone it is invisible to anything reading stdout.
+        if result.get("pruned"):
+            summary += (f" ({len(result['pruned'])} removed:"
+                        " no longer on disk)")
+        if result.get("prune_held_back"):
+            summary += (f" ({len(result['prune_held_back'])} missing, kept"
+                        " — see above)")
+        print(summary)
+
+
+def _parse_where(pairs: list[str] | None) -> dict | None:
+    """Turn repeated `--where key=value` into the predicate dict.
+
+    Repeats of one key become a list (OR); distinct keys stay separate (AND).
+    A flat encoding on purpose: anything richer on the command line would be a
+    filter DSL, and the predicate deliberately is not one.
+    """
+    if not pairs:
+        return None
+    out: dict[str, list[str]] = {}
+    for pair in pairs:
+        key, sep, value = pair.partition("=")
+        key = key.strip()
+        if not sep or not key:
+            raise SystemExit(f"--where expects KEY=VALUE, got {pair!r}")
+        out.setdefault(key, []).append(value)
+    # One value stays a scalar so the wire form matches what the API documents.
+    return {k: (v[0] if len(v) == 1 else v) for k, v in out.items()}
+
+
+# Daemon codes that are a real answer about the index, not a daemon fault.
+# Falling through to the in-process path on one of these reaches the same
+# refusal a model load later — and `bad_rules` used to be missing here, so the
+# fallback ran and the user got a raw traceback instead of the daemon's clean
+# message.
+_REFUSAL_CODES = frozenset({"bad_rules"})
 
 
 def _cmd_search(args: argparse.Namespace) -> None:
     """Search command: search indexed content."""
     import os
+    import sqlite3
+
+    from poma_memory.metadata import MetadataIncomplete, normalize_where
+
+    where = _parse_where(getattr(args, "where", None))
+    try:
+        normalize_where(where)
+    except ValueError as e:
+        print(f"poma-memory: {e}", file=sys.stderr)
+        raise SystemExit(2)
 
     # The env overrides documented on `search` (POMA_MEMORY_EMPTY_GATE selects the
     # relevance gate, POMA_EMBEDDER selects the embedder) are read inside the
@@ -151,23 +243,56 @@ def _cmd_search(args: argparse.Namespace) -> None:
                 "top_k": args.top,
                 "min_score": args.min_score,
                 "empty_gate": empty_gate,
+                "where": where,
             }, sock)
             if resp.get("ok"):
-                results = resp.get("results", [])
+                if where is not None and "where" not in resp:
+                    # A daemon from before `where` existed: it ignored the key
+                    # and answered for the WHOLE corpus, `ok: true`. The
+                    # session-start hook restarts a daemon whose version does
+                    # not match the installed one, but between a `pip install
+                    # -U` and the next session start the old one is still
+                    # serving. Not an answer to this question, so treat it as
+                    # no daemon and search in-process.
+                    results = None
+                else:
+                    results = resp.get("results", [])
+            elif str(resp.get("code", "")) in _REFUSAL_CODES or str(
+                    resp.get("code", "")).startswith("metadata_"):
+                # A real answer, not a daemon problem. Falling through to the
+                # in-process path would reach the same refusal ~0.5s and one
+                # model load later.
+                print(f"poma-memory: {resp.get('error')}", file=sys.stderr)
+                raise SystemExit(2)
+        except SystemExit:
+            raise
         except Exception:
             results = None
 
     if results is None:
         from poma_memory.api import search
 
-        results = search(
-            query=args.query,
-            path=args.path,
-            db_path=args.db,
-            top_k=args.top,
-            min_score=args.min_score,
-            empty_gate=empty_gate,
-        )
+        try:
+            results = search(
+                query=args.query,
+                path=args.path,
+                db_path=args.db,
+                top_k=args.top,
+                min_score=args.min_score,
+                empty_gate=empty_gate,
+                where=where,
+            )
+        except MetadataIncomplete as e:
+            # Only this one. A bare `ValueError` here would swallow, say, a
+            # corrupt chunk_ids blob and report it as a metadata problem.
+            print(f"poma-memory: {e}", file=sys.stderr)
+            raise SystemExit(2)
+        except sqlite3.DatabaseError as e:
+            # A `--db` that is not a database, which the refusal messages now
+            # invite people to type by hand.
+            print(f"poma-memory: {args.db or args.path}: {e}",
+                  file=sys.stderr)
+            raise SystemExit(2)
 
     if args.as_json:
         print(json.dumps(results, indent=2))
@@ -187,11 +312,43 @@ def _cmd_search(args: argparse.Namespace) -> None:
         print(r["context"])
 
 
+def _cmd_forget(args: argparse.Namespace) -> None:
+    """Forget command: drop every row under a directory."""
+    import sqlite3
+
+    from poma_memory.api import forget
+
+    try:
+        result = forget(args.path, db_path=args.db)
+    except (OSError, sqlite3.DatabaseError) as e:
+        # `sqlite3.DatabaseError` as well as `OSError`. This is the command
+        # whose whole point is that the user types `--db` by hand, copied out
+        # of an error message, so pointing it at the wrong file is the expected
+        # mistake -- and it tracebacked out of `main` with exit 1 instead of
+        # naming the path. `--db <a directory>` raises OperationalError,
+        # `--db <any other file>` raises DatabaseError; neither is an OSError.
+        print(f"poma-memory: {args.db or args.path}: {e}", file=sys.stderr)
+        raise SystemExit(2)
+    n = len(result["forgotten"])
+    if not n:
+        print(f"Nothing indexed under {result['root']} in {result['db_path']}.")
+        return
+    print(f"Forgot {n} file(s) under {result['root']}.")
+
+
 def _cmd_status(args: argparse.Namespace) -> None:
     """Status command: show index status."""
+    import sqlite3
+
     from poma_memory.api import status
 
-    info = status(path=args.path, db_path=args.db)
+    try:
+        info = status(path=args.path, db_path=args.db)
+    except sqlite3.DatabaseError as e:
+        # Same user-typed `--db` as the two commands above. Pre-existing rather
+        # than new, but it is the same one-line hole on the same surface.
+        print(f"poma-memory: {args.db}: {e}", file=sys.stderr)
+        raise SystemExit(2)
 
     if not info["files"]:
         print("No indexed files. Run: poma-memory index")
@@ -201,6 +358,24 @@ def _cmd_status(args: argparse.Namespace) -> None:
     print(f"Chunks:    {info['total_chunks']}")
     print(f"Chunksets: {info['total_chunksets']}")
     print(f"Semantic:  {'yes' if info['has_embeddings'] else 'no'}")
+    # Both ways the index can be behind, because this is the surface a user
+    # checks when a filtered search refuses. Reporting only the first said
+    # "complete" while every filtered search exited 2.
+    missing = info.get("files_without_metadata", 0)
+    stale = info.get("stale_rules", [])
+    if info.get("rules_error"):
+        print(f"Metadata:  rules file unusable - {info['rules_error']}")
+    elif missing:
+        print(f"Metadata:  {missing} file(s) unscanned - run `poma-memory index`")
+    elif stale:
+        print(f"Metadata:  {len(stale)} file(s) on an earlier rule set - "
+              "run `poma-memory index`")
+    else:
+        print("Metadata:  complete")
+    for f in stale[:3]:
+        print(f"  ! earlier rule set: {f}")
+    for f in info.get("unparsed_frontmatter", []):
+        print(f"  ! unparsed front-matter: {f}")
     for f in info["files"]:
         print(f"  - {f}")
 

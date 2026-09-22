@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import os
 from typing import TYPE_CHECKING
 
 from poma_memory.bm25_search import BM25Search
+from poma_memory.metadata import (
+    MetadataNotIndexed, MetadataStale, MetadataUnreadable, matches,
+    normalize_where, stale_by_root,
+)
 from poma_primecut_nano import expand_chunk_ids, assemble_context
 
 if TYPE_CHECKING:
@@ -26,6 +31,16 @@ class HybridSearch:
         self._store = store
         self._bm25 = BM25Search(store)
         self._semantic = None
+
+        # The BM25 corpus and the embedding matrix are snapshots — they are
+        # expensive, and the daemon rebuilds them when `PRAGMA data_version`
+        # moves. Metadata deliberately is NOT snapshotted here: it is read in
+        # one pass per query by `_allowed_ids`. A rules-file edit writes nothing
+        # to the database, so data_version never moves for it and a cached
+        # snapshot would keep vouching for rules that are gone; and splitting
+        # the freshness check from the map it guards let a reindex landing
+        # between them pass the check against new rows while resolving the
+        # predicate from the old map.
 
         if enable_semantic and HAS_SEMANTIC:
             try:
@@ -48,6 +63,7 @@ class HybridSearch:
         max_per_file: int = 3,
         min_score: float = 0.0,
         empty_gate: float | None = None,
+        where: dict | None = None,
     ) -> list[dict]:
         """Search with hybrid BM25 + semantic fusion.
 
@@ -59,15 +75,34 @@ class HybridSearch:
             empty_gate: Suppress ALL results when the best semantic hit's
                 cosine is below this. None = the embedder's calibrated
                 default; 0.0 disables. Env override: POMA_MEMORY_EMPTY_GATE.
+            where: Metadata predicate, e.g. {"kind": ["decision", "lesson"]}.
+                AND across keys, OR within a list. The corpus is narrowed
+                before anything is ranked — see `_allowed_ids`.
 
         Returns:
             List of dicts: [{file_path, score, context, chunk_ids}]
+
+        Raises:
+            MetadataNotIndexed: `where` was given but this index has files with
+                no metadata recorded, so the answer could not be honest.
+            MetadataStale: `where` was given but some rows were resolved
+                against a rule set other than the current one.
+            MetadataRulesError: a rules file a row points at cannot be read.
+                All three are `MetadataIncomplete`; catch that to cover any.
         """
+        allowed_ids = self._allowed_ids(where)
+        if allowed_ids is not None and not allowed_ids:
+            # Nothing matches the predicate. Returning early also avoids handing
+            # the searchers an all-zero mask, which is not a meaningful ranking.
+            return []
+
         # BM25 always runs
-        bm25_hits = self._bm25.search(query, top_k=top_k * 3)
+        bm25_hits = self._bm25.search(query, top_k=top_k * 3,
+                                      allowed_ids=allowed_ids)
 
         if self._semantic:
-            vec_hits = self._semantic.search(query, top_k=top_k * 3)
+            vec_hits = self._semantic.search(query, top_k=top_k * 3,
+                                             allowed_ids=allowed_ids)
             # Empty gate on ABSOLUTE similarity of the single best semantic
             # hit. RRF fused scores are rank-based: something always tops the
             # list, and a top-of-both-lists hit scores ~0.033 whether it is a
@@ -147,6 +182,77 @@ class HybridSearch:
         if min_score > 0.0:
             results = [r for r in results if r["score"] >= min_score]
         return results
+
+    def _allowed_ids(self, where: dict | None) -> set[int] | None:
+        """Chunkset ids the predicate admits, or None when there is no predicate.
+
+        Resolved before ranking, which is the entire point: the empty gate is
+        taken from the top-1 cosine of the ranked list, so a corpus narrowed
+        afterwards would leave the gate answering for documents the caller
+        excluded.
+
+        Everything metadata reads happens here, in one pass per query, so the
+        completeness check, the staleness check and the map they guard all
+        describe the same moment.
+        """
+        where = normalize_where(where)
+        if where is None:
+            return None
+
+        # ONE read answering all three questions, so they describe the same
+        # moment. As three separate queries this was both slower and able to
+        # straddle a concurrent write.
+        rows = self._store.metadata_rows()
+
+        missing = [fp for fp, meta, _, _ in rows if not meta]
+        if missing:
+            # An empty result here would be indistinguishable from an honest
+            # "nothing matches", so refuse instead of guessing.
+            raise MetadataNotIndexed(len(missing), self._store.db_path,
+                                     missing[:3])
+
+        # Each row names the directory its rules came from, so this re-reads
+        # those rules now rather than trusting anything cached or inferred --
+        # and keeps the grouping, because the remedy for a stale row is a
+        # command naming ITS directory and this database, not a flag.
+        by_root = stale_by_root([(fp, root, h) for fp, _, root, h in rows])
+        if by_root:
+            # EVERY stale row with the directory it came from, not a sample:
+            # the remedy is chosen from what the rows actually are, and a
+            # three-item slice both miscounted and picked the branch by
+            # whichever paths happened to sort first.
+            raise MetadataStale(
+                sorted((fp, root) for root, group in by_root.items()
+                       for fp in group),
+                self._store.db_path,
+            )
+
+        keep_files = set()
+        bad: list[tuple[str, str]] = []
+        for file_path, meta, root, _ in rows:
+            try:
+                value = json.loads(meta)
+            except (ValueError, TypeError):
+                value = None
+            if not isinstance(value, dict):
+                # The row passed the completeness check above -- it is not ''
+                # -- so this is a blob that was written and has since become
+                # unreadable. Skipping it dropped that document out of every
+                # filtered result silently, which is the one outcome this whole
+                # mechanism exists to refuse: an answer the caller cannot tell
+                # from a correct one. Collected rather than raised on the first
+                # one, so the refusal can name the directories they came from
+                # and pick the remedy that actually works for them.
+                bad.append((file_path, root))
+                continue
+            if matches(value, where):
+                keep_files.add(file_path)
+        if bad:
+            raise MetadataUnreadable(sorted(bad), self._store.db_path)
+        # Resolved in SQL rather than by scanning every chunkset in Python: the
+        # whole-table version cost 22 ms regardless of how narrow the predicate
+        # was, against 0.12 ms here for a 1%% filter.
+        return self._store.chunkset_ids_for_files(keep_files)
 
     def _resolve_empty_gate(self, empty_gate: float | None) -> float:
         """Precedence: explicit param > POMA_MEMORY_EMPTY_GATE env >

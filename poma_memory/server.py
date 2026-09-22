@@ -53,6 +53,10 @@ import threading
 import time
 from pathlib import Path
 
+from poma_memory.metadata import (
+    MetadataIncomplete, MetadataNotIndexed, MetadataRulesError, MetadataStale,
+    normalize_where,
+)
 from poma_memory.search import HybridSearch
 from poma_memory.store import Store
 
@@ -96,12 +100,39 @@ def _resolve_db(path: str | None, db_path: str | None) -> Path:
     return candidate / ".poma-memory.db"
 
 
+def _lock_key(req: dict) -> str:
+    """Which index this request serialises on: the RESOLVED database path.
+
+    The same string `_IndexCache` keys its entries on, and it has to be. Keyed
+    on the raw request instead, two spellings of one index took two different
+    locks -- `{"path": "/r/.agent"}` and
+    `{"db_path": "/r/.agent/.poma-memory.db"}` are the same database, and the
+    CLI sends the second whenever `--db` is passed. Two threads then entered
+    `_IndexCache.get` for one entry, and one closed the Store the other was
+    reading. Measured on 320 mixed requests before the fix: 13 failures
+    ("Cannot operate on a closed database", "bad parameter or other API
+    misuse", "tuple index out of range") and 4 cache builds instead of 1.
+
+    Anything with no resolvable database -- `ping`, `stats`, a relative path
+    `_handle` will refuse anyway -- shares the empty key and touches no index.
+    """
+    try:
+        return str(_resolve_db(req.get("path"), req.get("db_path")))
+    except Exception:
+        return ""
+
+
 class _IndexCache:
     """db path -> warm HybridSearch, invalidated when the db file changes."""
 
     def __init__(self, limit: int = MAX_CACHED_INDEXES):
         self._limit = limit
         self._entries: dict[str, dict] = {}
+        # `_entries` is touched by every worker thread. Held only around the
+        # dict itself, never across a build: a cold build is ~0.4s, and holding
+        # this through one would re-serialise every index behind the slowest,
+        # which is what the per-index `_LockTable` exists to avoid.
+        self._guard = threading.Lock()
         # Every rebuild is ~0.4s of model load and embedding reads. A daemon that
         # silently rebuilds on every request has lost its entire reason to exist
         # while still looking healthy, so the count is observable via `stats`.
@@ -156,14 +187,23 @@ class _IndexCache:
 
     def get(self, db: Path) -> HybridSearch:
         key = str(db)
-        entry = self._entries.get(key)
+        with self._guard:
+            entry = self._entries.get(key)
 
         if entry is not None:
             if self._stamp(entry["store"], db) == entry["stamp"]:
                 entry["used"] = time.time()
                 return entry["search"]
             # Another process wrote the index — drop the warm copy and rebuild.
-            self._close(key)
+            # Closing IS safe here, unlike in `_evict`: the caller holds this
+            # database's lock, so no other thread can be inside a search on it.
+            with self._guard:
+                if self._entries.get(key) is entry:
+                    del self._entries[key]
+            try:
+                entry["store"].close()
+            except Exception:
+                pass
 
         # Stamp before AND after building. An indexer that commits while
         # HybridSearch is reading would otherwise be recorded as "already
@@ -188,38 +228,64 @@ class _IndexCache:
             search = HybridSearch(store)
             after = self._stamp(store, db)
 
-        self.builds += 1
-        self._entries[key] = {
-            "store": store,
-            "search": search,
-            "stamp": after,
-            "used": time.time(),
-        }
-        self._evict()
+        with self._guard:
+            self.builds += 1
+            self._entries[key] = {
+                "store": store,
+                "search": search,
+                "stamp": after,
+                "used": time.time(),
+            }
+            self._evict()
         return search
 
-    def _close(self, key: str) -> None:
-        entry = self._entries.pop(key, None)
-        if entry is None:
-            return
-        try:
-            entry["store"].close()
-        except Exception:
-            pass
-
     def _evict(self) -> None:
+        """Drop the least recently used entries. Caller holds `_guard`.
+
+        It DROPS the reference and does not close the `Store`, which is the
+        whole point. Eviction crosses databases by construction — building an
+        entry for db A is what evicts db B — so the per-index lock cannot make
+        it safe, and closing here closed a connection another thread was
+        running a query on. With `MAX_CACHED_INDEXES = 8`, nine databases
+        queried concurrently was enough: "Cannot operate on a closed database",
+        and on the next run a **SIGSEGV** (exit 139). Ten databases against a
+        limit of twenty is clean, which is the tell.
+
+        Dropping is sufficient because nothing else needs to happen. The thread
+        mid-search still holds the `HybridSearch`, which holds the `Store`, so
+        the connection stays alive exactly as long as it is in use and CPython
+        closes it on the last reference — there is no cycle here, so that is
+        immediate rather than at some later collection. The cost of an eviction
+        that was still warm is one rebuild, which is what eviction means.
+        """
         while len(self._entries) > self._limit:
             oldest = min(self._entries, key=lambda k: self._entries[k]["used"])
-            self._close(oldest)
+            self._entries.pop(oldest, None)
 
     def close_all(self) -> None:
-        for key in list(self._entries):
-            self._close(key)
+        """Shutdown only, once no worker is still running — see `serve`.
+
+        The join before this is bounded (a 5 s budget across ALL workers), so
+        "the threads have been joined" was a guarantee the code did not
+        provide: one in-flight search slower than the budget met a closed
+        connection, which is the same close-under-a-live-reader class `_evict`
+        was fixed for, and with a query in flight it is the same segfault. The
+        caller now checks, and skips this when anything is still alive."""
+        with self._guard:
+            entries = list(self._entries.values())
+            self._entries.clear()
+        for entry in entries:
+            try:
+                entry["store"].close()
+            except Exception:
+                pass
 
     def stats(self) -> list[dict]:
+        with self._guard:
+            items = list(self._entries.items())
         return [
             {"db": k, "age_s": round(time.time() - v["used"], 1)}
-            for k, v in self._entries.items()
+            for k, v in items
         ]
 
 
@@ -252,9 +318,27 @@ def _handle(req: dict, cache: _IndexCache) -> dict:
         db = _resolve_db(req.get("path"), req.get("db_path"))
     except _RelativePath as e:
         return {"ok": False, "error": str(e)}
+
+    # Validate the predicate on its own, before any search work. Wrapping the
+    # whole call in `except ValueError` labelled unrelated failures — a corrupt
+    # `chunk_ids` blob raises json.JSONDecodeError, which IS a ValueError — as
+    # a bad predicate, and the CLI then treats that as a real answer and stops
+    # instead of falling through to the in-process path.
+    try:
+        where = normalize_where(req.get("where"))
+    except ValueError as e:
+        return {"ok": False, "code": "bad_where", "error": str(e)}
+
+    # Every ok response ECHOES the predicate it applied. A daemon that predates
+    # `where` ignores the key and returns the whole corpus as `ok: true`, and
+    # the client then prints it as a filtered answer -- reproduced with a 0.6
+    # CLI against a 0.5 daemon still running from before an upgrade: 4 results
+    # where the same query in-process gave 1. The echo is what lets the client
+    # tell "filtered" from "a daemon that never heard of filtering".
     if not db.exists():
         # Not an error: a root without an index is simply skipped by callers.
-        return {"ok": True, "results": [], "db": str(db), "indexed": False}
+        return {"ok": True, "results": [], "db": str(db), "indexed": False,
+                "where": where}
 
     # `x or default` silently rewrites a valid 0: `--top 0` would come back as 5
     # and the daemon would disagree with the in-process path. Only None means
@@ -262,13 +346,31 @@ def _handle(req: dict, cache: _IndexCache) -> dict:
     top_k = req.get("top_k")
     min_score = req.get("min_score")
     search = cache.get(db)
-    results = search.search(
-        query,
-        top_k=5 if top_k is None else int(top_k),
-        min_score=0.0 if min_score is None else float(min_score),
-        empty_gate=req.get("empty_gate"),
-    )
-    return {"ok": True, "results": results, "db": str(db), "indexed": True}
+    try:
+        results = search.search(
+            query,
+            top_k=5 if top_k is None else int(top_k),
+            min_score=0.0 if min_score is None else float(min_score),
+            empty_gate=req.get("empty_gate"),
+            where=where,
+        )
+    except MetadataIncomplete as e:
+        # A machine-readable code, not just prose. The client has to tell this
+        # apart from every other failure: falling back to the in-process path
+        # would raise the same thing half a second and one model load later,
+        # and matching on the message text is not something a client should be
+        # asked to do. Additive — every other failure keeps the old shape.
+        code = ("metadata_not_indexed" if isinstance(e, MetadataNotIndexed)
+                else "metadata_stale" if isinstance(e, MetadataStale)
+                else "bad_rules" if isinstance(e, MetadataRulesError)
+                else "metadata_incomplete")
+        resp = {"ok": False, "code": code, "error": str(e)}
+        if isinstance(e, MetadataNotIndexed):
+            # Kept for clients written against the original shape.
+            resp["files_without_metadata"] = e.count
+        return resp
+    return {"ok": True, "results": results, "db": str(db), "indexed": True,
+            "where": where}
 
 
 def request(payload: dict, socket_path: str | Path | None = None,
@@ -354,8 +456,7 @@ def _serve_conn(conn: socket.socket, cache: _IndexCache, lock: "_LockTable",
                     req = json.loads(buf.decode("utf-8").strip() or "{}")
                     # Cheap ops need no index lock at all; a search takes only
                     # the lock for the index it touches.
-                    key = str(req.get("db_path") or req.get("path") or "")
-                    with lock.for_key(key):
+                    with lock.for_key(_lock_key(req)):
                         resp = _handle(req, cache)
             except Exception as e:
                 # One bad request must never take the daemon down.
@@ -487,7 +588,11 @@ def serve(socket_path: str | Path | None = None,
             t.join(timeout=max(0.0, join_until - time.time()))
         for one in lock.all():
             one.acquire(timeout=2.0)
-        cache.close_all()
+        # Only when nothing is still running. The join above is best-effort, and
+        # closing a database out from under a live query is worse than leaving
+        # the handles to the exiting process: the OS reclaims them either way.
+        if all(not t.is_alive() for t in workers):
+            cache.close_all()
         try:
             if bound_ino is None or sock_path.stat().st_ino == bound_ino:
                 sock_path.unlink()

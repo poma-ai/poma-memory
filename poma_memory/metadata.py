@@ -77,15 +77,49 @@ class MetadataNotIndexed(MetadataIncomplete):
         )
 
 
-def _stuck_remedy(examples: list[str], roots: list[str],
-                  db_path: str | None) -> str:
-    """The sentence telling someone how to unstick a row, by WHY it is stuck.
+def _where(db_path: str | None) -> str:
+    return f" in {db_path}" if db_path else ""
+
+
+def _detail(examples: list[str]) -> str:
+    shown = ", ".join(examples[:3])
+    if shown and len(examples) > 3:
+        shown += ", ..."
+    return f" (e.g. {shown})" if shown else ""
+
+
+def _present(path: str) -> bool:
+    """Whether a path is there. `os.stat`, never `open` -- see `_stuck_remedy`."""
+    try:
+        os.stat(path)
+        return True
+    except OSError:
+        return False
+
+
+def _stuck_remedy(items: list[tuple[str, str]], db_path: str | None) -> str:
+    """The sentence telling someone how to unstick these rows, by WHY they are stuck.
+
+    `items` is (file_path, rules_root) for EVERY stuck row, not a sample. An
+    earlier cut classified only the three paths the message quotes, so the
+    count was wrong ("8 indexed file(s) ... 3 of them no longer exist" when
+    four were) and, worse, WHICH remedy you were given depended on how the
+    first three paths happened to sort.
 
     Shared by every refusal about a row that was scanned and can no longer be
-    trusted, because every one of them has the same three cases and getting any
-    of them wrong sends the user somewhere that silently does nothing. Naming
-    `index` is useless when the run that would fix the row is the run that just
-    skipped it, and a deleted file can be reached by no glob and no re-read.
+    trusted, because they all have the same cases and getting any of them wrong
+    sends the user somewhere that silently does nothing -- or somewhere that
+    destroys live data. Naming `index` is useless when the run that would fix
+    the row is the run that just skipped it; a deleted file can be reached by
+    no glob and no re-read; and `--db` is never optional, because the default
+    database lives inside the directory being named.
+
+    **`forget` is prescribed only for a root that is GONE.** It deletes every
+    row under a directory, so recommending it for a row whose directory is
+    still there costs a re-chunk and a re-embed of every live document beside
+    it -- measured, 6 rows to 0 where a plain `index` took 6 to 5 and fixed the
+    refusal. In a shared database it was worse still: the message listed every
+    stale root, so following it verbatim deleted a live root's rows too.
 
     `os.stat` and `os.access`, never `open`: this runs inside an exception
     constructor on the search path, and opening a FIFO blocks forever waiting
@@ -93,50 +127,73 @@ def _stuck_remedy(examples: list[str], roots: list[str],
     same. `os.access` can disagree with real openability under ACLs or as root,
     which is acceptable in a diagnostic string where a hang is not.
     """
-    gone, unreadable = [], []
-    for path in examples:
+    gone: list[tuple[str, str]] = []
+    unreadable: list[tuple[str, str]] = []
+    readable: list[tuple[str, str]] = []
+    for path, root in items:
         try:
             st = os.stat(path)
         except FileNotFoundError:
-            gone.append(path)
+            gone.append((path, root))
             continue
         except OSError:
-            unreadable.append(path)
+            unreadable.append((path, root))
             continue
         if not stat_module.S_ISREG(st.st_mode) or not os.access(path, os.R_OK):
-            unreadable.append(path)
-
-    roots = [r for r in roots if r]
-    db = f" --db {db_path}" if db_path else ""
-    if gone:
-        # Print the command, whole. Two earlier cuts printed one that did not
-        # work, and the second was worse than the first: "run `poma-memory
-        # index`" sends you to the run that just skipped the row, and "run
-        # `index <dir> --prune`" names a command that will not prune a
-        # directory it cannot see AND whose default database lives inside that
-        # directory -- so following it RECREATED the directory the user had
-        # deleted, left an empty database in it, printed "Indexed 0 files", and
-        # changed nothing.
-        if len(roots) == 1:
-            each = f"`poma-memory forget {roots[0]}{db}`"
-        elif roots:
-            each = (f"`poma-memory forget <dir>{db}` for each of "
-                    + ", ".join(roots[:3]))
+            unreadable.append((path, root))
         else:
-            each = f"`poma-memory forget <dir>{db}`"
-        return (f" {len(gone)} of them no longer exist (e.g. {gone[0]}); no "
-                "glob and no re-read can reach a deleted file, and "
-                "`index --prune` will not remove rows for a directory it "
-                f"cannot see. Run {each} to drop them.")
+            readable.append((path, root))
+
+    db = f" --db {db_path}" if db_path else ""
+
+    def _dirs(group: list[tuple[str, str]]) -> list[str]:
+        return sorted({r for _, r in group if r})
+
+    def _cmd(verb: str, dirs: list[str]) -> str:
+        if len(dirs) == 1:
+            return f"`poma-memory {verb} {dirs[0]}{db}`"
+        if dirs:
+            return (f"`poma-memory {verb} <dir>{db}` for each of "
+                    + ", ".join(dirs[:3]))
+        return f"`poma-memory {verb} <dir>{db}`"
+
+    # EVERY group gets a sentence. Returning on the first non-empty one left a
+    # mixed index telling you only about its deleted rows, so the obedient user
+    # ran that command and the search refused again -- recoverable, but the
+    # message had the rest of the answer and withheld it.
+    parts: list[str] = []
+    if gone:
+        # A gone FILE whose directory is still there is an ordinary deletion:
+        # `index` prunes it, and that is the non-destructive answer. Only a row
+        # whose own root has vanished needs `forget`, because no `index` run
+        # can reach it -- which is the justification the message used to give
+        # unconditionally, while being false in exactly the common case.
+        orphaned = [(p, r) for p, r in gone if not r or not _present(r)]
+        reachable = [(p, r) for p, r in gone if r and _present(r)]
+        parts.append(f" {len(gone)} of them no longer exist "
+                     f"(e.g. {gone[0][0]}); no glob and no re-read can reach a "
+                     "deleted file.")
+        if reachable:
+            parts.append(
+                f" {len(reachable)} sit under a directory that is still there, "
+                f"so {_cmd('index', _dirs(reachable))} removes them (add "
+                "`--prune` if it reports them held back instead).")
+        if orphaned:
+            parts.append(
+                f" {len(orphaned)} came from a directory that is gone too, "
+                f"which no `index` run can reach: {_cmd('forget', _dirs(orphaned))} "
+                "drops those rows, and only those.")
     if unreadable:
-        return (f" {len(unreadable)} of them cannot be read "
-                f"(e.g. {unreadable[0]}); fix the permissions, then re-run "
-                "`poma-memory index` — the run cannot resolve a file it "
-                "cannot open.")
-    where = f" (e.g. {roots[0]})" if roots else ""
-    return (f" Run `poma-memory index` over the directory each one came "
-            f"from{where}; it re-reads metadata only, with no re-chunking and "
-            "no re-embedding.")
+        parts.append(
+            f" {len(unreadable)} cannot be read (e.g. {unreadable[0][0]}); fix "
+            f"the permissions, then re-run {_cmd('index', _dirs(unreadable))} "
+            "-- the run cannot resolve a file it cannot open.")
+    if readable:
+        parts.append(
+            f" {len(readable)} are still on disk and readable: run "
+            f"{_cmd('index', _dirs(readable))} for those; it re-reads metadata "
+            "only, with no re-chunking and no re-embedding.")
+    return "".join(parts)
 
 
 class MetadataUnreadable(MetadataIncomplete):
@@ -153,23 +210,18 @@ class MetadataUnreadable(MetadataIncomplete):
     reports "6 missing, kept", heals nothing, and the refusal repeats verbatim.
     """
 
-    def __init__(self, count: int, db_path: str | os.PathLike | None = None,
-                 examples: list[str] | None = None,
-                 roots: list[str] | None = None):
-        self.count = count
+    def __init__(self, items: list[tuple[str, str]],
+                 db_path: str | os.PathLike | None = None):
+        self.items = list(items)
+        self.count = len(self.items)
         self.db_path = str(db_path) if db_path is not None else None
-        self.examples = list(examples or [])
-        self.roots = [r for r in (roots or []) if r]
-        where = f" in {self.db_path}" if self.db_path else ""
-        shown = ", ".join(self.examples[:3])
-        if shown and count > len(self.examples[:3]):
-            shown += ", ..."
-        detail = f" (e.g. {shown})" if shown else ""
+        self.examples = [fp for fp, _ in self.items]
+        self.roots = sorted({r for _, r in self.items if r})
         super().__init__(
-            f"{count} indexed file(s){where} have metadata recorded that is "
-            f"not a JSON object{detail}, so a metadata filter cannot be "
-            "answered honestly."
-            + _stuck_remedy(self.examples, self.roots, self.db_path)
+            f"{self.count} indexed file(s){_where(self.db_path)} have metadata "
+            f"recorded that is not a JSON object{_detail(self.examples)}, so a "
+            "metadata filter cannot be answered honestly."
+            + _stuck_remedy(self.items, self.db_path)
         )
 
 
@@ -184,26 +236,22 @@ class MetadataStale(MetadataIncomplete):
     `MetadataNotIndexed` applies to a row that was never scanned at all.
     """
 
-    def __init__(self, count: int, db_path: str | os.PathLike | None = None,
-                 examples: list[str] | None = None,
-                 roots: list[str] | None = None):
-        self.count = count
+    def __init__(self, items: list[tuple[str, str]],
+                 db_path: str | os.PathLike | None = None):
+        # (file_path, rules_root) for every stale row -- the directories they
+        # were indexed FROM. Without them the remedy can only name a flag, and
+        # the user runs it in the directory they are already in.
+        self.items = list(items)
+        self.count = len(self.items)
         self.db_path = str(db_path) if db_path is not None else None
-        self.examples = list(examples or [])
-        # The directories the stale rows were indexed FROM. Without them the
-        # remedy can only name a flag, and the user runs it in the directory
-        # they are already in, where the scope gate makes it a no-op.
-        self.roots = [r for r in (roots or []) if r]
-        where = f" in {self.db_path}" if self.db_path else ""
-        shown = ", ".join(self.examples[:3])
-        if shown and count > len(self.examples[:3]):
-            shown += ", ..."
-        detail = f" (e.g. {shown})" if shown else ""
+        self.examples = [fp for fp, _ in self.items]
+        self.roots = sorted({r for _, r in self.items if r})
         super().__init__(
-            f"{count} indexed file(s){where} still hold metadata resolved "
-            f"against an earlier rule set{detail}, so a metadata filter would "
-            "answer from rules that are no longer in effect."
-            + _stuck_remedy(self.examples, self.roots, self.db_path)
+            f"{self.count} indexed file(s){_where(self.db_path)} still hold "
+            f"metadata resolved against an earlier rule set"
+            f"{_detail(self.examples)}, so a metadata filter would answer from "
+            "rules that are no longer in effect."
+            + _stuck_remedy(self.items, self.db_path)
         )
 
 

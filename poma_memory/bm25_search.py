@@ -37,7 +37,11 @@ class BM25Search:
         # Leaving `_retriever` as None is what `search` already does for an
         # empty index: BM25 contributes nothing, and the semantic side, which
         # has no vocabulary, still answers.
-        if not getattr(corpus_tokens, "vocab", None):
+        # `corpus_tokens.vocab`, not `getattr(..., None)`: the pin is
+        # `bm25s>=0.3,<1`, and a future `tokenize` that returned something
+        # without `.vocab` would silently disable BM25 for EVERY index, with no
+        # error and no log. An AttributeError is the right failure there.
+        if not corpus_tokens.vocab:
             return
 
         self._retriever = bm25s.BM25()

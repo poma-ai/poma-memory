@@ -2098,7 +2098,7 @@ def test_the_exception_constructor_never_opens_a_file():
         done = threading.Event()
 
         def build():
-            str(MetadataStale(1, "/db", [str(fifo)]))
+            str(MetadataStale([(str(fifo), str(fifo.parent))], "/db"))
             done.set()
 
         threading.Thread(target=build, daemon=True).start()
@@ -2107,7 +2107,8 @@ def test_the_exception_constructor_never_opens_a_file():
         # reported as missing.
         d = Path(td) / "adir.md"
         d.mkdir()
-        assert "cannot be read" in str(MetadataStale(1, "/db", [str(d)]))
+        assert "cannot be read" in str(
+            MetadataStale([(str(d), str(d.parent))], "/db"))
 
 
 @pytest.mark.parametrize("prune", [True, False, None])
@@ -2262,10 +2263,14 @@ def test_the_stale_remedy_prints_a_command_that_works():
     the user is sent somewhere that silently does nothing."""
     with tempfile.TemporaryDirectory() as td:
         vanished = Path(td) / "vanished"
-        msg = str(MetadataStale(1, "/db/x.sqlite", [str(vanished / "note.md")],
-                                roots=[str(vanished)]))
-        assert f"forget {vanished} --db /db/x.sqlite" in msg
-        assert "--prune" not in msg.split("Run ")[-1]
+        msg = str(MetadataStale(
+            [(str(vanished / "note.md"), str(vanished))], "/db/x.sqlite"))
+        # The row's own directory is gone, so no `index` run can reach it and
+        # `forget` is the only thing that can -- named with the database,
+        # because the default one lived inside the directory that is missing.
+        assert f"poma-memory forget {vanished} --db /db/x.sqlite" in msg
+        # ...and no `index` command is offered, because none can work here.
+        assert "poma-memory index" not in msg
 
 
 def test_forget_only_reaches_rows_under_the_directory_it_is_given():
@@ -2583,14 +2588,19 @@ def test_the_corrupt_blob_refusal_names_a_remedy_that_works_when_the_file_is_gon
         with pytest.raises(MetadataIncomplete) as e:
             api.search("sqlite", path=root, where={"kind": "decision"})
         msg = str(e.value)
-        assert "forget" in msg and os.path.realpath(root) in msg
+        # The file is gone but its DIRECTORY is still there, so the remedy must
+        # be the non-destructive one. Prescribing `forget` here deletes every
+        # live document beside it: measured 6 rows to 0 where `index` took 6 to
+        # 5 and fixed the refusal.
+        assert "forget" not in msg, msg
+        assert f"poma-memory index {os.path.realpath(root)}" in msg
         assert f"--db {root / '.poma-memory.db'}" in msg
         # And it is not a dead end: the command it names clears the row.
-        api.forget(root, db_path=root / ".poma-memory.db")
-        assert api.search("sqlite", path=root, where={"kind": "decision"}) == []
+        api.index(root)
+        assert api.search("sqlite", path=root, where={"kind": "event"})
 
 
-@pytest.mark.parametrize("command", ["forget", "search", "status"])
+@pytest.mark.parametrize("command", ["forget", "search", "status", "index"])
 def test_a_db_that_is_not_a_database_is_reported_not_tracebacked(command, tmp_path):
     """`--db` is typed by hand, out of an error message, so pointing it at the
     wrong file is the expected mistake. `sqlite3.DatabaseError` is not an
@@ -2608,6 +2618,7 @@ def test_a_db_that_is_not_a_database_is_reported_not_tracebacked(command, tmp_pa
         "search": ["search", "sqlite", "--path", str(work), "--db", str(junk),
                    "--socket", "off"],
         "status": ["status", "--path", str(work), "--db", str(junk)],
+        "index": ["index", str(work), "--db", str(junk)],
     }[command]
     with pytest.raises(SystemExit) as e:
         cli.main(argv)
@@ -2619,3 +2630,156 @@ def test_poma_forget_is_advertised_where_the_other_tools_are():
     from poma_memory import mcp_server
     assert "forget" in (mcp_server.__doc__ or "")
     assert "poma_forget" in Path("README.md").read_text()
+
+
+def test_index_file_on_an_absent_root_creates_nothing():
+    """The fourth surface. `index()` got this gate in 7b6cfbd and `index_file`
+    did not, so `poma-memory index R --file R/f0.md` with R gone REPORTED
+    failure -- exit 2, "No such file or directory" -- and recreated R with an
+    empty database anyway, which re-armed the prune gate for the next run.
+    Rows 3 -> 0 in three commands, the first of which looked like it failed."""
+    with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as c:
+        root, db = Path(td) / "R", Path(c) / "shared.sqlite"
+        root.mkdir()
+        _many(root, 3)
+        api.index(root, db_path=db)
+        shutil.rmtree(root)
+
+        with pytest.raises(OSError):
+            api.index_file(root / "f0.md", path=root, db_path=None)
+        assert not root.exists(), "index_file recreated the root"
+        assert not (root / ".poma-memory.db").exists()
+
+        assert api.index(root, db_path=db)["pruned"] == []
+        store = Store(db)
+        try:
+            assert len(store.all_file_paths()) == 3
+        finally:
+            store.close()
+
+
+def test_a_dead_row_under_a_live_directory_is_not_answered_with_forget():
+    """`forget` deletes every row under a directory. Prescribing it for a row
+    whose directory is still there costs a re-chunk and a re-embed of every
+    live document beside it -- measured 6 rows to 0, where the plain `index`
+    the message should have named took 6 to 5 and fixed the refusal. The
+    justification the message gave ("`index --prune` will not remove rows for a
+    directory it cannot see") was false in exactly the case that produced it."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _many(root, 6)
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        api.index(root)
+        target = os.path.realpath(root / "f0.md")
+        store = Store(root / ".poma-memory.db")
+        record = store.get_file_record(target)
+        store.set_file_metadata(target, "[1, 2]", False,
+                                record["rules_hash"], record["rules_root"])
+        store.close()
+        os.remove(target)
+
+        with pytest.raises(MetadataIncomplete) as e:
+            api.search("sqlite", path=root, where={"kind": "note"})
+        msg = str(e.value)
+        assert "forget" not in msg, msg
+        assert f"poma-memory index {os.path.realpath(root)}" in msg
+        api.index(root)
+        store = Store(root / ".poma-memory.db")
+        try:
+            assert len(store.all_file_paths()) == 5
+        finally:
+            store.close()
+
+
+def test_the_remedy_never_names_a_live_root_for_deletion():
+    """Worse in a shared database: the message listed every STALE root, not the
+    roots of the GONE files, so following it verbatim deleted a live root's
+    rows too -- 8 to 0, the live root losing 4."""
+    with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as c:
+        live, db = Path(a) / "live", Path(c) / "shared.sqlite"
+        live.mkdir()
+        _many(live, 4)
+        _write_rules(live, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        api.index(live, db_path=db)
+
+        with tempfile.TemporaryDirectory() as b:
+            dead = Path(b) / "dead"
+            dead.mkdir()
+            _many(dead, 4)
+            _write_rules(dead, [{"glob": "**/*.md", "metadata": {"kind": "o"}}])
+            api.index(dead, db_path=db)
+
+        # The LIVE root must be stale too, or a remedy that names every stale
+        # root has nothing extra to name and the test cannot fail.
+        _write_rules(live, [{"glob": "**/*.md", "metadata": {"kind": "v2"}}])
+
+        with pytest.raises(MetadataStale) as e:
+            api.search("sqlite", path=live, db_path=db, where={"kind": "note"})
+        msg = str(e.value)
+        assert f"forget {os.path.realpath(dead)}" in msg
+        assert f"forget {os.path.realpath(live)}" not in msg
+        # Isolate the destructive clause and check the live root is not in it.
+        # (It does appear later, in the sentence that prescribes `index` for
+        # it, which is the point -- so a blunter check on the whole tail is
+        # wrong rather than strict.)
+        forget_clause = msg[msg.index("gone too"):msg.index("drops those rows")]
+        assert os.path.realpath(live) not in forget_clause
+        # ...and the live root gets the non-destructive command instead.
+        assert f"poma-memory index {os.path.realpath(live)}" in msg
+
+
+def test_the_remedy_counts_and_branches_on_every_row_not_a_sample():
+    """It classified only the three paths it quotes, so the count was wrong
+    ("8 indexed file(s) ... 3 of them no longer exist" when four were) and
+    WHICH remedy you got depended on how the first three paths sorted."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        gone = [(str(root / f"g{i}.md"), str(root)) for i in range(4)]
+        present = []
+        for i in range(4):
+            f = root / f"p{i}.md"
+            f.write_text("x")
+            present.append((str(f), str(root)))
+        msg = str(MetadataStale(gone + present, str(root / "db.sqlite")))
+        assert "8 indexed file(s)" in msg
+        assert "4 of them no longer exist" in msg
+
+
+def test_search_hands_the_refusal_every_stale_row_not_the_first_three():
+    """The count and the remedy branch are decided from what is passed in, so
+    passing a three-item slice made the message say "3 of them no longer exist"
+    when six did -- and, when the sample happened to sort the wrong way, gave
+    advice for a state the index was not in. Exercised through `search`,
+    because that is where the slice was."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _many(root, 6)
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        api.index(root)
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "v2"}}])
+        with pytest.raises(MetadataStale) as e:
+            api.search("sqlite", path=root, where={"kind": "note"})
+        assert e.value.count == 6
+        assert "6 indexed file(s)" in str(e.value)
+
+
+def test_a_permission_error_on_the_root_is_not_reported_as_absent(capsys):
+    """"gone" and "unknown" are different answers, which is the whole reason
+    `_disk_state` exists; the new gate's message collapsed them, so a directory
+    at mode 000 was reported as "is not present"."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root ignores the permission bits")
+    with tempfile.TemporaryDirectory() as td:
+        parent = Path(td) / "locked"
+        parent.mkdir()
+        root = parent / "R"
+        root.mkdir()
+        os.chmod(parent, 0o000)
+        try:
+            capsys.readouterr()
+            api.index(root)
+            err = capsys.readouterr().err
+            assert "cannot be read" in err
+            assert "is not present" not in err
+        finally:
+            os.chmod(parent, 0o755)

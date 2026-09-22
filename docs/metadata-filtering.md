@@ -265,8 +265,14 @@ the cause — losing most of an index in one run is worth blocking whatever
 produced it, while deleting a handful of documents stays automatic.
 `prune=True` (`--prune`) is the explicit yes and `prune=False` (`--no-prune`)
 the explicit no, so a genuinely deleted subtree is never stuck in the index —
-and the refusal a stale held-back row produces names `--prune` rather than a
-glob or a `chmod`, because neither of those can reach a file that is gone.
+and the refusal a stale held-back row produces names the command that can
+reach it rather than a glob or a `chmod`, because neither of those can reach a
+file that is gone. Which command that is depends on the row: `index <dir>`
+(with `--prune` if it reports the rows held back) when the row's own directory
+is still there, and `forget <dir>` only when that directory is gone too. Round
+eleven found this message prescribing `forget` unconditionally — destroying
+every live document beside the dead row, 6 rows to 0 where `index` took 6 to 5
+and fixed the refusal — so the distinction is the message's whole job. §8.
 
 **Neither of the first two gates has an override, `--prune` included** (it
 clears the two hold-backs, which is a different question) — and round nine
@@ -822,6 +828,50 @@ and `k: 'a' 'b'`). Both invent a key rather than alter a value, and the
 tightening that would reject them — requiring whitespace after the colon —
 would also reject `kind:note`, which real corpora write and which parses
 correctly today. Not worth a silent break for a purity gain.
+
+**Round 10 — do-not-ship, two blockers, both in round nine's own fixes.** The
+daemon segfaulted once there were more indexes than cache slots:
+`_IndexCache._evict` crosses databases by construction, so the round-nine lock
+key could not cover it, and it closed a `Store` another thread was querying
+(`ndb=9, limit=8` → exit 139; `ndb=10, limit=20` → clean, which is the tell).
+Eviction drops the entry now and lets the last reference close the connection.
+And two ordinary commands deleted an index: `index R` with R gone recreated R,
+because `Store` makes its database's parent and the default database sits
+inside `path` — which disarmed the root-present gate, so the next run pruned
+everything. Rows 3 → 0, no flag, no prompt.
+
+**Round 11 — do-not-ship, four blockers, and the worst of them was a fix.**
+`index_file` had the same recreate-the-root shape as `index`, on the surface
+round ten did not check — and it *reported failure* while doing it, so the user
+had every reason to think nothing had happened.
+
+The one worth remembering is the refusal message. Round nine gave it a `forget`
+command so a wedged index had a way out. Round eleven found it prescribing
+`forget` for a row whose directory was still there, where `index` prunes the
+dead row without touching anything else: 6 rows to 0 against 6 to 5. In a
+shared database it listed every stale root, so following it deleted a live
+root's rows too. The justification it printed — "`index --prune` will not
+remove rows for a directory it cannot see" — was false in exactly the case that
+produced it. A message that tells you to destroy data is worse than the dead
+end it replaced, and it got there by generalising one true sentence about one
+state to every state.
+
+Also round 11: `close_all`'s docstring claimed the workers had been joined,
+where the join is a 5-second budget across all of them, so a slow search met a
+closed connection — the same class as the `_evict` bug, in the exemption
+written for it. The remedy branch and its count were decided from the
+three-path sample the message quotes, so the count was wrong and which advice
+you got depended on how those three sorted. `sqlite3.DatabaseError` still
+tracebacked out of `index` and three of four MCP tools. A bad default database
+was reported as `None: file is not a database`. And `_disk_state`'s "unknown"
+was printed as "is not present", the exact conflation that function exists to
+prevent.
+
+One mutant survives deliberately: `corpus_tokens.vocab` against
+`getattr(corpus_tokens, "vocab", None)` behaves identically on bm25s 0.3.11, so
+no test can separate them. The attribute access is kept because it fails loudly
+if a future `tokenize` stops providing `vocab`, where the `getattr` would
+silently disable BM25 for every index.
 
 ## 9. Pre-existing, found during review, not this branch's to fix
 

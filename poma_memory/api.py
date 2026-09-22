@@ -107,9 +107,15 @@ def index(
     # database that is not there; this is the same rule for the third surface.
     # An EXISTING database outside the root is untouched by this and still runs
     # (it reports and skips pruning, below), because opening it creates nothing.
-    if _disk_state(root_key) != "present" and not Path(db_path).exists():
-        print(f"poma-memory: {root_key} is not present and there is no index "
-              f"at {db_path}; nothing to do. Nothing was created.",
+    root_state = _disk_state(root_key)
+    if root_state != "present" and not Path(db_path).exists():
+        # "gone" and "unknown" are different answers and this message used to
+        # collapse them, which is the exact conflation `_disk_state` exists to
+        # prevent: a directory at mode 000 was reported as "not present".
+        why = ("is not present" if root_state == "gone"
+               else "cannot be read (permissions, or an unavailable mount)")
+        print(f"poma-memory: {root_key} {why} and there is no index at "
+              f"{db_path}; nothing to do. Nothing was created.",
               file=sys.stderr)
         return {"files_indexed": 0, "chunks_created": 0, "chunksets_created": 0,
                 "metadata_refreshed": False, "unreadable": [], "stale_rules": [],
@@ -387,6 +393,16 @@ def index_file(
             f"{RULES_FILENAME} cannot describe it. Pass `path` as the "
             "directory the file lives in."
         )
+
+    # STAT BEFORE OPENING THE STORE, for the reason `index` has the same rule:
+    # `Store` makes its database's parent and the default database sits inside
+    # `path`, so indexing a file under a directory that is gone recreated that
+    # directory and left an empty database in it -- while REPORTING failure, so
+    # the user had every reason to think nothing had happened. The next `index`
+    # run then read a present root and pruned every row under it. Rows 3 -> 0
+    # in three commands. `update_file` stats this file anyway; doing it here
+    # only moves the same error earlier, before anything can be created.
+    os.stat(file_real)
 
     store = Store(db_path)
     try:

@@ -217,9 +217,15 @@ class HybridSearch:
         # command naming ITS directory and this database, not a flag.
         by_root = stale_by_root([(fp, root, h) for fp, _, root, h in rows])
         if by_root:
-            stale = sorted(fp for group in by_root.values() for fp in group)
-            raise MetadataStale(len(stale), self._store.db_path, stale[:3],
-                                roots=sorted(by_root))
+            # EVERY stale row with the directory it came from, not a sample:
+            # the remedy is chosen from what the rows actually are, and a
+            # three-item slice both miscounted and picked the branch by
+            # whichever paths happened to sort first.
+            raise MetadataStale(
+                sorted((fp, root) for root, group in by_root.items()
+                       for fp in group),
+                self._store.db_path,
+            )
 
         keep_files = set()
         bad: list[tuple[str, str]] = []
@@ -242,10 +248,7 @@ class HybridSearch:
             if matches(value, where):
                 keep_files.add(file_path)
         if bad:
-            raise MetadataUnreadable(
-                len(bad), self._store.db_path, [fp for fp, _ in bad][:3],
-                roots=sorted({r for _, r in bad}),
-            )
+            raise MetadataUnreadable(sorted(bad), self._store.db_path)
         # Resolved in SQL rather than by scanning every chunkset in Python: the
         # whole-table version cost 22 ms regardless of how narrow the predicate
         # was, against 0.12 ms here for a 1%% filter.

@@ -107,6 +107,8 @@ def main(argv: list[str] | None = None) -> None:
 
 def _cmd_index(args: argparse.Namespace) -> None:
     """Index command: index all markdown files in a directory."""
+    import sqlite3
+
     from poma_memory.api import index, index_file
 
     from poma_memory.metadata import MetadataRulesError
@@ -117,7 +119,8 @@ def _cmd_index(args: argparse.Namespace) -> None:
         # "scanned, no metadata" where a rule says otherwise.
         try:
             result = index_file(args.file, path=args.path, db_path=args.db)
-        except (OSError, ValueError, MetadataRulesError) as e:
+        except (OSError, ValueError, MetadataRulesError,
+                sqlite3.DatabaseError) as e:
             # OSError as well as ValueError. `index()` already treats an
             # unreadable or missing document as costing that file and not the
             # run; here the same file tracebacked out of `main` instead --
@@ -136,6 +139,12 @@ def _cmd_index(args: argparse.Namespace) -> None:
                            prune=getattr(args, "prune", None))
         except MetadataRulesError as e:
             print(f"poma-memory: {e}", file=sys.stderr)
+            raise SystemExit(2)
+        except sqlite3.DatabaseError as e:
+            # `index` is the command the refusal messages teach people to type
+            # `--db` into, and it was the one still tracebacking on a `--db`
+            # that is not a database (or a corrupt default one).
+            print(f"poma-memory: {args.db or args.path}: {e}", file=sys.stderr)
             raise SystemExit(2)
         summary = (f"Indexed {result['files_indexed']} files:"
                    f" {result['chunks_created']} chunks,"
@@ -271,7 +280,8 @@ def _cmd_search(args: argparse.Namespace) -> None:
         except sqlite3.DatabaseError as e:
             # A `--db` that is not a database, which the refusal messages now
             # invite people to type by hand.
-            print(f"poma-memory: {args.db}: {e}", file=sys.stderr)
+            print(f"poma-memory: {args.db or args.path}: {e}",
+                  file=sys.stderr)
             raise SystemExit(2)
 
     if args.as_json:

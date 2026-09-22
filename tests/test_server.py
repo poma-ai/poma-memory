@@ -449,3 +449,55 @@ def test_evicting_one_index_does_not_close_another_mid_search(ndb, limit):
             t.join(timeout=180)
         cache.close_all()
         assert errors == [], f"{len(errors)} failures, e.g. {errors[0]}"
+
+
+def test_shutdown_does_not_close_a_database_a_worker_is_still_using():
+    """`close_all`'s docstring said the workers have been joined by then. The
+    join is a TOTAL 5 s budget across all of them, and each lock acquire is
+    `timeout=2.0` with the result discarded, so one search slower than the
+    budget met a closed connection: `ProgrammingError: Cannot operate on a
+    closed database`, the same close-under-a-live-reader class `_evict` was
+    fixed for, and with a query in flight the same segfault.
+
+    Asserted on the guard rather than by racing a real daemon, so it cannot
+    pass by timing: `close_all` must not run while a worker is alive.
+    """
+    import threading as _th
+    from poma_memory.server import _IndexCache
+
+    cache = _IndexCache()
+    closed = []
+    cache.close_all = lambda: closed.append(True)        # type: ignore[method-assign]
+
+    stop = _th.Event()
+    slow = _th.Thread(target=stop.wait, daemon=True)
+    slow.start()
+    workers = [slow]
+    try:
+        # The exact expression `serve`'s finally block guards with.
+        if all(not t.is_alive() for t in workers):
+            cache.close_all()
+        assert closed == [], "closed the cache while a worker was running"
+    finally:
+        stop.set()
+        slow.join(timeout=5)
+
+    assert all(not t.is_alive() for t in workers)
+    if all(not t.is_alive() for t in workers):
+        cache.close_all()
+    assert closed == [True], "never closed the cache once the workers finished"
+
+
+def test_serve_guards_close_all_with_a_liveness_check():
+    """The guard has to be in `serve` itself, not only in this file's idea of
+    it: the bug was that `cache.close_all()` sat in the finally block with
+    nothing between it and a bounded join."""
+    import inspect
+
+    from poma_memory import server
+
+    src = inspect.getsource(server.serve)
+    tail = src[src.index("join_until"):]
+    assert "cache.close_all()" in tail
+    guard = tail[:tail.index("cache.close_all()")]
+    assert "is_alive()" in guard, "close_all is not guarded by a liveness check"

@@ -263,8 +263,14 @@ class _IndexCache:
             self._entries.pop(oldest, None)
 
     def close_all(self) -> None:
-        """Shutdown only, after the worker threads have been joined — which is
-        why this may close where `_evict` may not."""
+        """Shutdown only, once no worker is still running — see `serve`.
+
+        The join before this is bounded (a 5 s budget across ALL workers), so
+        "the threads have been joined" was a guarantee the code did not
+        provide: one in-flight search slower than the budget met a closed
+        connection, which is the same close-under-a-live-reader class `_evict`
+        was fixed for, and with a query in flight it is the same segfault. The
+        caller now checks, and skips this when anything is still alive."""
         with self._guard:
             entries = list(self._entries.values())
             self._entries.clear()
@@ -572,7 +578,11 @@ def serve(socket_path: str | Path | None = None,
             t.join(timeout=max(0.0, join_until - time.time()))
         for one in lock.all():
             one.acquire(timeout=2.0)
-        cache.close_all()
+        # Only when nothing is still running. The join above is best-effort, and
+        # closing a database out from under a live query is worse than leaving
+        # the handles to the exiting process: the OS reclaims them either way.
+        if all(not t.is_alive() for t in workers):
+            cache.close_all()
         try:
             if bound_ino is None or sock_path.stat().st_ino == bound_ino:
                 sock_path.unlink()

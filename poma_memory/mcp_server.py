@@ -44,6 +44,8 @@ def poma_search(
             list, case-sensitive equality. Requires the index to have been
             built with metadata (see `.poma-metadata.json`).
     """
+    import sqlite3
+
     from poma_memory.api import search
     from poma_memory.metadata import MetadataIncomplete
 
@@ -52,7 +54,9 @@ def poma_search(
             query=query, path=path, top_k=top_k, min_score=min_score,
             empty_gate=empty_gate, where=where,
         )
-    except (MetadataIncomplete, ValueError) as e:
+    except (MetadataIncomplete, ValueError, sqlite3.DatabaseError) as e:
+        # `sqlite3.DatabaseError` too -- a corrupt database reached the agent
+        # as a transport error rather than a sentence it could act on.
         return f"Search failed: {e}"
 
     if not results:
@@ -92,13 +96,16 @@ def poma_index(path: str = ".agent/", file: str | None = None,
             anything when `path` itself is absent -- use `poma_forget` for a
             directory that is gone for good.
     """
+    import sqlite3
+
     if file:
         from poma_memory.api import index_file
         from poma_memory.metadata import MetadataRulesError
 
         try:
             result = index_file(file, path=path)
-        except (OSError, ValueError, MetadataRulesError) as e:
+        except (OSError, ValueError, MetadataRulesError,
+                sqlite3.DatabaseError) as e:
             # OSError too: a missing or unreadable file raised straight out of
             # the tool, and the agent got a transport-level error instead of a
             # sentence it could act on.
@@ -114,7 +121,7 @@ def poma_index(path: str = ".agent/", file: str | None = None,
 
     try:
         result = api_index(path=path, glob=glob, prune=prune)
-    except (OSError, MetadataRulesError) as e:
+    except (OSError, MetadataRulesError, sqlite3.DatabaseError) as e:
         # The `file` branch above has always caught this; the directory branch
         # did not, so a `.poma-metadata.json` with a typo in it raised out of
         # the tool as a traceback rather than naming the file and the typo.
@@ -180,9 +187,14 @@ def poma_status(path: str = ".agent/") -> str:
     Args:
         path: Directory that was indexed (default: .agent/)
     """
+    import sqlite3
+
     from poma_memory.api import status
 
-    info = status(path=path)
+    try:
+        info = status(path=path)
+    except sqlite3.DatabaseError as e:
+        return f"Status failed: {path}: {e}"
 
     if not info["files"]:
         return "No indexed files. Use poma_index to index .agent/ first."

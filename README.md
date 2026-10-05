@@ -82,10 +82,10 @@ replaced.
 from poma_memory import MemoryIndex, index_file
 
 idx = MemoryIndex("/data/live/.poma-memory.db")
-idx.search("rollback", top_k=5, where={"repo": "poma-ai/poma-services-go"})
+idx.search("rollback", top_k=5, where={"repo": "acme/billing"})
 
 with idx.lock:                                    # re-entrant; every method takes it
-    index_file("/data/live/r/poma-ai/x/decision/ab12.md", path="/data/live")
+    index_file("/data/live/r/acme/billing/decision/ab12.md", path="/data/live")
     idx.ensure_embeddings()                       # embeds only rows with no valid embedding
 ```
 

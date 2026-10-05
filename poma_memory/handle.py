@@ -6,8 +6,10 @@ a hook; it is wrong for a service, where it pays the build per request and,
 because a build writes any missing embeddings, turns a read into a write.
 
 `MemoryIndex` keeps one warm `HybridSearch` per process and rebuilds it only
-when another connection has committed to the database (`PRAGMA data_version`,
-see `server._IndexCache`, which does the work). It adds the two things a caller
+when another connection has committed to the database (`PRAGMA data_version`)
+or the file at `db_path` has been replaced (see `server._IndexCache`, which
+does the work). A filesystem that reports an unstable inode rebuilds on every
+call: correct, but it costs what a rebuild costs. It adds the two things a caller
 needs and the daemon does not expose:
 
 * `lock`, a re-entrant lock every operation here takes. A caller that mutates
@@ -28,7 +30,6 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
-from poma_memory.search import HAS_SEMANTIC
 from poma_memory.server import _IndexCache
 
 
@@ -59,7 +60,9 @@ class MemoryIndex:
 
         Raises `RuntimeError` when semantic search is installed but the build
         could not produce it (the embedder failed: a quota, a network error, a
-        model that would not load). `HybridSearch` swallows that and degrades to
+        model that would not load). With `POMA_EMBEDDER=openai` an outage also
+        raises, and leaves the stored OpenAI vectors alone instead of replacing
+        them with local ones. `HybridSearch` swallows that and degrades to
         BM25, which is right for a one-off search and wrong here: the caller
         asked for the index to be made current, and a BM25-only index cached
         under the current stamp would serve every later search until the next
@@ -70,12 +73,16 @@ class MemoryIndex:
             if not self.db_path.exists():
                 return
             hybrid = self._cache.get(self.db_path)
-            if HAS_SEMANTIC and hybrid._semantic is None:
+            err = hybrid.semantic_error
+            # An ImportError is the optional extra not being installed: a
+            # BM25-only index is what this install is meant to have, so it is
+            # not a failure and the entry stays cached.
+            if err is not None and not isinstance(err, ImportError):
                 self._cache.drop(self.db_path)
                 raise RuntimeError(
-                    "semantic index could not be built; see stderr. "
-                    "Search would be BM25-only."
-                )
+                    f"semantic index could not be built ({type(err).__name__}: "
+                    f"{err}); search would be BM25-only"
+                ) from err
 
     def search(
         self,

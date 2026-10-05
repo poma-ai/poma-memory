@@ -179,9 +179,10 @@ class _IndexCache:
         if version is not None:
             # Authoritative and exact: SQLite bumps this for our connection when
             # ANOTHER connection commits, which is precisely the reindex case.
-            # Nothing else belongs in the stamp — the -wal file's mtime and size
-            # move on checkpoint and on our own writes with no content change,
-            # so including it made the cache rebuild on almost every request.
+            # Nothing else belongs in the stamp but the file identity above — the
+            # -wal file's mtime and size move on checkpoint and on our own writes
+            # with no content change, so including it made the cache rebuild on
+            # almost every request.
             return ("data_version", version, ident)
 
         def _stat(p: Path) -> tuple | None:

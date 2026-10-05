@@ -273,3 +273,41 @@ def test_a_closed_handle_stays_closed(live):
         h.search("option constraint")
     with pytest.raises(RuntimeError):
         h.ensure_embeddings()
+
+
+def test_a_base_install_without_model2vec_is_bm25_by_design_and_does_not_raise(
+        live, monkeypatch):
+    monkeypatch.setitem(__import__("sys").modules, "model2vec", None)
+    monkeypatch.setattr("poma_memory.semantic_search._MODELS", {})
+    h = MemoryIndex(live / ".poma-memory.db")
+    h.ensure_embeddings()
+    h.ensure_embeddings()
+    assert h.builds == 1, "an absent optional dependency must not drop the cache"
+    assert h.search("option constraint")
+    h.close()
+
+
+def test_an_openai_outage_raises_and_keeps_the_stored_vectors(live, monkeypatch):
+    class _Down:
+        class embeddings:                                   # noqa: N801
+            @staticmethod
+            def create(**_kw):
+                raise OSError("quota")
+
+    monkeypatch.setenv("POMA_EMBEDDER", "openai")
+    monkeypatch.setattr("poma_memory.semantic_search._get_openai_client",
+                        lambda: _Down())
+    db = live / ".poma-memory.db"
+    store = Store(db)
+    ids = [i for i, _ in store.get_all_chunkset_embeddings()]
+    foreign = np.zeros(3072, dtype=np.float32).tobytes()
+    store.update_chunkset_embeddings([(i, foreign) for i in ids[:-1]] + [(ids[-1], None)])
+    store.close()
+    h = MemoryIndex(db)
+    with pytest.raises(RuntimeError, match="OSError"):
+        h.ensure_embeddings()
+    store = Store(db)
+    kept = [e for _, e in store.get_all_chunkset_embeddings() if e is not None]
+    store.close()
+    assert len(kept) == len(ids) - 1 and all(e == foreign for e in kept)
+    h.close()

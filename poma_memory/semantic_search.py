@@ -263,6 +263,14 @@ class OpenAISearch(_EmbedderBase):
 SemanticSearch = Model2VecSearch
 
 
+def _holds_other_dims(store: Store, dims: int) -> bool:
+    """Whether any stored embedding has a size other than `dims`."""
+    return any(
+        emb is not None and len(emb) // 4 != dims
+        for _, emb in store.get_all_chunkset_embeddings()
+    )
+
+
 def create_search(store: Store) -> _EmbedderBase:
     """Select an embedder. Local model2vec is the default — private, free, no
     network, and deterministic across processes (avoids embedding-dimension
@@ -278,6 +286,13 @@ def create_search(store: Store) -> _EmbedderBase:
             try:
                 return OpenAISearch(store, client)
             except Exception as e:
+                if _holds_other_dims(store, Model2VecSearch.expected_dims):
+                    # Falling back would re-embed every row at the local
+                    # model's size and overwrite paid-for vectors, because a
+                    # wrong-sized row counts as missing, and the next successful
+                    # OpenAI build would pay for all of them again. An outage
+                    # should leave the index as it is and fail this build.
+                    raise
                 print(
                     f"poma-memory: OpenAI embedder init failed ({e}); "
                     "falling back to local model2vec",

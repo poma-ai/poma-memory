@@ -31,6 +31,12 @@ class HybridSearch:
         self._store = store
         self._bm25 = BM25Search(store)
         self._semantic = None
+        # Why semantic search is off, when it was asked for and could not be
+        # built. None when it is on, was not requested, or is not installed.
+        # A caller that must not serve a silently degraded index (MemoryIndex)
+        # reads this; an ImportError means "optional dependency absent", which
+        # is a configuration and not a failure.
+        self.semantic_error: Exception | None = None
 
         # The BM25 corpus and the embedding matrix are snapshots — they are
         # expensive, and the daemon rebuilds them when `PRAGMA data_version`
@@ -46,6 +52,7 @@ class HybridSearch:
             try:
                 self._semantic = _create_semantic(store)
             except Exception as e:
+                self.semantic_error = e
                 # Fall back to BM25 only, but surface WHY on stderr — a silent
                 # `pass` here hid a perpetual "Semantic: no" for a long time.
                 # (Callers that must stay quiet, e.g. hooks, redirect stderr.)

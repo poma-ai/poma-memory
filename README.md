@@ -75,7 +75,8 @@ forget("old-project/", db_path="shared.db")   # drop a directory's rows
 
 `search()` opens the database and rebuilds the BM25 corpus and the embedding
 matrix on every call. A service that answers many queries holds a `MemoryIndex`
-instead: one warm index, rebuilt only when another connection commits.
+instead: one warm index, rebuilt when another connection commits or the file is
+replaced.
 
 ```python
 from poma_memory import MemoryIndex, index_file
@@ -85,7 +86,7 @@ idx.search("rollback", top_k=5, where={"repo": "poma-ai/poma-services-go"})
 
 with idx.lock:                                    # re-entrant; every method takes it
     index_file("/data/live/r/poma-ai/x/decision/ab12.md", path="/data/live")
-    idx.ensure_embeddings()                       # embeds only rows with no embedding
+    idx.ensure_embeddings()                       # embeds only rows with no valid embedding
 ```
 
 Hold `idx.lock` around a write and `ensure_embeddings()` so no search sees the
@@ -95,7 +96,8 @@ every writer to this database runs in this process under `idx.lock`. A CLI, a
 hook or a daemon writing from another process changes the database under the
 handle, and the next search then rebuilds (and embeds) while holding the lock.
 If the embedder fails during `ensure_embeddings` it raises, instead of leaving
-the index BM25-only.
+the index BM25-only. A base install without `model2vec` is BM25-only by design
+and does not raise.
 
 ---
 

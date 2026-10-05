@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -77,7 +78,7 @@ class _EmbedderBase:
         self._chunkset_map = {cs["chunkset_id"]: cs for cs in chunksets}
         stored = self._store.get_all_chunkset_embeddings()
 
-        # Detect dimension mismatch (model switch) — wipe stale embeddings
+        # Detect dimension mismatch (model switch) -- wipe stale embeddings
         dim_ok = True
         for _, emb_bytes in stored:
             if emb_bytes is not None:
@@ -86,33 +87,42 @@ class _EmbedderBase:
                     dim_ok = False
                 break
 
-        needs_reembed = not dim_ok or not stored or any(
-            emb is None for _, emb in stored
-        )
+        by_id: dict[int, bytes | None] = dict(stored)
+        if not dim_ok:
+            self._store.update_chunkset_embeddings(
+                [(cs_id, None) for cs_id in by_id]
+            )
+            by_id = {cs_id: None for cs_id in by_id}
 
-        if needs_reembed:
-            if not dim_ok:
-                # Wipe all embeddings so they get recomputed
-                for cs_id, _ in stored:
-                    self._store.update_chunkset_embedding(cs_id, None)
+        # Embed ONLY the rows that have no embedding. This used to re-embed the
+        # whole corpus whenever any one row was NULL, so every ingest into a
+        # warm index cost a full pass of the model and one commit per row
+        # (measured: 602 UPDATEs for one file added to a 300-file corpus). The
+        # rows that do have an embedding are trusted: the dimension check above
+        # is the only invalidation, as before.
+        missing = [
+            cs for cs in chunksets if by_id.get(cs["chunkset_id"]) is None
+        ]
+        if missing:
             # Use to_embed field (normalized text) when available, fall back to contents
-            texts = [cs.get("to_embed") or cs["contents"] for cs in chunksets]
+            texts = [cs.get("to_embed") or cs["contents"] for cs in missing]
             embeddings = self._embed_texts(texts)
-            for cs, emb in zip(chunksets, embeddings):
-                emb_bytes = emb.astype(np.float32).tobytes()
-                self._store.update_chunkset_embedding(cs["chunkset_id"], emb_bytes)
-            self._chunkset_ids = [cs["chunkset_id"] for cs in chunksets]
-            self._embeddings = embeddings.astype(np.float32)
-        else:
-            ids, embs = [], []
-            for cs_id, emb_bytes in stored:
-                if emb_bytes is not None:
-                    arr = np.frombuffer(emb_bytes, dtype=np.float32)
-                    ids.append(cs_id)
-                    embs.append(arr)
-            if embs:
-                self._chunkset_ids = ids
-                self._embeddings = np.stack(embs)
+            fresh = [
+                (cs["chunkset_id"], emb.astype(np.float32).tobytes())
+                for cs, emb in zip(missing, embeddings)
+            ]
+            self._store.update_chunkset_embeddings(fresh)
+            by_id.update(fresh)
+
+        ids, embs = [], []
+        for cs_id in sorted(by_id):
+            emb_bytes = by_id[cs_id]
+            if emb_bytes is not None and cs_id in self._chunkset_map:
+                ids.append(cs_id)
+                embs.append(np.frombuffer(emb_bytes, dtype=np.float32))
+        if embs:
+            self._chunkset_ids = ids
+            self._embeddings = np.stack(embs)
 
     def search(self, query: str, top_k: int = 10,
                allowed_ids: set[int] | None = None) -> list[dict]:
@@ -165,6 +175,10 @@ class _EmbedderBase:
         return hits
 
 
+_MODELS: dict = {}
+_MODEL_LOCK = threading.Lock()
+
+
 def _load_static_model(name: str):
     """Load the model2vec model without re-resolving it against the hub.
 
@@ -183,10 +197,20 @@ def _load_static_model(name: str):
     """
     from model2vec import StaticModel
 
-    try:
-        return StaticModel.from_pretrained(name, force_download=False)
-    except TypeError:
-        return StaticModel.from_pretrained(name)
+    # One loaded model per process and name. A resident index rebuilds its
+    # embedding matrix every time another connection commits, and each rebuild
+    # used to load the model again (~0.1s and tens of MB) for nothing: the model
+    # does not change when the corpus does. The lock keeps two threads that
+    # arrive together from loading it twice.
+    with _MODEL_LOCK:
+        model = _MODELS.get(name)
+        if model is None:
+            try:
+                model = StaticModel.from_pretrained(name, force_download=False)
+            except TypeError:
+                model = StaticModel.from_pretrained(name)
+            _MODELS[name] = model
+        return model
 
 
 class Model2VecSearch(_EmbedderBase):

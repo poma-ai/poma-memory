@@ -71,6 +71,27 @@ for r in results:
 forget("old-project/", db_path="shared.db")   # drop a directory's rows
 ```
 
+### Serving one index from a long-lived process
+
+`search()` opens the database and rebuilds the BM25 corpus and the embedding
+matrix on every call. A service that answers many queries holds a `MemoryIndex`
+instead: one warm index, rebuilt only when another connection commits.
+
+```python
+from poma_memory import MemoryIndex, index_file
+
+idx = MemoryIndex("/data/live/.poma-memory.db")
+idx.search("rollback", top_k=5, where={"repo": "poma-ai/poma-services-go"})
+
+with idx.lock:                                    # re-entrant; every method takes it
+    index_file("/data/live/r/poma-ai/x/decision/ab12.md", path="/data/live")
+    idx.ensure_embeddings()                       # embeds only rows with no embedding
+```
+
+Hold `idx.lock` around a write and `ensure_embeddings()` so no search sees the
+half-way state and the new rows are embedded under the lock instead of by
+whichever search arrives next. After that, searches write nothing.
+
 ---
 
 ## Filtering by metadata

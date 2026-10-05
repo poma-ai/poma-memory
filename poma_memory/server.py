@@ -122,6 +122,26 @@ def _lock_key(req: dict) -> str:
         return ""
 
 
+def _file_ident(db: Path) -> tuple | None:
+    """(st_dev, st_ino) of the file at `db`, or None when it is not usable.
+
+    None when the file is absent, and also when the filesystem does not report a
+    stable identity: some FUSE and network mounts hand out a fresh inode on every
+    `stat`, and an identity that changes on its own would make the stamp differ
+    on every call and rebuild the index on every request. Two stats in a row
+    that disagree is how that is told apart from a real replacement. Replacement
+    detection is simply off on such a mount, which is the old behaviour; the
+    `data_version` half of the stamp still catches every ordinary commit.
+    """
+    try:
+        a = os.stat(db)
+        b = os.stat(db)
+    except OSError:
+        return None
+    ia, ib = (a.st_dev, a.st_ino), (b.st_dev, b.st_ino)
+    return ia if ia == ib else None
+
+
 class _IndexCache:
     """db path -> warm HybridSearch, invalidated when the db file changes."""
 
@@ -157,11 +177,7 @@ class _IndexCache:
         # over the path) keeps reading the old inode and its data_version never
         # moves, so without this a service would keep answering from the file
         # that is no longer there. Cheap: one stat.
-        try:
-            st = db.stat()
-            ident = (st.st_dev, st.st_ino)
-        except OSError:
-            ident = None
+        ident = _file_ident(db)
 
         version = None
         if store is not None:

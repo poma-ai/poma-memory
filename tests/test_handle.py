@@ -311,3 +311,23 @@ def test_an_openai_outage_raises_and_keeps_the_stored_vectors(live, monkeypatch)
     store.close()
     assert len(kept) == len(ids) - 1 and all(e == foreign for e in kept)
     h.close()
+
+
+def test_an_unstable_inode_does_not_rebuild_on_every_call(live, monkeypatch):
+    real = os.stat
+    counter = iter(range(10**9))
+
+    def flaky(path, *a, **kw):
+        st = real(path, *a, **kw)
+        if str(path).endswith(".poma-memory.db"):
+            return os.stat_result((st.st_mode, next(counter), st.st_dev, st.st_nlink,
+                                   st.st_uid, st.st_gid, st.st_size,
+                                   st.st_atime, st.st_mtime, st.st_ctime))
+        return st
+
+    monkeypatch.setattr(os, "stat", flaky)
+    h = MemoryIndex(live / ".poma-memory.db")
+    for _ in range(5):
+        h.search("option constraint")
+    assert h.builds == 1
+    h.close()

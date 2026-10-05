@@ -8,8 +8,8 @@ because a build writes any missing embeddings, turns a read into a write.
 `MemoryIndex` keeps one warm `HybridSearch` per process and rebuilds it only
 when another connection has committed to the database (`PRAGMA data_version`)
 or the file at `db_path` has been replaced (see `server._IndexCache`, which
-does the work). A filesystem that reports an unstable inode rebuilds on every
-call: correct, but it costs what a rebuild costs. It adds the two things a caller
+does the work). On a filesystem that does not report a stable inode the
+replacement check switches itself off rather than rebuilding on every call. It adds the two things a caller
 needs and the daemon does not expose:
 
 * `lock`, a re-entrant lock every operation here takes. A caller that mutates

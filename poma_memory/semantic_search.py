@@ -78,21 +78,18 @@ class _EmbedderBase:
         self._chunkset_map = {cs["chunkset_id"]: cs for cs in chunksets}
         stored = self._store.get_all_chunkset_embeddings()
 
-        # Detect dimension mismatch (model switch) -- wipe stale embeddings
-        dim_ok = True
-        for _, emb_bytes in stored:
-            if emb_bytes is not None:
-                dim = len(emb_bytes) // 4  # float32 = 4 bytes
-                if dim != self.expected_dims:
-                    dim_ok = False
-                break
-
-        by_id: dict[int, bytes | None] = dict(stored)
-        if not dim_ok:
-            self._store.update_chunkset_embeddings(
-                [(cs_id, None) for cs_id in by_id]
+        # Any row whose embedding is the wrong size (a model switch, or two
+        # processes with different POMA_EMBEDDER settings writing one database)
+        # is treated as missing and re-embedded with the rest. Checking only the
+        # first stored row left a mixed corpus unrepairable: np.stack failed on
+        # every rebuild and semantic search stayed off for good.
+        by_id: dict[int, bytes | None] = {
+            cs_id: (
+                emb if emb is not None
+                and len(emb) // 4 == self.expected_dims else None
             )
-            by_id = {cs_id: None for cs_id in by_id}
+            for cs_id, emb in stored
+        }
 
         # Embed ONLY the rows that have no embedding. This used to re-embed the
         # whole corpus whenever any one row was NULL, so every ingest into a
@@ -107,6 +104,13 @@ class _EmbedderBase:
             # Use to_embed field (normalized text) when available, fall back to contents
             texts = [cs.get("to_embed") or cs["contents"] for cs in missing]
             embeddings = self._embed_texts(texts)
+            if len(embeddings) != len(texts):
+                # zip() would truncate and, worse, store the vectors after a
+                # dropped one against the wrong rows, where they would stay.
+                raise ValueError(
+                    f"embedder returned {len(embeddings)} vectors for "
+                    f"{len(texts)} texts"
+                )
             fresh = [
                 (cs["chunkset_id"], emb.astype(np.float32).tobytes())
                 for cs, emb in zip(missing, embeddings)

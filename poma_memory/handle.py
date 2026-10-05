@@ -28,6 +28,7 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
+from poma_memory.search import HAS_SEMANTIC
 from poma_memory.server import _IndexCache
 
 
@@ -38,11 +39,16 @@ class MemoryIndex:
         self.db_path = Path(db_path)
         self.lock = threading.RLock()
         self._cache = _IndexCache(limit=1)
+        self._closed = False
 
     @property
     def builds(self) -> int:
         """How many times the warm index was (re)built. For tests and metrics."""
         return self._cache.builds
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("MemoryIndex is closed")
 
     def ensure_embeddings(self) -> None:
         """Make the warm index current, embedding only rows that lack one.
@@ -50,10 +56,26 @@ class MemoryIndex:
         A no-op when the database does not exist or has not changed since the
         last build. After it returns, a search issues no embedding writes until
         the next commit from another connection.
+
+        Raises `RuntimeError` when semantic search is installed but the build
+        could not produce it (the embedder failed: a quota, a network error, a
+        model that would not load). `HybridSearch` swallows that and degrades to
+        BM25, which is right for a one-off search and wrong here: the caller
+        asked for the index to be made current, and a BM25-only index cached
+        under the current stamp would serve every later search until the next
+        commit. The entry is dropped so the next call retries.
         """
         with self.lock:
-            if self.db_path.exists():
-                self._cache.get(self.db_path)
+            self._check_open()
+            if not self.db_path.exists():
+                return
+            hybrid = self._cache.get(self.db_path)
+            if HAS_SEMANTIC and hybrid._semantic is None:
+                self._cache.drop(self.db_path)
+                raise RuntimeError(
+                    "semantic index could not be built; see stderr. "
+                    "Search would be BM25-only."
+                )
 
     def search(
         self,
@@ -65,6 +87,7 @@ class MemoryIndex:
     ) -> list[dict]:
         """Same arguments, result and exceptions as `poma_memory.search`."""
         with self.lock:
+            self._check_open()
             if not self.db_path.exists():
                 return []
             return self._cache.get(self.db_path).search(
@@ -73,6 +96,8 @@ class MemoryIndex:
             )
 
     def close(self) -> None:
-        """Shutdown only, once no thread is inside `search`."""
+        """Shutdown only, once no thread is inside `search`. Final: every later
+        call raises `RuntimeError`."""
         with self.lock:
+            self._closed = True
             self._cache.close_all()

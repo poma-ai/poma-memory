@@ -90,7 +90,12 @@ with idx.lock:                                    # re-entrant; every method tak
 
 Hold `idx.lock` around a write and `ensure_embeddings()` so no search sees the
 half-way state and the new rows are embedded under the lock instead of by
-whichever search arrives next. After that, searches write nothing.
+whichever search arrives next. After that, searches write nothing, as long as
+every writer to this database runs in this process under `idx.lock`. A CLI, a
+hook or a daemon writing from another process changes the database under the
+handle, and the next search then rebuilds (and embeds) while holding the lock.
+If the embedder fails during `ensure_embeddings` it raises, instead of leaving
+the index BM25-only.
 
 ---
 

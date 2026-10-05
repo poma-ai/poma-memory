@@ -5,6 +5,7 @@ covers that): after an ingest a search must not write, and an ingest must
 embed only what is new.
 """
 
+import os
 import threading
 
 import numpy as np
@@ -42,12 +43,13 @@ class _Counter:
     """Counts rows written by embedding batches and single-row updates."""
 
     def __init__(self, monkeypatch):
-        self.batches, self.singles = [], 0
+        self.batches, self.singles, self.threads = [], 0, set()
         orig_batch = Store.update_chunkset_embeddings
         orig_one = Store.update_chunkset_embedding
 
         def batch(store, pairs):
             self.batches.append(len(pairs))
+            self.threads.add(threading.current_thread().name)
             return orig_batch(store, pairs)
 
         def one(store, cs_id, emb):
@@ -145,12 +147,12 @@ def test_a_dimension_change_re_embeds_everything(live, monkeypatch):
     c = _Counter(monkeypatch)
     h2 = MemoryIndex(live / ".poma-memory.db")
     h2.ensure_embeddings()
-    assert c.rows == 2 * len(rows)       # one wipe pass, one embed pass
+    assert c.rows == len(rows) and len(c.batches) == 1
     assert h2.search("option constraint")
     h2.close()
 
 
-def test_concurrent_searches_and_ingests_do_not_fail(live):
+def test_concurrent_searches_and_ingests_do_not_fail(live, monkeypatch):
     h = MemoryIndex(live / ".poma-memory.db")
     h.ensure_embeddings()
     errors = []
@@ -172,14 +174,102 @@ def test_concurrent_searches_and_ingests_do_not_fail(live):
         except Exception as e:      # noqa: BLE001
             errors.append(e)
 
-    threads = [threading.Thread(target=reader) for _ in range(6)]
-    threads.append(threading.Thread(target=writer))
+    c = _Counter(monkeypatch)
+    threads = [threading.Thread(target=reader, name=f"reader{i}") for i in range(6)]
+    threads.append(threading.Thread(target=writer, name="writer"))
     [t.start() for t in threads]
     [t.join(120) for t in threads]
+    assert not any(t.is_alive() for t in threads), "deadlock"
     assert not errors, errors
+    assert c.threads == {"writer"}, f"a reader wrote embeddings: {c.threads}"
     assert any("w204.md" in r["file_path"] for r in h.search("option 204"))
     h.close()
 
 
 def test_exported_at_the_package_root():
     assert poma_memory.MemoryIndex is MemoryIndex
+
+
+def test_a_recreated_database_is_not_served_from_the_old_file(live):
+    db = live / ".poma-memory.db"
+    h = MemoryIndex(db)
+    assert h.search("option constraint")
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.remove(str(db) + suffix)
+        except FileNotFoundError:
+            pass
+    for f in live.glob("*"):
+        if f.is_file() and f.suffix == ".md":
+            f.unlink()
+    _write(live.parent, "z.md", "# Zebras\nStriped animals graze on the savanna.\n")
+    index(path=str(live))
+    got = h.search("striped animals savanna")
+    assert got and all("z.md" in r["file_path"] for r in got)
+    assert not h.search("option constraint")
+    h.close()
+
+
+def test_a_mixed_size_corpus_repairs_itself(live):
+    db = live / ".poma-memory.db"
+    MemoryIndex(db).ensure_embeddings()
+    store = Store(db)
+    ids = [i for i, _ in store.get_all_chunkset_embeddings()]
+    store.update_chunkset_embeddings([
+        (ids[0], np.zeros(7, dtype=np.float32).tobytes()),
+        (ids[1], None),
+    ])
+    store.close()
+    h = MemoryIndex(db)
+    h.ensure_embeddings()
+    assert h._cache.get(db)._semantic is not None
+    store = Store(db)
+    assert all(e is not None and len(e) // 4 == 512
+               for _, e in store.get_all_chunkset_embeddings())
+    store.close()
+    h.close()
+
+
+def test_a_failed_embed_raises_and_is_retried(live, monkeypatch):
+    from poma_memory.semantic_search import Model2VecSearch
+    h = MemoryIndex(live / ".poma-memory.db")
+    h.ensure_embeddings()
+    with h.lock:
+        index_file(str(_write(live.parent, "d97.md", _entry(97))), path=str(live))
+        real = Model2VecSearch._embed_texts
+        monkeypatch.setattr(Model2VecSearch, "_embed_texts",
+                            lambda self, texts: (_ for _ in ()).throw(OSError("quota")))
+        with pytest.raises(RuntimeError):
+            h.ensure_embeddings()
+        monkeypatch.setattr(Model2VecSearch, "_embed_texts", real)
+        h.ensure_embeddings()
+    c = _Counter(monkeypatch)
+    assert any("d97.md" in r["file_path"] for r in h.search("option 97 constraint"))
+    assert c.rows == 0
+    assert h._cache.get(h.db_path)._semantic is not None
+    h.close()
+
+
+def test_a_short_embedder_response_is_an_error_not_a_misalignment(live, monkeypatch):
+    from poma_memory.semantic_search import Model2VecSearch
+    store = Store(live / ".poma-memory.db")
+    store.update_chunkset_embeddings(
+        [(i, None) for i, _ in store.get_all_chunkset_embeddings()]
+    )
+    monkeypatch.setattr(Model2VecSearch, "_embed_texts",
+                        lambda self, texts: np.zeros((len(texts) - 1, 512),
+                                                     dtype=np.float32))
+    with pytest.raises(ValueError, match="vectors for"):
+        Model2VecSearch(store)
+    assert all(e is None for _, e in store.get_all_chunkset_embeddings())
+    store.close()
+
+
+def test_a_closed_handle_stays_closed(live):
+    h = MemoryIndex(live / ".poma-memory.db")
+    h.search("option constraint")
+    h.close()
+    with pytest.raises(RuntimeError):
+        h.search("option constraint")
+    with pytest.raises(RuntimeError):
+        h.ensure_embeddings()

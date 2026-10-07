@@ -30,6 +30,30 @@ def _disk_state(path: str, kind: str = "file") -> str:
     return path_state(path, kind)
 
 
+def _is_empty_dir(path: str) -> bool:
+    """True only when `path` was listed and has no entries at all.
+
+    An unmounted nested volume leaves exactly this behind: a present, empty
+    mountpoint. Any error listing it (EACCES, EIO, a dead mount) is "cannot
+    tell" and answers False, because the one thing this must never do is hold
+    back MORE than the missing-directory rule already did on a guess. Hidden
+    entries count as entries, so a directory with only a `.DS_Store` in it is
+    not empty and its deletions stay automatic.
+
+    The tool's own database files do not count: `index <mountpoint>` run by hand
+    creates `.poma-memory.db` in that directory, which would otherwise make the
+    emptied mountpoint look ordinary and let the next `index <root>` prune the
+    volume's rows -- the guard switched off by the very command a user tries
+    when something looks wrong.
+    """
+    try:
+        with os.scandir(path) as it:
+            return all(e.name == ".poma-memory.db" or e.name.startswith(".poma-memory.db-")
+                       for e in it)
+    except OSError:
+        return False
+
+
 def _stat_ok(path: str | Path) -> bool:
     """Whether the path can be proven present. `Path.exists` raises on
     PermissionError before Python 3.14, which turned an unreadable parent into a
@@ -80,9 +104,11 @@ def index(
         db_path: SQLite database path (default: {path}/.poma-memory.db)
         glob: File pattern to match (default: **/*.md)
         prune: Remove indexed files that are gone from disk. None (default)
-            removes them unless a directory under `path` has vanished or the
-            removals would be most of the index, both of which look more like
-            something that failed to mount than a deletion. True removes them
+            removes them unless a directory under `path` has vanished or is
+            now completely empty (with more than five of its files gone), or the removals would be most of the index,
+            all of which look more like something that failed to mount than a
+            deletion (so emptying a larger directory on purpose takes
+            `prune=True` once). True removes them
             anyway; False never does. Neither reaches rows outside `path`, and
             neither removes anything at all when `path` itself is absent — for
             a directory that is gone for good, see `forget`.
@@ -125,6 +151,18 @@ def index(
         print(f"poma-memory: {root_key} {why} and there is no index at "
               f"{db_path}; nothing to do. Nothing was created.",
               file=sys.stderr)
+        return {"files_indexed": 0, "chunks_created": 0, "chunksets_created": 0,
+                "metadata_refreshed": False, "unreadable": [], "stale_rules": [],
+                "pruned": [], "prune_held_back": []}
+
+    # NOTHING TO INDEX AND NO DATABASE YET: create nothing. An empty database
+    # holds no rows to protect, and the file it leaves behind is not harmless --
+    # `index <mountpoint>` run by hand on an unmounted volume's empty mountpoint
+    # dropped a database in it (whatever `--db` named), which made the directory
+    # look ordinary and let the next `index <root>` prune the volume's rows
+    # without `--prune`. `_is_empty_dir` exempts the default database's name, but
+    # only this closes it for a database the user named.
+    if not _stat_ok(db_path) and next(iter(path.glob(glob)), None) is None:
         return {"files_indexed": 0, "chunks_created": 0, "chunksets_created": 0,
                 "metadata_refreshed": False, "unreadable": [], "stale_rules": [],
                 "pruned": [], "prune_held_back": []}
@@ -294,20 +332,42 @@ def index(
             # the guard erodes: a subtree held back today becomes a minority of
             # the index as the corpus grows and is pruned silently on some later
             # run, with no warning at all. `--prune` still clears it.
-            lost_dirs = {os.path.dirname(fp) for fp in gone
-                         if _disk_state(os.path.dirname(fp), "dir") != "present"}
+            #
+            # A directory that is present but EMPTY is held the same way: an
+            # unmounted nested volume leaves its mountpoint behind as exactly
+            # that, so "gone" and "present" alone let it prune silently (8 of
+            # 28 rows, under the proportional threshold). Only a directory with
+            # no entries at all counts (see `_is_empty_dir`: a listing error is
+            # "cannot tell" and holds nothing extra), so a directory that still
+            # has other files in it keeps its ordinary deletions automatic.
+            # And only when MORE than `_PRUNE_FLOOR` rows sat directly in it:
+            # emptying a directory of a handful of notes is the commonest
+            # deletion there is, and "below five missing files a run prunes
+            # regardless" has to keep meaning that. The cost: deleting every
+            # file of a bigger directory on purpose needs `--prune` once, and
+            # a mountpoint with five or fewer indexed files is not caught.
+            lost_dirs = set()
+            per_dir: dict[str, int] = {}
+            for fp in gone:
+                d = os.path.dirname(fp)
+                per_dir[d] = per_dir.get(d, 0) + 1
+            for d, n in per_dir.items():
+                if _disk_state(d, "dir") != "present" or (
+                        n > _PRUNE_FLOOR and _is_empty_dir(d)):
+                    lost_dirs.add(d)
             if lost_dirs or len(gone) > max(_PRUNE_FLOOR, tracked_here // 2):
                 held_back, gone = gone, []
                 shown = ", ".join(held_back[:3]) + (
                     ", ..." if len(held_back) > 3 else "")
-                why = ("their directory is missing too" if lost_dirs
+                why = ("their directory is missing or now empty too" if lost_dirs
                        else "that is most of this index")
                 print(
                     f"poma-memory: {len(held_back)} of {tracked_here} indexed "
                     f"file(s) under {root_key} are missing ({shown}) and "
                     f"{why}, which looks more like a directory that did not "
-                    "mount than a deletion, so nothing was removed. Re-run "
-                    "with --prune to remove them.", file=sys.stderr)
+                    "mount than a deletion, so nothing was removed. If you "
+                    "deleted them on purpose (including emptying a directory), "
+                    "re-run with --prune to remove them.", file=sys.stderr)
         elif prune is False:
             held_back, gone = gone, []
 

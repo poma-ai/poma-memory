@@ -183,16 +183,19 @@ the directory it was given — a run over one directory never removes another's
 rows, even when they share a database and even with `--prune`.
 
 It holds back rather than removing when the directory it was given is itself
-absent, when a whole directory under it has disappeared, or when the removals
-would be most of the index, since all three look more like something that
-failed to mount than a deletion. Held-back documents stay in the index and keep
+absent, when a whole directory under it has disappeared or been left completely
+empty (more than five of its indexed files gone, nothing else in it), or when
+the removals would be most of the index, since all of these look more like
+something that failed to mount than a deletion. Held-back documents stay in the index and keep
 appearing in results until you decide: `--prune` removes them, `--no-prune`
 never removes anything. A handful of individual files going missing is removed
-without asking. A change is detected by mtime, size or ctime, so an edit
+without asking, and so is deleting some of a directory's files while others
+remain. The price of the empty-directory rule: deliberately deleting every file
+of a larger directory needs `--prune` once. A change is detected by mtime, size or ctime, so an edit
 restored from a backup with its timestamp intact is still picked up.
 
-`--prune` overrides both hold-backs — the proportional one and a vanished
-subdirectory — but never the absent-root gate: a run whose own directory is
+`--prune` overrides both hold-backs — the proportional one and a vanished or
+emptied subdirectory — but never the absent-root gate: a run whose own directory is
 absent removes nothing whatever the flag says, because at that moment nothing
 can tell an unmounted drive from a deleted one. (It also creates nothing, so
 the directory's absence stays true for the next run.)

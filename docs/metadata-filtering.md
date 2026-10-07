@@ -256,7 +256,7 @@ it was sampled for every row before any were removed; and a run will not remove
 MOST of an index without being asked.
 
 `--prune` overrides the two hold-backs below — the proportional one and a
-vanished subdirectory — and neither of the two gates above them, which have no
+vanished or emptied subdirectory — and neither of the two gates above them, which have no
 override at all. That last one is not a guess about intent, because there is no
 guess to be made: a mountpoint nested inside a present root reports ENOENT for everything
 under it, exactly as a deleted directory does, and no filesystem call
@@ -333,6 +333,23 @@ documents elsewhere in the tree pruned a vanished subtree silently. And a
 missing DIRECTORY is held whatever the proportion, because a purely
 proportional guard erodes — a subtree held back today is a minority of the
 index once the corpus grows, and would be pruned later with no warning at all.
+
+A present but EMPTY directory is held the same way. An unmounted nested volume
+leaves its mountpoint behind as exactly that, `stat` says "present", and the
+vanished-directory rule therefore never fired: 20 files plus 8 in `vol/`, the 8
+deleted and `vol/` left, pruned all 8 silently (8 is not more than
+`max(5, 28 // 2)`). The rule is deliberately narrow: `os.scandir` returns no
+entry at all (a hidden file or an empty subdirectory counts as an entry; poma-memory's own `.poma-memory.db*` files do not), more
+than `_PRUNE_FLOOR` rows sat directly in that directory, and the listing itself
+succeeded. A listing error is "cannot tell", and unknown never holds back more
+than the existing rules do. The cost, stated: deleting every file of a larger
+directory on purpose now needs `--prune` once, and the refusal message says so;
+a mountpoint with five or fewer indexed files is not caught, because emptying a
+directory of a few notes is the commonest deletion there is. It is a heuristic for the accident (an unmount
+leaving an empty directory), not a guarantee: a file the user puts in that
+directory -- including a database they point `--db` at inside it -- makes it
+non-empty and the rows are pruned as an ordinary deletion. `index` itself
+creates no database for a directory with nothing to index.
 
 Below five missing files a run prunes regardless, so ordinary deletions in a
 small corpus are not a standing question. `size_bytes` and `ctime` are what let an edit be noticed at all when

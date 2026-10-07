@@ -114,8 +114,20 @@ class _EmbedderBase:
                 self._chunkset_ids = ids
                 self._embeddings = np.stack(embs)
 
-    def search(self, query: str, top_k: int = 10) -> list[dict]:
-        """Perform cosine similarity search on stored chunkset embeddings."""
+    def search(self, query: str, top_k: int = 10,
+               allowed_ids: set[int] | None = None) -> list[dict]:
+        """Perform cosine similarity search on stored chunkset embeddings.
+
+        `allowed_ids` narrows the corpus BEFORE the ranking, and this is the
+        step that makes metadata filtering correct rather than merely
+        available. `HybridSearch` derives its empty gate from the top-1 cosine
+        of whatever this returns; if out-of-scope documents were still in the
+        ranking at that point, the gate would answer for a corpus the caller
+        did not ask about — suppressing a real in-scope hit when out-of-scope
+        bulk drags top-1 down, or returning [] indistinguishable from "no
+        answer" when an out-of-scope document cleared the gate and was filtered
+        away afterwards.
+        """
         if self._embeddings is None or len(self._chunkset_ids) == 0:
             return []
         query_vec = self._embed_query(query)
@@ -125,6 +137,12 @@ class _EmbedderBase:
         denom = np.where(denom > 0, denom, 1.0)
         scores = np.dot(self._embeddings, query_vec) / denom
         scores = np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+        if allowed_ids is not None:
+            keep = np.fromiter(
+                (cs_id in allowed_ids for cs_id in self._chunkset_ids),
+                dtype=bool, count=len(self._chunkset_ids),
+            )
+            scores = np.where(keep, scores, -np.inf)
         top_indices = np.argsort(scores)[-top_k:][::-1]
         hits = []
         for idx in top_indices:
@@ -132,6 +150,8 @@ class _EmbedderBase:
             if score < self.min_score:
                 continue
             cs_id = self._chunkset_ids[idx]
+            if allowed_ids is not None and cs_id not in allowed_ids:
+                continue
             cs = self._chunkset_map.get(cs_id)
             if cs is None:
                 continue

@@ -217,8 +217,11 @@ class _StubSemantic:
     def __init__(self, hits):
         self._hits = hits
 
-    def search(self, query, top_k=10):
-        return self._hits[:top_k]
+    def search(self, query, top_k=10, allowed_ids=None):
+        hits = self._hits
+        if allowed_ids is not None:
+            hits = [h for h in hits if h["chunkset_id"] in allowed_ids]
+        return hits[:top_k]
 
 
 def _indexed_store(tmpdir):

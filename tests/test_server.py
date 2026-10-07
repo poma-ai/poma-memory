@@ -346,3 +346,158 @@ def test_env_override_is_not_taken_from_the_daemons_environment(running_daemon,
 
     assert run(str(running_daemon)) == run("off"), \
         "daemon and in-process disagreed under an environment override"
+
+
+def test_one_index_addressed_two_ways_takes_one_lock(running_daemon, indexed_dir):
+    """The lock key must be the RESOLVED database, not the raw request.
+
+    `{"path": "/r/.agent"}` and `{"db_path": "/r/.agent/.poma-memory.db"}` name
+    one index, and the CLI sends the second whenever `--db` is passed. Keyed on
+    the raw request they took two different locks, so two threads entered
+    `_IndexCache.get` for one entry and one closed the Store the other was
+    reading. Measured before the fix on this shape: 13 failures in 320 requests
+    ("Cannot operate on a closed database", "bad parameter or other API
+    misuse", "tuple index out of range") and 4 cache builds instead of 1.
+    """
+    db = str(indexed_dir / ".poma-memory.db")
+    # Warm it first, so `builds` counts only rebuilds caused by the two
+    # spellings fighting over one entry.
+    request({"op": "search", "query": "rollback", "path": str(indexed_dir)},
+            running_daemon, timeout=60)
+    warm = request({"op": "stats"}, running_daemon)["builds"]
+    errors = []
+
+    def hit(use_db):
+        for _ in range(30):
+            try:
+                resp = request({
+                    "op": "search", "query": "rollback",
+                    "path": str(indexed_dir),
+                    "db_path": db if use_db else None, "top_k": 3,
+                }, running_daemon, timeout=30)
+                if not resp.get("ok"):
+                    errors.append(resp)
+            except Exception as e:                      # noqa: BLE001
+                errors.append(f"{type(e).__name__}: {e}")
+
+    threads = [threading.Thread(target=hit, args=(i % 2 == 0,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=120)
+
+    assert errors == [], f"{len(errors)} concurrent failures, e.g. {errors[0]}"
+    assert request({"op": "stats"}, running_daemon)["builds"] == warm, \
+        "the two spellings rebuilt the cache instead of sharing one entry"
+
+
+def test_the_lock_key_is_the_resolved_database():
+    """The unit of the above: both spellings resolve to one key."""
+    from poma_memory.server import _lock_key
+    a = {"op": "search", "path": "/r/.agent"}
+    b = {"op": "search", "path": "/r/.agent",
+         "db_path": "/r/.agent/.poma-memory.db"}
+    assert _lock_key(a) == _lock_key(b) == "/r/.agent/.poma-memory.db"
+    # Nothing resolvable (ping, stats, a relative path) shares the empty key.
+    assert _lock_key({"op": "ping"}) == ""
+    assert _lock_key({"op": "search", "path": "relative/.agent"}) == ""
+
+
+@pytest.mark.parametrize("ndb,limit", [(9, 8), (12, 8)])
+def test_evicting_one_index_does_not_close_another_mid_search(ndb, limit):
+    """`_evict` crosses databases by construction — building an entry for db A
+    is what evicts db B — so the per-index lock cannot make it safe, and
+    closing the Store there closed a connection another thread was querying.
+
+    With `MAX_CACHED_INDEXES = 8`, nine databases queried concurrently was
+    enough: "Cannot operate on a closed database", then on a re-run a
+    **SIGSEGV**. Ten databases against a limit of twenty was clean, which is
+    what identified eviction rather than the lock key. Runs in-process, so a
+    regression here fails this test rather than taking the suite's interpreter
+    down with it — which is what it did.
+    """
+    import tempfile as _tf
+    from poma_memory.api import index as api_index
+    from poma_memory.server import _IndexCache, _LockTable
+
+    with _tf.TemporaryDirectory() as td:
+        dbs = []
+        for i in range(ndb):
+            r = Path(td) / f"r{i}"
+            r.mkdir()
+            for j in range(3):
+                (r / f"f{j}.md").write_text(f"# R{i}F{j}\n\nsqlite storage {j}\n")
+            api_index(r)
+            dbs.append(r / ".poma-memory.db")
+
+        cache = _IndexCache(limit=limit)
+        locks = _LockTable()
+        errors: list[str] = []
+
+        def worker(db):
+            for _ in range(25):
+                try:
+                    with locks.for_key(str(db)):
+                        cache.get(db).search("sqlite storage", top_k=3)
+                except Exception as e:                       # noqa: BLE001
+                    errors.append(f"{type(e).__name__}: {e}")
+
+        threads = [threading.Thread(target=worker, args=(d,)) for d in dbs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=180)
+        cache.close_all()
+        assert errors == [], f"{len(errors)} failures, e.g. {errors[0]}"
+
+
+def test_shutdown_does_not_close_a_database_a_worker_is_still_using():
+    """`close_all`'s docstring said the workers have been joined by then. The
+    join is a TOTAL 5 s budget across all of them, and each lock acquire is
+    `timeout=2.0` with the result discarded, so one search slower than the
+    budget met a closed connection: `ProgrammingError: Cannot operate on a
+    closed database`, the same close-under-a-live-reader class `_evict` was
+    fixed for, and with a query in flight the same segfault.
+
+    Asserted on the guard rather than by racing a real daemon, so it cannot
+    pass by timing: `close_all` must not run while a worker is alive.
+    """
+    import threading as _th
+    from poma_memory.server import _IndexCache
+
+    cache = _IndexCache()
+    closed = []
+    cache.close_all = lambda: closed.append(True)        # type: ignore[method-assign]
+
+    stop = _th.Event()
+    slow = _th.Thread(target=stop.wait, daemon=True)
+    slow.start()
+    workers = [slow]
+    try:
+        # The exact expression `serve`'s finally block guards with.
+        if all(not t.is_alive() for t in workers):
+            cache.close_all()
+        assert closed == [], "closed the cache while a worker was running"
+    finally:
+        stop.set()
+        slow.join(timeout=5)
+
+    assert all(not t.is_alive() for t in workers)
+    if all(not t.is_alive() for t in workers):
+        cache.close_all()
+    assert closed == [True], "never closed the cache once the workers finished"
+
+
+def test_serve_guards_close_all_with_a_liveness_check():
+    """The guard has to be in `serve` itself, not only in this file's idea of
+    it: the bug was that `cache.close_all()` sat in the finally block with
+    nothing between it and a bounded join."""
+    import inspect
+
+    from poma_memory import server
+
+    src = inspect.getsource(server.serve)
+    tail = src[src.index("join_until"):]
+    assert "cache.close_all()" in tail
+    guard = tail[:tail.index("cache.close_all()")]
+    assert "is_alive()" in guard, "close_all is not guarded by a liveness check"

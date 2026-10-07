@@ -43,6 +43,7 @@ pip install 'poma-memory[semantic,mcp]'           # recommended combo
 ```bash
 poma-memory index .claude/                                    # index your context files
 poma-memory search "authentication middleware" --path .claude/ # search
+poma-memory search "rollback" --path .claude/ --where kind=runbook  # search one kind
 ```
 
 ## MCP server (Claude Code)
@@ -51,7 +52,7 @@ Add poma-memory as an MCP server so Claude Code can search your project memory a
 
 ```bash
 claude mcp add --transport stdio --scope user poma-memory -- poma-memory-mcp
-# Exposes poma_search, poma_index, poma_status tools
+# Exposes poma_search, poma_index, poma_forget, poma_status tools
 ```
 
 Once added, Claude Code can call `poma_search` during planning and exploration to surface relevant decisions, patterns, and context from prior sessions.
@@ -59,14 +60,127 @@ Once added, Claude Code can call `poma_search` during planning and exploration t
 ## Python API
 
 ```python
-from poma_memory import index, search, status
+from poma_memory import index, search, status, forget
 
 index(path=".claude/")
 results = search("session context", path=".claude/", top_k=5)
 for r in results:
     print(f"{r['file_path']} (score: {r['score']:.4f})")
     print(r['context'])
+
+forget("old-project/", db_path="shared.db")   # drop a directory's rows
 ```
+
+---
+
+## Filtering by metadata
+
+One index can hold more than one kind of document. To search a subset, give
+each file some metadata and pass a predicate.
+
+Metadata comes from two places. **Path rules** name what your layout already
+says, and need no change to the files themselves — put a
+`.poma-metadata.json` at the root of the indexed directory:
+
+```json
+{
+  "rules": [
+    {"glob": "events/**/*.md", "metadata": {"kind": "event"}},
+    {"glob": "DECISIONS.md",   "metadata": {"kind": "decision"}},
+    {"glob": "**/*.md",        "metadata": {"kind": "note"}}
+  ]
+}
+```
+
+First matching rule wins, so put the catch-all last. **Front-matter** is the
+second source, and wins per key over a path rule:
+
+```markdown
+---
+kind: event
+session: laptop-2
+---
+```
+
+Front-matter is read by a **restricted** parser, not a full YAML one: `key:
+value`, `key: [a, b]`, a block list, and one level of nesting flattened to
+`parent.child`. Values stay strings, so `true` and `1` are the strings `"true"`
+and `"1"`. A trailing `# comment` outside quotes is dropped.
+
+Anything else — block scalars (`|`, `>`), anchors, flow mappings, duplicate
+keys, an unterminated fence — makes the whole block **unparsed**: the file gets
+no front-matter metadata, and `poma-memory status` names it. If a filter misses
+a file you expected, check `status` first.
+
+Then filter:
+
+```bash
+poma-memory search "disk pressure" --path .agent/ --where kind=event
+poma-memory search "disk pressure" --path .agent/ --where kind=event --where kind=decision
+```
+
+```python
+search("disk pressure", path=".agent/", where={"kind": ["event", "decision"]})
+```
+
+Keys are AND-ed, values within a list are OR-ed, and comparison is
+case-sensitive string equality. There are no operators and no negation: the
+predicate cannot express "kind is not X" or "key is absent", so emit the key
+on every document and filter positively.
+
+Filtering narrows the corpus **before** anything is ranked. That matters
+because the relevance gate reads the top semantic score, and a gate that saw
+documents you filtered out would answer for a corpus you did not ask about.
+
+Run `poma-memory index` after adding metadata or editing the rules file — it
+re-reads metadata in place, with no re-chunking and no re-embedding. Until
+then, a filtered search **refuses** rather than returning an empty list you
+could not tell apart from "nothing matches". That covers both ways the index
+can be behind: a file never scanned for metadata, and a file still carrying
+what an earlier version of the rules file said about it. `poma-memory status`
+shows both.
+
+Each row records which directory's rules produced it, so this holds however the
+database is addressed — including `--db` pointing somewhere else, and two
+directories sharing one database. Directories sharing a database must be
+**disjoint**: index `/proj/.agent` and `/proj/.agent/events` into one and each
+file belongs to whichever run touched it last, silently, with `status`
+reporting the index complete. A run given a narrower `--glob` reaches only part
+of the corpus and leaves the rest on the old rules; re-run over each directory
+to clear it.
+
+`index` also **removes** documents that are gone from disk, so a deleted or
+renamed file stops appearing in results. It only ever does this for files under
+the directory it was given — a run over one directory never removes another's
+rows, even when they share a database and even with `--prune`.
+
+It holds back rather than removing when the directory it was given is itself
+absent, when a whole directory under it has disappeared, or when the removals
+would be most of the index, since all three look more like something that
+failed to mount than a deletion. Held-back documents stay in the index and keep
+appearing in results until you decide: `--prune` removes them, `--no-prune`
+never removes anything. A handful of individual files going missing is removed
+without asking. A change is detected by mtime, size or ctime, so an edit
+restored from a backup with its timestamp intact is still picked up.
+
+`--prune` overrides both hold-backs — the proportional one and a vanished
+subdirectory — but never the absent-root gate: a run whose own directory is
+absent removes nothing whatever the flag says, because at that moment nothing
+can tell an unmounted drive from a deleted one. (It also creates nothing, so
+the directory's absence stays true for the next run.)
+
+For a directory that is gone for good, **`poma-memory forget <dir> --db <db>`**
+drops its rows — it does not need the directory to exist, and it reaches
+nothing outside it. That is the way out of two states nothing else can clear:
+a directory deleted while it shared a database with another, and a directory
+that was renamed. In both, the old rows hold metadata resolved against rules
+nobody can re-read, so every filtered search refuses — including searches that
+have nothing to do with the directory that moved. Name `--db` explicitly: the
+default database lives *inside* the directory that is missing. A refusal caused
+by this prints the exact command.
+
+Why the filter runs before ranking rather than after, and what the refusals are
+protecting against: **[`docs/metadata-filtering.md`](docs/metadata-filtering.md)**.
 
 ---
 

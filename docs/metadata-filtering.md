@@ -353,7 +353,13 @@ the timestamp was restored — see `incremental._stat_agrees`.
 2. If `where` is set and any `files.metadata = ''` → raise
    `MetadataNotIndexed`; if any row's `rules_hash` differs from what its
    `rules_root` says now → raise `MetadataStale`. Both before any ranking, and
-   both `MetadataIncomplete`, which is what every surface catches.
+   both `MetadataIncomplete`, which is what every surface catches. After the
+   predicate is applied, any matching file that `metadata.path_state` reports
+   as gone (deleted, a non-file in its place, a symlink that dangles or loops)
+   raises `MetadataGhosts`: a ghost the predicate did not match changes
+   nothing, and neither does one with no chunks. `path_state` is the single
+   "is it still there" rule, shared with the prune, so the remedy a refusal
+   names is one that clears it.
 3. **Semantic — the step that fixes §2.** In `_EmbedderBase.search`, set
    disallowed rows of the cosine vector to `-inf` **before** `np.argsort`.
    `vec_hits[0]` is then the top-1 of the narrowed corpus and the gate in

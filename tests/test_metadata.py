@@ -1861,12 +1861,12 @@ def test_a_file_that_returns_before_its_turn_is_not_pruned(monkeypatch):
         real = api_mod._disk_state
         calls: dict[str, int] = {}
 
-        def flaky(path: str) -> str:
+        def flaky(path: str, kind: str = "file") -> str:
             if path == target:
                 calls[path] = calls.get(path, 0) + 1
                 # "gone" when sampled, back by the time we would delete it.
                 return "gone" if calls[path] == 1 else "present"
-            return real(path)
+            return real(path, kind)
 
         monkeypatch.setattr(api_mod, "_disk_state", flaky)
         # A narrow glob, so b.md is not scanned this run and therefore reaches
@@ -2103,11 +2103,12 @@ def test_the_exception_constructor_never_opens_a_file():
 
         threading.Thread(target=build, daemon=True).start()
         assert done.wait(5), "MetadataStale blocked on a FIFO"
-        # A directory is not a readable document either, but must not be
-        # reported as missing.
+        # A directory where a document was is not that document: reported as
+        # gone, which is what `--prune` also treats it as, so the remedy named
+        # is one that can clear it (see `path_state`).
         d = Path(td) / "adir.md"
         d.mkdir()
-        assert "cannot be read" in str(
+        assert "no longer exist" in str(
             MetadataStale([(str(d), str(d.parent))], "/db"))
 
 
@@ -2805,3 +2806,121 @@ def test_index_never_prescribes_forget_for_rows_under_a_live_root(capsys):
         assert "still hold metadata" in err
         assert "poma-memory forget" not in err
         assert f"poma-memory index {os.path.realpath(root)}" in err and "--prune" in err
+
+
+def test_a_filtered_search_refuses_when_a_matching_file_is_gone(tmp_path):
+    """A renamed root with no rules file has nothing to go stale, so the old
+    rows kept answering as current beside the new ones. Same for rows `index`
+    holds back. A ghost the predicate does not match must not refuse."""
+    from poma_memory.metadata import MetadataGhosts
+    root = tmp_path / "R"
+    root.mkdir()
+    (root / "a.md").write_text("---\nkind: decision\n---\n# A\n\nsqlite\n")
+    (root / "b.md").write_text("---\nkind: note\n---\n# B\n\nsqlite\n")
+    api.index(root)
+    (root / "b.md").unlink()
+    api.index(root, prune=False)
+    assert api.search("sqlite", path=root, where={"kind": "decision"})
+    (root / "a.md").unlink()
+    api.index(root, prune=False)
+    with pytest.raises(MetadataGhosts) as e:
+        api.search("sqlite", path=root, where={"kind": "decision"})
+    assert "index" in str(e.value) and "forget" not in str(e.value)
+    api.index(root, prune=True)
+    assert api.search("sqlite", path=root, where={"kind": "decision"}) == []
+
+
+def test_a_row_under_a_parent_replaced_by_a_file_is_pruned(tmp_path):
+    (tmp_path / "notes").mkdir()
+    (tmp_path / "notes" / "a.md").write_text("# A\n\nsqlite\n")
+    (tmp_path / "keep.md").write_text("# K\n\nsqlite\n")
+    api.index(tmp_path)
+    shutil.rmtree(tmp_path / "notes")
+    (tmp_path / "notes").write_text("now a file")
+    assert api.index(tmp_path, prune=True)["pruned"]
+
+
+def test_a_deeply_nested_rules_file_is_a_rules_error_not_a_crash(tmp_path):
+    (tmp_path / ".poma-metadata.json").write_text("[" * 100000 + "]" * 100000)
+    with pytest.raises(MetadataRulesError):
+        load_rules(tmp_path)
+
+
+def test_a_dangling_symlink_counts_as_a_vanished_file(tmp_path):
+    from poma_memory.metadata import MetadataGhosts
+    (tmp_path / "a.md").write_text("---\nkind: note\n---\n# A\n\nsqlite\n")
+    api.index(tmp_path)
+    (tmp_path / "a.md").unlink()
+    (tmp_path / "a.md").symlink_to(tmp_path / "nowhere.md")
+    api.index(tmp_path, prune=False)
+    with pytest.raises(MetadataGhosts):
+        api.search("sqlite", path=tmp_path, where={"kind": "note"})
+    # ...and the remedy it names must actually clear it.
+    api.index(tmp_path, prune=True)
+    assert api.search("sqlite", path=tmp_path, where={"kind": "note"}) == []
+
+
+def test_a_vanished_file_with_no_chunks_does_not_refuse(tmp_path):
+    (tmp_path / "keep.md").write_text("# K\n\nsqlite\n")
+    (tmp_path / "empty.md").write_text("")
+    _write_rules(tmp_path, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+    api.index(tmp_path)
+    (tmp_path / "empty.md").unlink()
+    api.index(tmp_path, prune=False)
+    assert api.search("sqlite", path=tmp_path, where={"kind": "note"})
+
+
+def test_a_root_replaced_by_a_file_does_not_prune_the_index(tmp_path):
+    """`stat` on the root succeeds when a regular file stands where it was, so
+    the root gate passed and every row beneath it read as gone (ENOTDIR)."""
+    root, db = tmp_path / "R", tmp_path / "shared.db"
+    root.mkdir()
+    (root / "a.md").write_text("# A\n\nsqlite\n")
+    api.index(root, db_path=db)
+    root.rename(tmp_path / "R.saved")
+    root.write_text("now a file")
+    api.index(root, db_path=db)
+    store = Store(db)
+    try:
+        assert len(store.all_file_paths()) == 1
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("make", ["dir", "loop"])
+def test_a_non_file_where_a_document_was_is_refused_then_pruned(tmp_path, make):
+    """The state model is one rule (`path_state`): a directory or a symlink loop
+    standing where a document was is not that document. Search must
+    refuse to serve it, and the remedy it names must actually clear it."""
+    from poma_memory.metadata import MetadataGhosts
+    (tmp_path / "keep.md").write_text("---\nkind: note\n---\n# K\n\nsqlite\n")
+    (tmp_path / "a.md").write_text("---\nkind: note\n---\n# A\n\nsqlite\n")
+    api.index(tmp_path)
+    (tmp_path / "a.md").unlink()
+    if make == "dir":
+        (tmp_path / "a.md").mkdir()
+    else:
+        (tmp_path / "a.md").symlink_to(tmp_path / "a.md")
+    api.index(tmp_path, prune=False)
+    with pytest.raises(MetadataGhosts):
+        api.search("sqlite", path=tmp_path, where={"kind": "note"})
+    api.index(tmp_path, prune=True)
+    hits = api.search("sqlite", path=tmp_path, where={"kind": "note"})
+    assert [os.path.basename(h["file_path"]) for h in hits] == ["keep.md"]
+
+
+def test_an_unreadable_path_is_unknown_not_gone(tmp_path):
+    from poma_memory.metadata import path_state
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root ignores the permission bits")
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "a.md").write_text("x")
+    os.chmod(locked, 0o000)
+    try:
+        assert path_state(str(locked / "a.md"), "file") == "unknown"
+    finally:
+        os.chmod(locked, 0o755)
+    assert path_state(str(locked / "a.md"), "file") == "present"
+    assert path_state(str(locked), "file") == "gone"
+    assert path_state(str(locked / "a.md"), "dir") == "gone"

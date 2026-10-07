@@ -17,6 +17,7 @@ caller's words; this module stores and compares them.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -88,13 +89,40 @@ def _detail(examples: list[str]) -> str:
     return f" (e.g. {shown})" if shown else ""
 
 
-def _present(path: str) -> bool:
-    """Whether a path is there. `os.stat`, never `open` -- see `_stuck_remedy`."""
+def path_state(path: str, kind: str = "file") -> str:
+    """"present" | "gone" | "unknown" -- the ONE answer to "is this still there?".
+
+    Everything that decides whether a row is a ghost asks this: the filtered
+    search that refuses to serve one, the prune that removes it, the root gate
+    that must not prune a corpus whose directory was only moved aside, and the
+    remedy text. They disagreed whenever each carried its own test, and every
+    disagreement was a way to either serve a vanished file as current or prune a
+    live one, so there is exactly one rule:
+
+    * It follows symlinks (`stat`): a link whose target is gone cannot be read.
+    * `kind="file"` must be a regular file and `kind="dir"` a directory. A
+      directory where a file was, or the reverse, is "gone" -- what the row
+      described is not there, whatever else is.
+    * "gone" is ENOENT, a parent that is not a directory, or a symlink loop
+      (permanent, unlike a permission error). Everything else -- EACCES, a dead
+      mount, EIO -- is "unknown", and callers must treat it as neither present
+      nor deleted: never prune it, never call it a deletion.
+
+    `stat`, never `open`: this can run inside an exception constructor on the
+    search path, and opening a FIFO blocks forever waiting for a writer.
+    """
     try:
-        os.stat(path)
-        return True
-    except OSError:
-        return False
+        st = os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return "gone"
+    except OSError as e:
+        return "gone" if e.errno == errno.ELOOP else "unknown"
+    wanted = stat_module.S_ISDIR if kind == "dir" else stat_module.S_ISREG
+    return "present" if wanted(st.st_mode) else "gone"
+
+
+def file_is_gone(path: str) -> bool:
+    return path_state(path, "file") == "gone"
 
 
 def _stuck_remedy(items: list[tuple[str, str]], db_path: str | None) -> str:
@@ -131,15 +159,12 @@ def _stuck_remedy(items: list[tuple[str, str]], db_path: str | None) -> str:
     unreadable: list[tuple[str, str]] = []
     readable: list[tuple[str, str]] = []
     for path, root in items:
-        try:
-            st = os.stat(path)
-        except FileNotFoundError:
+        state = path_state(path, "file")
+        if state == "gone":
             gone.append((path, root))
-            continue
-        except OSError:
-            unreadable.append((path, root))
-            continue
-        if not stat_module.S_ISREG(st.st_mode) or not os.access(path, os.R_OK):
+        elif state == "unknown" or not os.access(path, os.R_OK):
+            # `os.access` can disagree with real openability under ACLs or as
+            # root, which is acceptable in a diagnostic string where a hang is not.
             unreadable.append((path, root))
         else:
             readable.append((path, root))
@@ -168,8 +193,12 @@ def _stuck_remedy(items: list[tuple[str, str]], db_path: str | None) -> str:
         # whose own root has vanished needs `forget`, because no `index` run
         # can reach it -- which is the justification the message used to give
         # unconditionally, while being false in exactly the common case.
-        orphaned = [(p, r) for p, r in gone if not r or not _present(r)]
-        reachable = [(p, r) for p, r in gone if r and _present(r)]
+        # "unknown" is not "gone": a root that cannot be read right now is not
+        # one `forget` should be prescribed for.
+        orphaned = [(p, r) for p, r in gone
+                    if not r or path_state(r, "dir") == "gone"]
+        reachable = [(p, r) for p, r in gone
+                     if r and path_state(r, "dir") != "gone"]
         parts.append(f" {len(gone)} of them no longer exist "
                      f"(e.g. {gone[0][0]}); no glob and no re-read can reach a "
                      "deleted file.")
@@ -255,6 +284,34 @@ class MetadataStale(MetadataIncomplete):
         )
 
 
+class MetadataGhosts(MetadataIncomplete):
+    """A filtered search would return files that no longer exist on disk.
+
+    A deleted file leaves its row behind until an `index` run prunes it, and
+    that run holds it back when the loss looks like a failed mount, when
+    `--no-prune` was given, or when the root itself was renamed -- in which case
+    no rules file is there to make the row look stale. In each case the filter
+    would have answered with documents the caller then treats as the current
+    set, which is the outcome this mechanism exists to refuse. Only a row the
+    predicate actually matched counts: a ghost elsewhere in the index does not
+    change this answer.
+    """
+
+    def __init__(self, items: list[tuple[str, str]],
+                 db_path: str | os.PathLike | None = None):
+        self.items = list(items)
+        self.count = len(self.items)
+        self.db_path = os.path.abspath(str(db_path)) if db_path is not None else None
+        self.examples = [fp for fp, _ in self.items]
+        self.roots = sorted({r for _, r in self.items if r})
+        super().__init__(
+            f"{self.count} indexed file(s){_where(self.db_path)} that match this "
+            f"filter no longer exist on disk{_detail(self.examples)}, so the "
+            "answer would include documents that are gone."
+            + _stuck_remedy(self.items, self.db_path)
+        )
+
+
 class MetadataRulesError(MetadataIncomplete, ValueError):
     """`.poma-metadata.json` exists but cannot be used.
 
@@ -295,7 +352,9 @@ def load_rules(root: str | Path) -> tuple[list[dict], str]:
         raise MetadataRulesError(f"{p}: cannot be read ({e})") from e
     try:
         doc = json.loads(raw)
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, RecursionError) as e:
+        # RecursionError: a rules file ships with a cloned repo, and a deeply
+        # nested array is valid JSON that overflows the parser's stack.
         raise MetadataRulesError(f"{p}: invalid JSON ({e})") from e
     if not isinstance(doc, dict) or not isinstance(doc.get("rules"), list):
         raise MetadataRulesError(f"{p}: expected an object with a 'rules' list")

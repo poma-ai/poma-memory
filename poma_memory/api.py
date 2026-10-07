@@ -27,10 +27,24 @@ def _disk_state(path: str) -> str:
     try:
         os.lstat(path)
         return "present"
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
+        # NotADirectoryError: a parent was replaced by a file. The path is as
+        # gone as one under a deleted directory, and calling it "unknown" left
+        # `--prune` unable to clear the row.
         return "gone"
     except OSError:
         return "unknown"
+
+
+def _stat_ok(path: str | Path) -> bool:
+    """Whether the path can be proven present. `Path.exists` raises on
+    PermissionError before Python 3.14, which turned an unreadable parent into a
+    traceback where `index` has a message for exactly that case."""
+    try:
+        os.stat(path)
+        return True
+    except OSError:
+        return False
 
 
 def format_updated(upserted_at: float | None) -> str | None:
@@ -108,7 +122,7 @@ def index(
     # An EXISTING database outside the root is untouched by this and still runs
     # (it reports and skips pruning, below), because opening it creates nothing.
     root_state = _disk_state(root_key)
-    if root_state != "present" and not Path(db_path).exists():
+    if root_state != "present" and not _stat_ok(db_path):
         # "gone" and "unknown" are different answers and this message used to
         # collapse them, which is the exact conflation `_disk_state` exists to
         # prevent: a directory at mode 000 was reported as "not present".

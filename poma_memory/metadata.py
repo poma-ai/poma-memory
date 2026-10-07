@@ -88,6 +88,20 @@ def _detail(examples: list[str]) -> str:
     return f" (e.g. {shown})" if shown else ""
 
 
+def file_is_gone(path: str) -> bool:
+    """Whether a path is definitely not there (ENOENT, or a parent that is not a
+    directory). Any other error -- permissions, a dead mount -- is "cannot tell"
+    and returns False: the caller must not treat an unreadable file as deleted.
+    `lstat`, never `open`; see `_stuck_remedy`."""
+    try:
+        os.lstat(path)
+        return False
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+
+
 def _present(path: str) -> bool:
     """Whether a path is there. `os.stat`, never `open` -- see `_stuck_remedy`."""
     try:
@@ -133,7 +147,9 @@ def _stuck_remedy(items: list[tuple[str, str]], db_path: str | None) -> str:
     for path, root in items:
         try:
             st = os.stat(path)
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
+            # NotADirectoryError: a parent was replaced by a file, so this path
+            # is as deleted as one under a removed directory.
             gone.append((path, root))
             continue
         except OSError:
@@ -255,6 +271,34 @@ class MetadataStale(MetadataIncomplete):
         )
 
 
+class MetadataGhosts(MetadataIncomplete):
+    """A filtered search would return files that no longer exist on disk.
+
+    A deleted file leaves its row behind until an `index` run prunes it, and
+    that run holds it back when the loss looks like a failed mount, when
+    `--no-prune` was given, or when the root itself was renamed -- in which case
+    no rules file is there to make the row look stale. In each case the filter
+    would have answered with documents the caller then treats as the current
+    set, which is the outcome this mechanism exists to refuse. Only a row the
+    predicate actually matched counts: a ghost elsewhere in the index does not
+    change this answer.
+    """
+
+    def __init__(self, items: list[tuple[str, str]],
+                 db_path: str | os.PathLike | None = None):
+        self.items = list(items)
+        self.count = len(self.items)
+        self.db_path = os.path.abspath(str(db_path)) if db_path is not None else None
+        self.examples = [fp for fp, _ in self.items]
+        self.roots = sorted({r for _, r in self.items if r})
+        super().__init__(
+            f"{self.count} indexed file(s){_where(self.db_path)} that match this "
+            f"filter no longer exist on disk{_detail(self.examples)}, so the "
+            "answer would include documents that are gone."
+            + _stuck_remedy(self.items, self.db_path)
+        )
+
+
 class MetadataRulesError(MetadataIncomplete, ValueError):
     """`.poma-metadata.json` exists but cannot be used.
 
@@ -295,7 +339,9 @@ def load_rules(root: str | Path) -> tuple[list[dict], str]:
         raise MetadataRulesError(f"{p}: cannot be read ({e})") from e
     try:
         doc = json.loads(raw)
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, RecursionError) as e:
+        # RecursionError: a rules file ships with a cloned repo, and a deeply
+        # nested array is valid JSON that overflows the parser's stack.
         raise MetadataRulesError(f"{p}: invalid JSON ({e})") from e
     if not isinstance(doc, dict) or not isinstance(doc.get("rules"), list):
         raise MetadataRulesError(f"{p}: expected an object with a 'rules' list")

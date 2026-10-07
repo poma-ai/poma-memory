@@ -17,8 +17,8 @@ from poma_primecut_nano import (
 from poma_memory.api import forget, index, index_file, search, status
 from poma_memory.handle import MemoryIndex
 from poma_memory.metadata import (
-    MetadataIncomplete, MetadataNotIndexed, MetadataRulesError, MetadataStale,
-    MetadataUnreadable,
+    MetadataGhosts, MetadataIncomplete, MetadataNotIndexed, MetadataRulesError,
+    MetadataStale, MetadataUnreadable,
 )
 
 __all__ = [
@@ -37,6 +37,7 @@ __all__ = [
     "index_file",
     "search",
     "status",
+    "MetadataGhosts",
     "MetadataIncomplete",
     "MetadataNotIndexed",
     "MetadataRulesError",

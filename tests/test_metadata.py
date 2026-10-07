@@ -2805,3 +2805,41 @@ def test_index_never_prescribes_forget_for_rows_under_a_live_root(capsys):
         assert "still hold metadata" in err
         assert "poma-memory forget" not in err
         assert f"poma-memory index {os.path.realpath(root)}" in err and "--prune" in err
+
+
+def test_a_filtered_search_refuses_when_a_matching_file_is_gone(tmp_path):
+    """A renamed root with no rules file has nothing to go stale, so the old
+    rows kept answering as current beside the new ones. Same for rows `index`
+    holds back. A ghost the predicate does not match must not refuse."""
+    from poma_memory.metadata import MetadataGhosts
+    root = tmp_path / "R"
+    root.mkdir()
+    (root / "a.md").write_text("---\nkind: decision\n---\n# A\n\nsqlite\n")
+    (root / "b.md").write_text("---\nkind: note\n---\n# B\n\nsqlite\n")
+    api.index(root)
+    (root / "b.md").unlink()
+    api.index(root, prune=False)
+    assert api.search("sqlite", path=root, where={"kind": "decision"})
+    (root / "a.md").unlink()
+    api.index(root, prune=False)
+    with pytest.raises(MetadataGhosts) as e:
+        api.search("sqlite", path=root, where={"kind": "decision"})
+    assert "index" in str(e.value) and "forget" not in str(e.value)
+    api.index(root, prune=True)
+    assert api.search("sqlite", path=root, where={"kind": "decision"}) == []
+
+
+def test_a_row_under_a_parent_replaced_by_a_file_is_pruned(tmp_path):
+    (tmp_path / "notes").mkdir()
+    (tmp_path / "notes" / "a.md").write_text("# A\n\nsqlite\n")
+    (tmp_path / "keep.md").write_text("# K\n\nsqlite\n")
+    api.index(tmp_path)
+    shutil.rmtree(tmp_path / "notes")
+    (tmp_path / "notes").write_text("now a file")
+    assert api.index(tmp_path, prune=True)["pruned"]
+
+
+def test_a_deeply_nested_rules_file_is_a_rules_error_not_a_crash(tmp_path):
+    (tmp_path / ".poma-metadata.json").write_text("[" * 100000 + "]" * 100000)
+    with pytest.raises(MetadataRulesError):
+        load_rules(tmp_path)

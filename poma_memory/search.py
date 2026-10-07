@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING
 
 from poma_memory.bm25_search import BM25Search
 from poma_memory.metadata import (
-    MetadataNotIndexed, MetadataStale, MetadataUnreadable, matches,
-    normalize_where, stale_by_root,
+    MetadataGhosts, MetadataNotIndexed, MetadataStale, MetadataUnreadable,
+    file_is_gone, matches, normalize_where, stale_by_root,
 )
 from poma_primecut_nano import expand_chunk_ids, assemble_context
 
@@ -235,6 +235,7 @@ class HybridSearch:
             )
 
         keep_files = set()
+        keep_roots: dict[str, str] = {}
         bad: list[tuple[str, str]] = []
         for file_path, meta, root, _ in rows:
             try:
@@ -254,8 +255,15 @@ class HybridSearch:
                 continue
             if matches(value, where):
                 keep_files.add(file_path)
+                keep_roots[file_path] = root
         if bad:
             raise MetadataUnreadable(sorted(bad), self._store.db_path)
+        # Only rows the predicate matched, so a ghost elsewhere in the index
+        # does not refuse an answer it cannot appear in.
+        ghosts = sorted((fp, keep_roots[fp]) for fp in keep_files
+                        if file_is_gone(fp))
+        if ghosts:
+            raise MetadataGhosts(ghosts, self._store.db_path)
         # Resolved in SQL rather than by scanning every chunkset in Python: the
         # whole-table version cost 22 ms regardless of how narrow the predicate
         # was, against 0.12 ms here for a 1%% filter.

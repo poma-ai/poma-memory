@@ -468,6 +468,25 @@ class Store:
         )
         self._conn.commit()
 
+    def update_chunkset_embeddings(
+        self, pairs: list[tuple[int, bytes | None]],
+    ) -> None:
+        """Set or clear the embeddings of many chunksets in ONE transaction.
+
+        `update_chunkset_embedding` commits per row, which on a journaled
+        volume is one fsync per chunkset: embedding a 3000-file corpus was
+        6000 commits. One transaction is one fsync and, as important, all or
+        nothing -- a crash mid-batch leaves the rows NULL for the next build to
+        fill, never half-written.
+        """
+        if not pairs:
+            return
+        with self._conn:
+            self._conn.executemany(
+                "UPDATE chunksets SET embedding = ? WHERE chunkset_id = ?",
+                [(emb, cs_id) for cs_id, emb in pairs],
+            )
+
     def get_all_chunkset_embeddings(self) -> list[tuple[int, bytes | None]]:
         """Return every chunkset id with its embedding (or None if missing), ordered by id."""
         rows = self._conn.execute(

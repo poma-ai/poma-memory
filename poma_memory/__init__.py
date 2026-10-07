@@ -15,6 +15,7 @@ from poma_primecut_nano import (
 
 # poma-memory's own API
 from poma_memory.api import forget, index, index_file, search, status
+from poma_memory.handle import MemoryIndex
 from poma_memory.metadata import (
     MetadataIncomplete, MetadataNotIndexed, MetadataRulesError, MetadataStale,
     MetadataUnreadable,
@@ -30,6 +31,7 @@ __all__ = [
     "assemble_context",
     "normalize_for_embedding",
     # poma-memory API
+    "MemoryIndex",
     "forget",
     "index",
     "index_file",

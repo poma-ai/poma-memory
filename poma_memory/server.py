@@ -122,6 +122,26 @@ def _lock_key(req: dict) -> str:
         return ""
 
 
+def _file_ident(db: Path) -> tuple | None:
+    """(st_dev, st_ino) of the file at `db`, or None when it is not usable.
+
+    None when the file is absent, and also when the filesystem does not report a
+    stable identity: some FUSE and network mounts hand out a fresh inode on every
+    `stat`, and an identity that changes on its own would make the stamp differ
+    on every call and rebuild the index on every request. Two stats in a row
+    that disagree is how that is told apart from a real replacement. Replacement
+    detection is simply off on such a mount, which is the old behaviour; the
+    `data_version` half of the stamp still catches every ordinary commit.
+    """
+    try:
+        a = os.stat(db)
+        b = os.stat(db)
+    except OSError:
+        return None
+    ia, ib = (a.st_dev, a.st_ino), (b.st_dev, b.st_ino)
+    return ia if ia == ib else None
+
+
 class _IndexCache:
     """db path -> warm HybridSearch, invalidated when the db file changes."""
 
@@ -152,6 +172,13 @@ class _IndexCache:
         The -wal stat is carried too, as a belt for the moment before a
         checkpoint, and as the whole answer if the pragma is ever unavailable.
         """
+        # Which file is at `db`, not only what the open connection has seen. A
+        # connection to a deleted or replaced file (a restore, a rebuild moved
+        # over the path) keeps reading the old inode and its data_version never
+        # moves, so without this a service would keep answering from the file
+        # that is no longer there. Cheap: one stat.
+        ident = _file_ident(db)
+
         version = None
         if store is not None:
             try:
@@ -168,10 +195,11 @@ class _IndexCache:
         if version is not None:
             # Authoritative and exact: SQLite bumps this for our connection when
             # ANOTHER connection commits, which is precisely the reindex case.
-            # Nothing else belongs in the stamp — the -wal file's mtime and size
-            # move on checkpoint and on our own writes with no content change,
-            # so including it made the cache rebuild on almost every request.
-            return ("data_version", version)
+            # Nothing else belongs in the stamp but the file identity above — the
+            # -wal file's mtime and size move on checkpoint and on our own writes
+            # with no content change, so including it made the cache rebuild on
+            # almost every request.
+            return ("data_version", version, ident)
 
         def _stat(p: Path) -> tuple | None:
             try:
@@ -183,7 +211,7 @@ class _IndexCache:
         # No pragma (an unusable connection): fall back to file state, -wal
         # included, since in WAL mode the main db alone can sit still across a
         # commit. Coarser and prone to spurious rebuilds, but never stale.
-        return ("stat", _stat(db), _stat(db.with_name(db.name + "-wal")))
+        return ("stat", ident, _stat(db), _stat(db.with_name(db.name + "-wal")))
 
     def get(self, db: Path) -> HybridSearch:
         key = str(db)
@@ -238,6 +266,15 @@ class _IndexCache:
             }
             self._evict()
         return search
+
+    def drop(self, db: Path) -> None:
+        """Forget the warm entry for `db` so the next `get` rebuilds it.
+
+        Drops the reference and does not close the `Store`, for the reason
+        `_evict` gives: a thread may still be inside a search on it.
+        """
+        with self._guard:
+            self._entries.pop(str(db), None)
 
     def _evict(self) -> None:
         """Drop the least recently used entries. Caller holds `_guard`.

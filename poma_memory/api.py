@@ -203,8 +203,8 @@ def index(
         #
         # This is the only destructive operation in the package, and losing a row
         # costs a re-chunk AND a re-embed of it — real money on a paid embedder, and
-        # more than that, because a single NULL embedding makes the semantic index
-        # re-embed every chunkset it holds. So it is gated three ways, each of which
+        # more than that: the rows that remain are fine, but re-embedding the ones
+        # affected is paid for on the next build. So it is gated three ways, each of which
         # was a reproduced way to delete live data:
         #
         # 1. THE ROOT MUST BE PRESENT. `_disk_state` maps FileNotFoundError to

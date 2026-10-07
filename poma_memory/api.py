@@ -48,7 +48,8 @@ def _is_empty_dir(path: str) -> bool:
     """
     try:
         with os.scandir(path) as it:
-            return all(e.name.startswith(".poma-memory.db") for e in it)
+            return all(e.name == ".poma-memory.db" or e.name.startswith(".poma-memory.db-")
+                       for e in it)
     except OSError:
         return False
 
@@ -150,6 +151,18 @@ def index(
         print(f"poma-memory: {root_key} {why} and there is no index at "
               f"{db_path}; nothing to do. Nothing was created.",
               file=sys.stderr)
+        return {"files_indexed": 0, "chunks_created": 0, "chunksets_created": 0,
+                "metadata_refreshed": False, "unreadable": [], "stale_rules": [],
+                "pruned": [], "prune_held_back": []}
+
+    # NOTHING TO INDEX AND NO DATABASE YET: create nothing. An empty database
+    # holds no rows to protect, and the file it leaves behind is not harmless --
+    # `index <mountpoint>` run by hand on an unmounted volume's empty mountpoint
+    # dropped a database in it (whatever `--db` named), which made the directory
+    # look ordinary and let the next `index <root>` prune the volume's rows
+    # without `--prune`. `_is_empty_dir` exempts the default database's name, but
+    # only this closes it for a database the user named.
+    if not _stat_ok(db_path) and next(iter(path.glob(glob)), None) is None:
         return {"files_indexed": 0, "chunks_created": 0, "chunksets_created": 0,
                 "metadata_refreshed": False, "unreadable": [], "stale_rules": [],
                 "pruned": [], "prune_held_back": []}

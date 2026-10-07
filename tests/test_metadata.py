@@ -3066,3 +3066,21 @@ def test_indexing_an_emptied_mountpoint_does_not_switch_the_guard_off(tmp_path, 
     capsys.readouterr()
     r = api.index(root)
     assert r["pruned"] == [] and len(r["prune_held_back"]) == 8
+
+
+def test_indexing_an_empty_directory_creates_no_database(tmp_path):
+    """Whatever `--db` names: the file would make an emptied mountpoint look
+    ordinary to the guard, and an index with no rows protects nothing."""
+    root = tmp_path / "R"
+    (root / "vol").mkdir(parents=True)
+    _many(root, 20)
+    _many(root / "vol", 8)
+    api.index(root)
+    for f in (root / "vol").glob("*.md"):
+        f.unlink()
+    assert len(api.index(root)["prune_held_back"]) == 8
+    api.index(root / "vol", db_path=root / "vol" / "cache.sqlite")
+    api.index(root / "vol")
+    assert sorted(p.name for p in (root / "vol").iterdir()) == []
+    r = api.index(root)
+    assert r["pruned"] == [] and len(r["prune_held_back"]) == 8

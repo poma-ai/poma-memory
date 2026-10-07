@@ -2549,6 +2549,130 @@ def test_an_existing_database_outside_an_absent_root_still_runs():
         assert not root.exists()
 
 
+def _emptied(td: str, vol_rows: int, keep: int = 0, sub: str = "vol",
+             name: str = "R", db_path: Path | None = None) -> Path:
+    """Index 20 files in a root plus `vol_rows` in `<root>/<sub>`, then delete
+    all but `keep` of the latter. The directory itself stays: with `keep=0`
+    that is what an unmounted nested volume looks like (a present, EMPTY
+    mountpoint), which `os.stat` cannot tell from a directory someone emptied."""
+    root = Path(td) / name
+    root.mkdir()
+    _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+    _many(root, 20)
+    vol = _many(root, vol_rows, sub=sub)
+    api.index(root, db_path=db_path)
+    for i in range(vol_rows - keep):
+        os.remove(vol / f"f{i}.md")
+    return root
+
+
+def test_a_present_but_empty_directory_is_held_like_a_vanished_one(capsys):
+    """Reproduced: 20 files plus 8 in `vol/`, then `vol/`'s files deleted and
+    the directory left behind (an unmounted nested volume). `lost_dirs` was
+    empty because `vol/` is a present directory, and 8 > max(5, 28 // 2) is
+    false, so all 8 rows were pruned silently."""
+    with tempfile.TemporaryDirectory() as td:
+        root = _emptied(td, 8)
+        assert os.listdir(root / "vol") == []
+        result = api.index(root)
+        assert result["pruned"] == []
+        assert len(result["prune_held_back"]) == 8
+        err = capsys.readouterr().err
+        assert "empty" in err and "--prune" in err
+        store = Store(root / ".poma-memory.db")
+        try:
+            assert len(store.all_file_paths()) == 28
+        finally:
+            store.close()
+        # Held, not stuck: `prune=True` is the explicit yes.
+        assert len(api.index(root, prune=True)["pruned"]) == 8
+
+
+def test_an_empty_directory_deep_under_the_root_is_held_too():
+    with tempfile.TemporaryDirectory() as td:
+        root = _emptied(td, 8, sub="a/b/vol")
+        assert len(api.index(root)["prune_held_back"]) == 8
+        assert len(api.index(root, prune=True)["pruned"]) == 8
+
+
+def test_a_directory_that_still_has_files_keeps_pruning_automatically():
+    """The rule is "no entries at all". Deleting 8 of 10 files in `vol/`
+    leaves two beside them and stays an ordinary, automatic deletion."""
+    with tempfile.TemporaryDirectory() as td:
+        root = _emptied(td, 10, keep=2)
+        result = api.index(root)
+        assert len(result["pruned"]) == 8
+        assert result["prune_held_back"] == []
+
+
+def test_a_directory_holding_only_a_stray_entry_is_not_empty():
+    """A hidden file or an empty subdirectory is still an entry, so the
+    mountpoint rule does not claim it."""
+    with tempfile.TemporaryDirectory() as td:
+        root = _emptied(td, 8)
+        (root / "vol" / ".DS_Store").write_bytes(b"x")
+        result = api.index(root)
+        assert len(result["pruned"]) == 8
+        assert result["prune_held_back"] == []
+
+
+def test_emptying_a_directory_of_a_few_files_is_still_automatic():
+    """Five or fewer rows is under `_PRUNE_FLOOR`, where a run prunes
+    regardless; deleting the only note in a directory is the commonest
+    deletion there is and must not become a standing question."""
+    with tempfile.TemporaryDirectory() as td:
+        root = _emptied(td, 5)
+        assert os.listdir(root / "vol") == []
+        result = api.index(root)
+        assert len(result["pruned"]) == 5
+        assert result["prune_held_back"] == []
+
+
+def test_an_unlistable_directory_holds_nothing_back_on_a_guess(monkeypatch):
+    """A listing error is "cannot tell", and unknown never holds MORE back than
+    the existing rules: it falls through to the ordinary proportional guard."""
+    with tempfile.TemporaryDirectory() as td:
+        root = _emptied(td, 8)
+        real = os.scandir
+
+        def deny(path="."):
+            if str(path).endswith("vol"):
+                raise PermissionError(13, "denied")
+            return real(path)
+
+        monkeypatch.setattr(api.os, "scandir", deny)
+        result = api.index(root)
+        assert len(result["pruned"]) == 8
+        assert result["prune_held_back"] == []
+
+
+def test_the_empty_directory_rule_never_reaches_another_roots_rows():
+    """Two roots sharing a database. A's emptied `vol/` is held, then pruned
+    with `prune=True`; B's rows, which are just as missing, are never touched
+    by a run over A."""
+    with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b, \
+            tempfile.TemporaryDirectory() as c:
+        db = Path(c) / "shared.sqlite"
+        ra = _emptied(a, 8, name="A", db_path=db)
+        rb = _emptied(b, 8, name="B", db_path=db)
+
+        def rows() -> list[str]:
+            store = Store(db)
+            try:
+                return store.all_file_paths()
+            finally:
+                store.close()
+
+        assert len(rows()) == 56
+        result = api.index(ra, db_path=db)
+        assert result["pruned"] == [] and len(result["prune_held_back"]) == 8
+        assert len(rows()) == 56
+        assert len(api.index(ra, db_path=db, prune=True)["pruned"]) == 8
+        left = rows()
+        assert len(left) == 48
+        assert sum(1 for fp in left if "/B/" in fp) == 28
+
+
 def test_prune_clears_a_vanished_subdirectory_as_the_docs_now_say():
     """`--prune` overrides BOTH hold-backs. The README and the design doc said
     it overrode only the proportional one, which is the wrong rule for the flag

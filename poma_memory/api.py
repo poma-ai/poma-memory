@@ -12,7 +12,7 @@ from poma_memory.incremental import update_file
 from poma_memory.metadata import (
     RULES_FILENAME, MetadataIncomplete, MetadataRulesError, load_rules,
     resolve_paths, rules_hash,
-    stale_files,
+    stale_files, _stuck_remedy,
 )
 from poma_memory.search import HybridSearch
 
@@ -319,25 +319,29 @@ def index(
         # work and committed it — so this reports and continues rather than
         # raising past `store.close()`.
         stale: list[str] = []
+        stale_roots: dict[str, str] = {}
         try:
-            stale = stale_files(store.scanned_rows_rules())
+            scanned = store.scanned_rows_rules()
+            stale = stale_files(scanned)
+            stale_roots = {fp: root for fp, root, _ in scanned}
         except MetadataIncomplete as e:
             print(f"poma-memory: could not check whether other indexed files are "
                   f"on the current rule set ({e})", file=sys.stderr)
         if stale:
             shown = ", ".join(stale[:3]) + (", ..." if len(stale) > 3 else "")
             # A row whose file is GONE cannot be reached by any glob, so telling
-            # the user to widen one sends them nowhere. `--prune` is the only
-            # thing that clears those.
-            # ...and in a shared database they may not belong to this root at
-            # all. A row whose FILE is gone can be reached by no glob and no
-            # re-read, and `index --prune` will not touch a directory it cannot
-            # see -- so the only command that clears it is `forget`, with the
-            # database named, because the default one lives inside the
-            # directory that is missing.
-            vanished = [fp for fp in stale if _disk_state(fp) == "gone"]
-            how = (f"Run `poma-memory forget <dir> --db {db_path}` for the "
-                   "directory each one was indexed from."
+            # the user to widen one sends them nowhere. What does reach it
+            # depends on its OWN root, not on this run's: a root that is still
+            # there is cleared by `index --prune`, and `forget` -- which deletes
+            # every row under a directory -- is right only for a root that is
+            # gone too. The earlier cut named `forget` for any vanished file, so
+            # a subdirectory deleted under a live root sent the user to a
+            # command that took the live documents beside it. `_stuck_remedy`
+            # already makes that split for the search-time refusals; this is the
+            # same rule, not a second copy of it.
+            vanished = [(fp, stale_roots.get(fp, "")) for fp in stale
+                        if _disk_state(fp) == "gone"]
+            how = (_stuck_remedy(vanished, str(db_path)).strip()
                    if vanished else "Re-run with a glob that matches them.")
             print(f"poma-memory: {len(stale)} file(s) still hold metadata from "
                   f"an earlier rule set and were not reached by this run "

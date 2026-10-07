@@ -2783,3 +2783,25 @@ def test_a_permission_error_on_the_root_is_not_reported_as_absent(capsys):
             assert "is not present" not in err
         finally:
             os.chmod(parent, 0o755)
+
+
+def test_index_never_prescribes_forget_for_rows_under_a_live_root(capsys):
+    """A subdirectory deleted under a root that is still there leaves stale rows
+    `index` holds back. The advice for them used to be `forget <dir>`, and
+    `forget` removes every row under that directory -- the live documents beside
+    the vanished ones included. A present root is cleared by `index --prune`."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "proj"
+        (root / "sub").mkdir(parents=True)
+        _many(root, 5)
+        _many(root / "sub", 6)
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+        api.index(root)
+        shutil.rmtree(root / "sub")
+        _write_rules(root, [{"glob": "**/*.md", "metadata": {"kind": "event"}}])
+        capsys.readouterr()
+        api.index(root)
+        err = capsys.readouterr().err
+        assert "still hold metadata" in err
+        assert "poma-memory forget" not in err
+        assert f"poma-memory index {os.path.realpath(root)}" in err and "--prune" in err

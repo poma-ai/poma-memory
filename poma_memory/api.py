@@ -39,10 +39,16 @@ def _is_empty_dir(path: str) -> bool:
     back MORE than the missing-directory rule already did on a guess. Hidden
     entries count as entries, so a directory with only a `.DS_Store` in it is
     not empty and its deletions stay automatic.
+
+    The tool's own database files do not count: `index <mountpoint>` run by hand
+    creates `.poma-memory.db` in that directory, which would otherwise make the
+    emptied mountpoint look ordinary and let the next `index <root>` prune the
+    volume's rows -- the guard switched off by the very command a user tries
+    when something looks wrong.
     """
     try:
         with os.scandir(path) as it:
-            return next(it, None) is None
+            return all(e.name.startswith(".poma-memory.db") for e in it)
     except OSError:
         return False
 

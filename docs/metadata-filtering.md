@@ -339,7 +339,7 @@ leaves its mountpoint behind as exactly that, `stat` says "present", and the
 vanished-directory rule therefore never fired: 20 files plus 8 in `vol/`, the 8
 deleted and `vol/` left, pruned all 8 silently (8 is not more than
 `max(5, 28 // 2)`). The rule is deliberately narrow: `os.scandir` returns no
-entry at all (a hidden file or an empty subdirectory counts as an entry), more
+entry at all (a hidden file or an empty subdirectory counts as an entry; poma-memory's own `.poma-memory.db*` files do not), more
 than `_PRUNE_FLOOR` rows sat directly in that directory, and the listing itself
 succeeded. A listing error is "cannot tell", and unknown never holds back more
 than the existing rules do. The cost, stated: deleting every file of a larger

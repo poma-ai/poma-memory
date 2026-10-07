@@ -3048,3 +3048,21 @@ def test_an_unreadable_path_is_unknown_not_gone(tmp_path):
     assert path_state(str(locked / "a.md"), "file") == "present"
     assert path_state(str(locked), "file") == "gone"
     assert path_state(str(locked / "a.md"), "dir") == "gone"
+
+
+def test_indexing_an_emptied_mountpoint_does_not_switch_the_guard_off(tmp_path, capsys):
+    """`index <mountpoint>` run by hand creates a database inside it. That file
+    must not make the emptied directory look like an ordinary one, or the next
+    `index <root>` prunes the volume's rows without `--prune`."""
+    root = tmp_path / "R"
+    (root / "vol").mkdir(parents=True)
+    _many(root, 20)
+    _many(root / "vol", 8)
+    api.index(root)
+    for f in (root / "vol").glob("*.md"):
+        f.unlink()
+    assert len(api.index(root)["prune_held_back"]) == 8
+    api.index(root / "vol")
+    capsys.readouterr()
+    r = api.index(root)
+    assert r["pruned"] == [] and len(r["prune_held_back"]) == 8

@@ -2867,3 +2867,20 @@ def test_a_vanished_file_with_no_chunks_does_not_refuse(tmp_path):
     (tmp_path / "empty.md").unlink()
     api.index(tmp_path, prune=False)
     assert api.search("sqlite", path=tmp_path, where={"kind": "note"})
+
+
+def test_a_root_replaced_by_a_file_does_not_prune_the_index(tmp_path):
+    """`stat` on the root succeeds when a regular file stands where it was, so
+    the root gate passed and every row beneath it read as gone (ENOTDIR)."""
+    root, db = tmp_path / "R", tmp_path / "shared.db"
+    root.mkdir()
+    (root / "a.md").write_text("# A\n\nsqlite\n")
+    api.index(root, db_path=db)
+    root.rename(tmp_path / "R.saved")
+    root.write_text("now a file")
+    api.index(root, db_path=db)
+    store = Store(db)
+    try:
+        assert len(store.all_file_paths()) == 1
+    finally:
+        store.close()

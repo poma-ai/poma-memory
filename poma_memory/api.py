@@ -40,6 +40,18 @@ def _disk_state(path: str) -> str:
         return "unknown"
 
 
+def _dir_state(path: str) -> str:
+    """`_disk_state` for something that must be a DIRECTORY: a regular file
+    standing where one was is "gone", not "present". Without this a root
+    replaced by a file passed the root gate -- `stat` succeeded -- while every
+    path beneath it read as gone, and the whole index was pruned under the floor
+    for a directory that had only been moved aside."""
+    state = _disk_state(path)
+    if state == "present" and not os.path.isdir(path):
+        return "gone"
+    return state
+
+
 def _stat_ok(path: str | Path) -> bool:
     """Whether the path can be proven present. `Path.exists` raises on
     PermissionError before Python 3.14, which turned an unreadable parent into a
@@ -125,7 +137,7 @@ def index(
     # database that is not there; this is the same rule for the third surface.
     # An EXISTING database outside the root is untouched by this and still runs
     # (it reports and skips pruning, below), because opening it creates nothing.
-    root_state = _disk_state(root_key)
+    root_state = _dir_state(root_key)
     if root_state != "present" and not _stat_ok(db_path):
         # "gone" and "unknown" are different answers and this message used to
         # collapse them, which is the exact conflation `_disk_state` exists to
@@ -253,7 +265,7 @@ def index(
         # against an absent root took 12 rows and 12 chunksets to zero. The
         # route out of a root that really is gone is `forget`, which is a
         # different word for a different question.
-        root_present = _disk_state(root_key) == "present"
+        root_present = _dir_state(root_key) == "present"
         candidates = []
         if root_present:
             for fp in store.all_file_paths():
@@ -299,7 +311,7 @@ def index(
             # the index as the corpus grows and is pruned silently on some later
             # run, with no warning at all. `--prune` still clears it.
             lost_dirs = {os.path.dirname(fp) for fp in gone
-                         if _disk_state(os.path.dirname(fp)) != "present"}
+                         if _dir_state(os.path.dirname(fp)) != "present"}
             if lost_dirs or len(gone) > max(_PRUNE_FLOOR, tracked_here // 2):
                 held_back, gone = gone, []
                 shown = ", ".join(held_back[:3]) + (

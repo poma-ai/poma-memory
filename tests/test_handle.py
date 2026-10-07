@@ -313,6 +313,31 @@ def test_an_openai_outage_raises_and_keeps_the_stored_vectors(live, monkeypatch)
     h.close()
 
 
+def test_an_openai_outage_with_no_vectors_yet_does_not_cache_a_local_index(
+        live, monkeypatch):
+    class _Down:
+        class embeddings:                                   # noqa: N801
+            @staticmethod
+            def create(**_kw):
+                raise OSError("quota")
+
+    monkeypatch.setenv("POMA_EMBEDDER", "openai")
+    monkeypatch.setattr("poma_memory.semantic_search._get_openai_client",
+                        lambda: _Down())
+    db = live / ".poma-memory.db"
+    store = Store(db)
+    store.update_chunkset_embeddings(
+        [(i, None) for i, _ in store.get_all_chunkset_embeddings()])
+    store.close()
+    h = MemoryIndex(db)
+    with pytest.raises(RuntimeError, match="OSError"):
+        h.ensure_embeddings()
+    store = Store(db)
+    assert all(e is None for _, e in store.get_all_chunkset_embeddings())
+    store.close()
+    h.close()
+
+
 def test_an_unstable_inode_does_not_rebuild_on_every_call(live, monkeypatch):
     real = os.stat
     counter = iter(range(10**9))

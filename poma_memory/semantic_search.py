@@ -263,10 +263,16 @@ class OpenAISearch(_EmbedderBase):
 SemanticSearch = Model2VecSearch
 
 
-def _holds_other_dims(store: Store, dims: int) -> bool:
-    """Whether any stored embedding has a size other than `dims`."""
+def _fallback_would_rewrite(store: Store, dims: int) -> bool:
+    """Whether a local fallback would write vectors this index does not hold yet.
+
+    True for a row of another size (paid-for OpenAI vectors) and for a row with
+    no embedding at all: either way the fallback fills it at the local model's
+    size, and the index is then cached as local, so a later OpenAI retry finds
+    nothing to do instead of the build it was waiting for.
+    """
     return any(
-        emb is not None and len(emb) // 4 != dims
+        emb is None or len(emb) // 4 != dims
         for _, emb in store.get_all_chunkset_embeddings()
     )
 
@@ -286,11 +292,13 @@ def create_search(store: Store) -> _EmbedderBase:
             try:
                 return OpenAISearch(store, client)
             except Exception as e:
-                if _holds_other_dims(store, Model2VecSearch.expected_dims):
-                    # Falling back would re-embed every row at the local
+                if _fallback_would_rewrite(store, Model2VecSearch.expected_dims):
+                    # Falling back would embed every missing row at the local
                     # model's size and overwrite paid-for vectors, because a
                     # wrong-sized row counts as missing, and the next successful
-                    # OpenAI build would pay for all of them again. An outage
+                    # OpenAI build would pay for all of them again. A row with
+                    # no vector yet is the same case: the fallback would fill
+                    # it locally and the OpenAI retry would never run. An outage
                     # should leave the index as it is and fail this build.
                     raise
                 print(

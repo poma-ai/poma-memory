@@ -207,11 +207,12 @@ have nothing to do with the directory that moved. Name `--db` explicitly: the
 default database lives *inside* the directory that is missing. A refusal caused
 by this prints the exact command.
 
-A directory with no `.poma-metadata.json` has no rules to go stale, so for it a
-filtered search refuses only when a file it would return no longer exists on
-disk (`MetadataGhosts`); a search whose answer cannot include a vanished file
-is unaffected. The vanished directory may only be unmounted: remount it
-rather than running the `forget` the message names.
+Independently of rules, a filtered search also refuses when a file it would
+return no longer exists on disk (`MetadataGhosts`) — the only refusal a
+directory with no `.poma-metadata.json` can raise, since it has no rules to go
+stale. A search whose answer cannot include a vanished file is unaffected. The
+vanished directory may only be unmounted: remount it rather than running the
+`forget` the message names.
 
 Why the filter runs before ranking rather than after, and what the refusals are
 protecting against: **[`docs/metadata-filtering.md`](docs/metadata-filtering.md)**.

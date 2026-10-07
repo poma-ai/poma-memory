@@ -2854,6 +2854,9 @@ def test_a_dangling_symlink_counts_as_a_vanished_file(tmp_path):
     api.index(tmp_path, prune=False)
     with pytest.raises(MetadataGhosts):
         api.search("sqlite", path=tmp_path, where={"kind": "note"})
+    # ...and the remedy it names must actually clear it.
+    api.index(tmp_path, prune=True)
+    assert api.search("sqlite", path=tmp_path, where={"kind": "note"}) == []
 
 
 def test_a_vanished_file_with_no_chunks_does_not_refuse(tmp_path):

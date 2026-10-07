@@ -25,7 +25,11 @@ def _disk_state(path: str) -> str:
     records a live document as scanned-and-empty, permanently and silently.
     """
     try:
-        os.lstat(path)
+        # `stat`, not `lstat`: a symlink whose target is gone cannot be read, and
+        # `metadata.file_is_gone` -- which decides whether a filtered search
+        # refuses -- follows links too. Disagreeing here left a refusal that
+        # `--prune` could not clear.
+        os.stat(path)
         return "present"
     except (FileNotFoundError, NotADirectoryError):
         # NotADirectoryError: a parent was replaced by a file. The path is as

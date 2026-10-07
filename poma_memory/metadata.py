@@ -92,9 +92,10 @@ def file_is_gone(path: str) -> bool:
     """Whether a path is definitely not there (ENOENT, or a parent that is not a
     directory). Any other error -- permissions, a dead mount -- is "cannot tell"
     and returns False: the caller must not treat an unreadable file as deleted.
-    `lstat`, never `open`; see `_stuck_remedy`."""
+    `stat`, never `open`; see `_stuck_remedy`. It follows symlinks on purpose: a
+    link whose target is gone cannot be read, which is what "gone" means here."""
     try:
-        os.lstat(path)
+        os.stat(path)
         return False
     except (FileNotFoundError, NotADirectoryError):
         return True

@@ -210,7 +210,8 @@ by this prints the exact command.
 A directory with no `.poma-metadata.json` has no rules to go stale, so for it a
 filtered search refuses only when a file it would return no longer exists on
 disk (`MetadataGhosts`); a search whose answer cannot include a vanished file
-is unaffected.
+is unaffected. The vanished directory may only be unmounted: remount it
+rather than running the `forget` the message names.
 
 Why the filter runs before ranking rather than after, and what the refusals are
 protecting against: **[`docs/metadata-filtering.md`](docs/metadata-filtering.md)**.

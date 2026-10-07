@@ -537,6 +537,8 @@ def search(
             resolved against a rule set that is no longer current. Run
             `index()` with a glob that covers them.
         MetadataRulesError: a rules file a row points at cannot be read.
+        MetadataGhosts: a file the filter matched no longer exists on disk.
+            Run `index()` (add `prune=True` if it reports them held back).
     """
     path = Path(path)
     if db_path is None:

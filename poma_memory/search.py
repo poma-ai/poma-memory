@@ -95,7 +95,8 @@ class HybridSearch:
             MetadataStale: `where` was given but some rows were resolved
                 against a rule set other than the current one.
             MetadataRulesError: a rules file a row points at cannot be read.
-                All three are `MetadataIncomplete`; catch that to cover any.
+            MetadataGhosts: a file the filter matched no longer exists on disk.
+                All four are `MetadataIncomplete`; catch that to cover any.
         """
         allowed_ids = self._allowed_ids(where)
         if allowed_ids is not None and not allowed_ids:
@@ -260,8 +261,11 @@ class HybridSearch:
             raise MetadataUnreadable(sorted(bad), self._store.db_path)
         # Only rows the predicate matched, so a ghost elsewhere in the index
         # does not refuse an answer it cannot appear in.
+        # ...and only a file that has chunks: one with none cannot appear in any
+        # answer, so its absence changes nothing the caller is told.
         ghosts = sorted((fp, keep_roots[fp]) for fp in keep_files
-                        if file_is_gone(fp))
+                        if file_is_gone(fp)
+                        and self._store.chunkset_ids_for_files({fp}))
         if ghosts:
             raise MetadataGhosts(ghosts, self._store.db_path)
         # Resolved in SQL rather than by scanning every chunkset in Python: the

@@ -2843,3 +2843,24 @@ def test_a_deeply_nested_rules_file_is_a_rules_error_not_a_crash(tmp_path):
     (tmp_path / ".poma-metadata.json").write_text("[" * 100000 + "]" * 100000)
     with pytest.raises(MetadataRulesError):
         load_rules(tmp_path)
+
+
+def test_a_dangling_symlink_counts_as_a_vanished_file(tmp_path):
+    from poma_memory.metadata import MetadataGhosts
+    (tmp_path / "a.md").write_text("---\nkind: note\n---\n# A\n\nsqlite\n")
+    api.index(tmp_path)
+    (tmp_path / "a.md").unlink()
+    (tmp_path / "a.md").symlink_to(tmp_path / "nowhere.md")
+    api.index(tmp_path, prune=False)
+    with pytest.raises(MetadataGhosts):
+        api.search("sqlite", path=tmp_path, where={"kind": "note"})
+
+
+def test_a_vanished_file_with_no_chunks_does_not_refuse(tmp_path):
+    (tmp_path / "keep.md").write_text("# K\n\nsqlite\n")
+    (tmp_path / "empty.md").write_text("")
+    _write_rules(tmp_path, [{"glob": "**/*.md", "metadata": {"kind": "note"}}])
+    api.index(tmp_path)
+    (tmp_path / "empty.md").unlink()
+    api.index(tmp_path, prune=False)
+    assert api.search("sqlite", path=tmp_path, where={"kind": "note"})

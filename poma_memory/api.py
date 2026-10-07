@@ -12,44 +12,22 @@ from poma_memory.incremental import update_file
 from poma_memory.metadata import (
     RULES_FILENAME, MetadataIncomplete, MetadataRulesError, load_rules,
     resolve_paths, rules_hash,
-    stale_files, _stuck_remedy,
+    path_state, stale_files, _stuck_remedy,
 )
 from poma_memory.search import HybridSearch
 
-def _disk_state(path: str) -> str:
-    """"gone" | "present" | "unknown".
+def _disk_state(path: str, kind: str = "file") -> str:
+    """"gone" | "present" | "unknown"; see `metadata.path_state`, the single rule.
 
     `os.path.exists` collapses the last two: it returns False for a permission
     error on a parent directory, an unmounted volume and a dead network mount,
     none of which mean the file was deleted. Treating those as deletions
     records a live document as scanned-and-empty, permanently and silently.
+    Pass kind="dir" for a root or a directory: a file standing where one was is
+    "gone", which is what keeps a root that was moved aside and replaced by a
+    file from pruning the whole index.
     """
-    try:
-        # `stat`, not `lstat`: a symlink whose target is gone cannot be read, and
-        # `metadata.file_is_gone` -- which decides whether a filtered search
-        # refuses -- follows links too. Disagreeing here left a refusal that
-        # `--prune` could not clear.
-        os.stat(path)
-        return "present"
-    except (FileNotFoundError, NotADirectoryError):
-        # NotADirectoryError: a parent was replaced by a file. The path is as
-        # gone as one under a deleted directory, and calling it "unknown" left
-        # `--prune` unable to clear the row.
-        return "gone"
-    except OSError:
-        return "unknown"
-
-
-def _dir_state(path: str) -> str:
-    """`_disk_state` for something that must be a DIRECTORY: a regular file
-    standing where one was is "gone", not "present". Without this a root
-    replaced by a file passed the root gate -- `stat` succeeded -- while every
-    path beneath it read as gone, and the whole index was pruned under the floor
-    for a directory that had only been moved aside."""
-    state = _disk_state(path)
-    if state == "present" and not os.path.isdir(path):
-        return "gone"
-    return state
+    return path_state(path, kind)
 
 
 def _stat_ok(path: str | Path) -> bool:
@@ -137,7 +115,7 @@ def index(
     # database that is not there; this is the same rule for the third surface.
     # An EXISTING database outside the root is untouched by this and still runs
     # (it reports and skips pruning, below), because opening it creates nothing.
-    root_state = _dir_state(root_key)
+    root_state = _disk_state(root_key, "dir")
     if root_state != "present" and not _stat_ok(db_path):
         # "gone" and "unknown" are different answers and this message used to
         # collapse them, which is the exact conflation `_disk_state` exists to
@@ -265,7 +243,7 @@ def index(
         # against an absent root took 12 rows and 12 chunksets to zero. The
         # route out of a root that really is gone is `forget`, which is a
         # different word for a different question.
-        root_present = _dir_state(root_key) == "present"
+        root_present = _disk_state(root_key, "dir") == "present"
         candidates = []
         if root_present:
             for fp in store.all_file_paths():
@@ -278,10 +256,16 @@ def index(
                 if under_root:
                     candidates.append(fp)
         elif store.all_file_paths():
-            print(f"poma-memory: {root_key} is not present; skipping the check "
-                  "for indexed files that have been deleted. If it is gone for "
-                  f"good, `poma-memory forget {root_key} --db {db_path}` "
-                  "removes its rows.", file=sys.stderr)
+            if _disk_state(root_key, "dir") == "gone":
+                print(f"poma-memory: {root_key} is not present; skipping the "
+                      "check for indexed files that have been deleted. If it "
+                      f"is gone for good, `poma-memory forget {root_key} --db "
+                      f"{db_path}` removes its rows.", file=sys.stderr)
+            else:
+                print(f"poma-memory: {root_key} cannot be read right now "
+                      "(permissions, or an unavailable mount); skipping the "
+                      "check for indexed files that have been deleted. Nothing "
+                      "was removed.", file=sys.stderr)
 
         # Sampled for every candidate first, so the set being deleted is decided
         # from one consistent view...
@@ -311,7 +295,7 @@ def index(
             # the index as the corpus grows and is pruned silently on some later
             # run, with no warning at all. `--prune` still clears it.
             lost_dirs = {os.path.dirname(fp) for fp in gone
-                         if _dir_state(os.path.dirname(fp)) != "present"}
+                         if _disk_state(os.path.dirname(fp), "dir") != "present"}
             if lost_dirs or len(gone) > max(_PRUNE_FLOOR, tracked_here // 2):
                 held_back, gone = gone, []
                 shown = ", ".join(held_back[:3]) + (

@@ -17,6 +17,7 @@ caller's words; this module stores and compares them.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -88,28 +89,40 @@ def _detail(examples: list[str]) -> str:
     return f" (e.g. {shown})" if shown else ""
 
 
-def file_is_gone(path: str) -> bool:
-    """Whether a path is definitely not there (ENOENT, or a parent that is not a
-    directory). Any other error -- permissions, a dead mount -- is "cannot tell"
-    and returns False: the caller must not treat an unreadable file as deleted.
-    `stat`, never `open`; see `_stuck_remedy`. It follows symlinks on purpose: a
-    link whose target is gone cannot be read, which is what "gone" means here."""
+def path_state(path: str, kind: str = "file") -> str:
+    """"present" | "gone" | "unknown" -- the ONE answer to "is this still there?".
+
+    Everything that decides whether a row is a ghost asks this: the filtered
+    search that refuses to serve one, the prune that removes it, the root gate
+    that must not prune a corpus whose directory was only moved aside, and the
+    remedy text. They disagreed whenever each carried its own test, and every
+    disagreement was a way to either serve a vanished file as current or prune a
+    live one, so there is exactly one rule:
+
+    * It follows symlinks (`stat`): a link whose target is gone cannot be read.
+    * `kind="file"` must be a regular file and `kind="dir"` a directory. A
+      directory where a file was, or the reverse, is "gone" -- what the row
+      described is not there, whatever else is.
+    * "gone" is ENOENT, a parent that is not a directory, or a symlink loop
+      (permanent, unlike a permission error). Everything else -- EACCES, a dead
+      mount, EIO -- is "unknown", and callers must treat it as neither present
+      nor deleted: never prune it, never call it a deletion.
+
+    `stat`, never `open`: this can run inside an exception constructor on the
+    search path, and opening a FIFO blocks forever waiting for a writer.
+    """
     try:
-        os.stat(path)
-        return False
+        st = os.stat(path)
     except (FileNotFoundError, NotADirectoryError):
-        return True
-    except OSError:
-        return False
+        return "gone"
+    except OSError as e:
+        return "gone" if e.errno == errno.ELOOP else "unknown"
+    wanted = stat_module.S_ISDIR if kind == "dir" else stat_module.S_ISREG
+    return "present" if wanted(st.st_mode) else "gone"
 
 
-def _present(path: str) -> bool:
-    """Whether a path is there. `os.stat`, never `open` -- see `_stuck_remedy`."""
-    try:
-        os.stat(path)
-        return True
-    except OSError:
-        return False
+def file_is_gone(path: str) -> bool:
+    return path_state(path, "file") == "gone"
 
 
 def _stuck_remedy(items: list[tuple[str, str]], db_path: str | None) -> str:
@@ -146,17 +159,12 @@ def _stuck_remedy(items: list[tuple[str, str]], db_path: str | None) -> str:
     unreadable: list[tuple[str, str]] = []
     readable: list[tuple[str, str]] = []
     for path, root in items:
-        try:
-            st = os.stat(path)
-        except (FileNotFoundError, NotADirectoryError):
-            # NotADirectoryError: a parent was replaced by a file, so this path
-            # is as deleted as one under a removed directory.
+        state = path_state(path, "file")
+        if state == "gone":
             gone.append((path, root))
-            continue
-        except OSError:
-            unreadable.append((path, root))
-            continue
-        if not stat_module.S_ISREG(st.st_mode) or not os.access(path, os.R_OK):
+        elif state == "unknown" or not os.access(path, os.R_OK):
+            # `os.access` can disagree with real openability under ACLs or as
+            # root, which is acceptable in a diagnostic string where a hang is not.
             unreadable.append((path, root))
         else:
             readable.append((path, root))
@@ -185,8 +193,12 @@ def _stuck_remedy(items: list[tuple[str, str]], db_path: str | None) -> str:
         # whose own root has vanished needs `forget`, because no `index` run
         # can reach it -- which is the justification the message used to give
         # unconditionally, while being false in exactly the common case.
-        orphaned = [(p, r) for p, r in gone if not r or not _present(r)]
-        reachable = [(p, r) for p, r in gone if r and _present(r)]
+        # "unknown" is not "gone": a root that cannot be read right now is not
+        # one `forget` should be prescribed for.
+        orphaned = [(p, r) for p, r in gone
+                    if not r or path_state(r, "dir") == "gone"]
+        reachable = [(p, r) for p, r in gone
+                     if r and path_state(r, "dir") != "gone"]
         parts.append(f" {len(gone)} of them no longer exist "
                      f"(e.g. {gone[0][0]}); no glob and no re-read can reach a "
                      "deleted file.")

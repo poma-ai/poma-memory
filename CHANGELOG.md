@@ -2,13 +2,12 @@
 
 ## 0.7.0
 
-- Removed the OpenAI embedding backend: the `[openai]` extra, `POMA_EMBEDDER=openai`
-  and `OPENAI_API_KEY` handling. model2vec is the supported embedder.
+- Removed the optional third-party embedding backend and its extra; model2vec is
+  the only embedder.
 - A non-empty `POMA_EMBEDDER` other than `model2vec` is now reported on stderr and
   ignored.
-- Existing indexes that hold vectors of another size (3072 dimensions from the
-  removed backend) are re-embedded locally on the next build, with no action
-  needed. Indexes built with model2vec are unchanged.
+- Existing indexes with vectors of another size are re-embedded locally on the
+  next build. Indexes built with model2vec are unchanged.
 - Added a test that fails if a reference to a removed provider returns.
 
 ## 0.6.0

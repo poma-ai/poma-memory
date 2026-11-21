@@ -210,8 +210,7 @@ class Store:
         """Update metadata in place, without re-chunking or re-embedding.
 
         This is the whole backfill mechanism. `_full_reindex` would delete,
-        re-chunk and re-embed the file, which on the OpenAI embedder is real
-        money for a column that can be filled from the file head.
+        re-chunk and re-embed the file, which is wasted work for a column that can be filled from the file head.
         """
         self._conn.execute(
             "UPDATE files SET metadata = ?, fm_unparsed = ?, rules_hash = ?, "

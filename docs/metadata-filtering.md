@@ -236,7 +236,7 @@ metadata is `''`, re-resolve and `UPDATE` the column for that file. Per row, not
 per index: a run given a narrower `--glob` reaches part of the corpus, and a
 global flag cannot express "this row was covered but that one was not" — which
 is exactly how rounds one to three each produced a different wrong answer (§8). **No re-chunking and no re-embedding** — `_full_reindex` would delete,
-re-chunk and re-embed, which is real money on the OpenAI backend.
+re-chunk and re-embed, which is wasted work.
 
 That makes both the upgrade path and the rule-edit path the same command
 callers already run: `poma-memory index`. No `--backfill-metadata` flag.
@@ -539,7 +539,7 @@ and more honest.
 **Stripping front-matter from indexed text.** Confirmed: nothing parses it
 today, so it is chunked as prose and pollutes BM25 tokens and embeddings.
 Stripping changes chunk contents and indices and forces a full reindex of every
-corpus — re-embedding is real money on OpenAI. Own PR, own version bump.
+corpus — re-embedding every corpus is expensive. Own PR, own version bump.
 
 **`PRAGMA user_version` retrofit.** §3.2 derives completeness from data, so
 this feature needs nothing from it, and the new columns arrive by
@@ -616,12 +616,9 @@ lesson is that such judgements expire.
 
 ## 8. Review rounds
 
-Reviewed by the `reviewer` subagent and Gemini (`--as-reviewer --pro`). Codex
-is installed but outside `MEGAVIBE_REVIEWERS` on this machine, so it did not
-run — a setting, not an outage. Rounds 8 and 9 are recorded at the end of this
-section; round 9 is the one where Gemini returned SHIP with no findings on a
-tree the subagent reproduced three blockers in, which is the measured reason
-Gemini is a fallback reviewer here rather than a peer.
+Reviewed in independent rounds by two reviewers. Rounds 8 and 9 are recorded
+at the end of this section; in round 9 one reviewer returned SHIP with no
+findings on a tree the other reproduced three blockers in.
 
 **Round 1 — do-not-ship, 13 findings.** Two substantive.
 

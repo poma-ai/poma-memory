@@ -60,9 +60,7 @@ class MemoryIndex:
 
         Raises `RuntimeError` when semantic search is installed but the build
         could not produce it (the embedder failed: a quota, a network error, a
-        model that would not load). With `POMA_EMBEDDER=openai` an outage also
-        raises, and leaves the stored OpenAI vectors alone instead of replacing
-        them with local ones. `HybridSearch` swallows that and degrades to
+        model that would not load). `HybridSearch` swallows that and degrades to
         BM25, which is right for a one-off search and wrong here: the caller
         asked for the index to be made current, and a BM25-only index cached
         under the current stamp would serve every later search until the next

@@ -229,7 +229,7 @@ def test_editing_the_rules_file_re_resolves_without_re_chunking():
         assert kinds["e1.md"] == "event"
         after = store.status()
         # Re-resolution is an UPDATE. Nothing was deleted, re-chunked or
-        # re-embedded — on the OpenAI embedder that distinction is money.
+        # re-embedded.
         assert after["total_chunks"] == before["total_chunks"]
         assert after["total_chunksets"] == before["total_chunksets"]
         assert [c["chunk_id"] for c in store.get_chunks_for_file(

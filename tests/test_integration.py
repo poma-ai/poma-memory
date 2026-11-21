@@ -24,11 +24,11 @@ Append-only. Record decisions, key prompts, and important tool outputs here.
 
 **Decision:** Split files into shared (FULL_CONTEXT, DECISIONS, TASKS) vs session-scoped (WORKING_CONTEXT, counter, flag, tool-events). Use session_id from hook stdin.
 
-## 2026-02-20 — AI backend fallback (Gemini to Codex)
+## 2026-02-20 — AI backend fallback (primary to secondary)
 
-**Problem:** Gemini MCP is geo-blocked in Andorra (403 PERMISSION_DENIED).
+**Problem:** The primary AI backend is geo-blocked in some regions (403 PERMISSION_DENIED).
 
-**Decision:** Add backend availability check + bidirectional fallback routing. At session start, Claude pings Gemini MCP. If unavailable, tasks route to Codex.
+**Decision:** Add backend availability check + bidirectional fallback routing. At session start, Claude pings the primary backend. If unavailable, tasks route to the secondary backend.
 """
 
 
@@ -71,9 +71,9 @@ def test_full_pipeline():
 
         # BM25 search
         bm25 = BM25Search(store)
-        results = bm25.search("geo-blocked Andorra fallback", top_k=3)
+        results = bm25.search("geo-blocked regions fallback", top_k=3)
         assert len(results) > 0
-        assert any("andorra" in r["contents"].lower() for r in results)
+        assert any("geo-blocked" in r["contents"].lower() for r in results)
 
         # Status
         status = store.status()

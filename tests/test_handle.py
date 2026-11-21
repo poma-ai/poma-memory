@@ -287,57 +287,6 @@ def test_a_base_install_without_model2vec_is_bm25_by_design_and_does_not_raise(
     h.close()
 
 
-def test_an_openai_outage_raises_and_keeps_the_stored_vectors(live, monkeypatch):
-    class _Down:
-        class embeddings:                                   # noqa: N801
-            @staticmethod
-            def create(**_kw):
-                raise OSError("quota")
-
-    monkeypatch.setenv("POMA_EMBEDDER", "openai")
-    monkeypatch.setattr("poma_memory.semantic_search._get_openai_client",
-                        lambda: _Down())
-    db = live / ".poma-memory.db"
-    store = Store(db)
-    ids = [i for i, _ in store.get_all_chunkset_embeddings()]
-    foreign = np.zeros(3072, dtype=np.float32).tobytes()
-    store.update_chunkset_embeddings([(i, foreign) for i in ids[:-1]] + [(ids[-1], None)])
-    store.close()
-    h = MemoryIndex(db)
-    with pytest.raises(RuntimeError, match="OSError"):
-        h.ensure_embeddings()
-    store = Store(db)
-    kept = [e for _, e in store.get_all_chunkset_embeddings() if e is not None]
-    store.close()
-    assert len(kept) == len(ids) - 1 and all(e == foreign for e in kept)
-    h.close()
-
-
-def test_an_openai_outage_with_no_vectors_yet_does_not_cache_a_local_index(
-        live, monkeypatch):
-    class _Down:
-        class embeddings:                                   # noqa: N801
-            @staticmethod
-            def create(**_kw):
-                raise OSError("quota")
-
-    monkeypatch.setenv("POMA_EMBEDDER", "openai")
-    monkeypatch.setattr("poma_memory.semantic_search._get_openai_client",
-                        lambda: _Down())
-    db = live / ".poma-memory.db"
-    store = Store(db)
-    store.update_chunkset_embeddings(
-        [(i, None) for i, _ in store.get_all_chunkset_embeddings()])
-    store.close()
-    h = MemoryIndex(db)
-    with pytest.raises(RuntimeError, match="OSError"):
-        h.ensure_embeddings()
-    store = Store(db)
-    assert all(e is None for _, e in store.get_all_chunkset_embeddings())
-    store.close()
-    h.close()
-
-
 def test_an_unstable_inode_does_not_rebuild_on_every_call(live, monkeypatch):
     real = os.stat
     counter = iter(range(10**9))
@@ -355,4 +304,31 @@ def test_an_unstable_inode_does_not_rebuild_on_every_call(live, monkeypatch):
     for _ in range(5):
         h.search("option constraint")
     assert h.builds == 1
+    h.close()
+
+
+def test_vectors_of_another_size_are_reembedded_locally(live):
+    db = live / ".poma-memory.db"
+    store = Store(db)
+    ids = [i for i, _ in store.get_all_chunkset_embeddings()]
+    foreign = np.zeros(3072, dtype=np.float32).tobytes()
+    store.update_chunkset_embeddings([(i, foreign) for i in ids])
+    store.close()
+    h = MemoryIndex(db)
+    h.ensure_embeddings()
+    store = Store(db)
+    sizes = {len(e) // 4 for _, e in store.get_all_chunkset_embeddings()}
+    store.close()
+    assert sizes == {512}
+    assert h.search("option constraint")
+    h.close()
+
+
+def test_an_unsupported_embedder_setting_warns_and_uses_model2vec(
+        live, monkeypatch, capsys):
+    monkeypatch.setenv("POMA_EMBEDDER", "something-else")
+    h = MemoryIndex(live / ".poma-memory.db")
+    h.ensure_embeddings()
+    assert h.search("option constraint")
+    assert "not supported" in capsys.readouterr().err
     h.close()

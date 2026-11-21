@@ -33,7 +33,6 @@ This is an open-source extraction of [POMA](https://poma-ai.com)'s heuristic chu
 ```bash
 pip install poma-memory                         # BM25 keyword search (always works)
 pip install 'poma-memory[semantic]'               # + model2vec local embeddings (30MB, no API key)
-pip install 'poma-memory[openai]'                 # + OpenAI text-embedding-3-large
 pip install 'poma-memory[mcp]'                    # + MCP server for Claude Code
 pip install 'poma-memory[semantic,mcp]'           # recommended combo
 ```
@@ -237,7 +236,6 @@ protecting against: **[`docs/metadata-filtering.md`](docs/metadata-filtering.md)
 |---------|---------|----------|----------|
 | BM25 | included | nothing | exact term matching |
 | model2vec | `[semantic]` | 30MB local model | general-purpose, no API key |
-| OpenAI | `[openai]` | `OPENAI_API_KEY` | highest quality |
 
 Multiple backends are automatically fused via Reciprocal Rank Fusion when available.
 

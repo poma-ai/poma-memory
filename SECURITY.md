@@ -15,7 +15,7 @@ poma-memory runs locally — it reads files from a configured directory, writes 
 - Parsing of `.agent/` file content and frontmatter
 - SQLite index construction and queries
 - The MCP server surface (`poma-memory mcp`)
-- Optional integrations: OpenAI embeddings, model2vec semantic search
+- Optional integrations: model2vec semantic search
 
 Bugs in documentation, test fixtures, or unrelated features are not security issues — report those as regular issues.
 

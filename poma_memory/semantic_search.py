@@ -1,7 +1,6 @@
-"""Semantic search via model2vec (default) or OpenAI embeddings.
+"""Semantic search via model2vec.
 
 Install with: pip install poma-memory[semantic]
-For OpenAI: pip install poma-memory[openai]
 """
 
 from __future__ import annotations
@@ -29,26 +28,6 @@ _M2V_DIMS = 512
 # irrelevant top-1 cosines 0.14–0.25, answerable 0.44–0.71 — 0.35 sits mid-gap,
 # rejecting 10/10 irrelevant while keeping 12/12 answerable.
 _M2V_EMPTY_GATE = 0.35
-
-_OAI_MODEL = "text-embedding-3-large"
-_OAI_CUTOFF = 0.25
-_OAI_DIMS = 3072
-# Not yet calibrated for text-embedding-3-large (different cosine scale —
-# runs cooler than model2vec). Conservatively equal to the per-hit cutoff:
-# gate fires only when NO hit clears the cutoff, i.e. behavior is unchanged
-# until someone calibrates a real corpus and raises it.
-_OAI_EMPTY_GATE = 0.25
-
-
-def _get_openai_client():
-    """Return OpenAI client if API key is set and SDK available, else None."""
-    if not os.environ.get("OPENAI_API_KEY"):
-        return None
-    try:
-        from openai import OpenAI
-        return OpenAI()
-    except ImportError:
-        return None
 
 
 class _EmbedderBase:
@@ -235,81 +214,24 @@ class Model2VecSearch(_EmbedderBase):
         return self._model.encode([query])[0].astype(np.float32)
 
 
-class OpenAISearch(_EmbedderBase):
-    """Vector search using OpenAI text-embedding-3-large."""
-
-    min_score = _OAI_CUTOFF
-    empty_gate = _OAI_EMPTY_GATE
-    expected_dims = _OAI_DIMS
-
-    def __init__(self, store: Store, client):
-        self._client = client
-        super().__init__(store)
-
-    def _embed_texts(self, texts: list[str]) -> np.ndarray:
-        all_embs = []
-        for i in range(0, len(texts), 2048):
-            batch = texts[i:i + 2048]
-            resp = self._client.embeddings.create(model=_OAI_MODEL, input=batch)
-            all_embs.extend([e.embedding for e in resp.data])
-        return np.array(all_embs, dtype=np.float32)
-
-    def _embed_query(self, query: str) -> np.ndarray:
-        resp = self._client.embeddings.create(model=_OAI_MODEL, input=[query])
-        return np.array(resp.data[0].embedding, dtype=np.float32)
-
-
 # Kept as alias for backwards compatibility with existing HybridSearch import
 SemanticSearch = Model2VecSearch
 
 
-def _fallback_would_rewrite(store: Store, dims: int) -> bool:
-    """Whether a local fallback would write vectors this index does not hold yet.
-
-    True for a row of another size (paid-for OpenAI vectors) and for a row with
-    no embedding at all: either way the fallback fills it at the local model's
-    size, and the index is then cached as local, so a later OpenAI retry finds
-    nothing to do instead of the build it was waiting for.
-    """
-    return any(
-        emb is None or len(emb) // 4 != dims
-        for _, emb in store.get_all_chunkset_embeddings()
-    )
-
-
 def create_search(store: Store) -> _EmbedderBase:
-    """Select an embedder. Local model2vec is the default — private, free, no
-    network, and deterministic across processes (avoids embedding-dimension
-    thrash when one caller has OPENAI_API_KEY and another does not).
+    """Return the embedder: local model2vec, which is private, free, has no
+    network use and is deterministic across processes.
 
-    Opt into OpenAI embeddings explicitly with POMA_EMBEDDER=openai. NOTE: that
-    sends the indexed content to OpenAI's API — do not enable it for private or
-    proprietary corpora unless that data egress is acceptable.
+    POMA_EMBEDDER is no longer a selector. A non-empty value other than
+    "model2vec" is reported on stderr and ignored. Stored vectors of another
+    size are treated as missing and re-embedded locally on the next build.
     """
-    if os.environ.get("POMA_EMBEDDER", "").strip().lower() == "openai":
-        client = _get_openai_client()
-        if client is not None:
-            try:
-                return OpenAISearch(store, client)
-            except Exception as e:
-                if _fallback_would_rewrite(store, Model2VecSearch.expected_dims):
-                    # Falling back would embed every missing row at the local
-                    # model's size and overwrite paid-for vectors, because a
-                    # wrong-sized row counts as missing, and the next successful
-                    # OpenAI build would pay for all of them again. A row with
-                    # no vector yet is the same case: the fallback would fill
-                    # it locally and the OpenAI retry would never run. An outage
-                    # should leave the index as it is and fail this build.
-                    raise
-                print(
-                    f"poma-memory: OpenAI embedder init failed ({e}); "
-                    "falling back to local model2vec",
-                    file=sys.stderr,
-                )
-        else:
-            print(
-                "poma-memory: POMA_EMBEDDER=openai set but no OPENAI_API_KEY / "
-                "openai SDK available; using local model2vec",
-                file=sys.stderr,
-            )
+    choice = os.environ.get("POMA_EMBEDDER", "").strip().lower()
+    if choice not in ("", "model2vec"):
+        print(
+            f"poma-memory: POMA_EMBEDDER={choice[:40]!r} is not supported; "
+            "using local model2vec (stored vectors of another size are "
+            "re-embedded)",
+            file=sys.stderr,
+        )
     return Model2VecSearch(store)

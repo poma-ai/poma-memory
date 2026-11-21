@@ -229,7 +229,7 @@ def create_search(store: Store) -> _EmbedderBase:
     choice = os.environ.get("POMA_EMBEDDER", "").strip().lower()
     if choice not in ("", "model2vec"):
         print(
-            f"poma-memory: POMA_EMBEDDER={choice} is not supported; "
+            f"poma-memory: POMA_EMBEDDER={choice[:40]!r} is not supported; "
             "using local model2vec (stored vectors of another size are "
             "re-embedded)",
             file=sys.stderr,
